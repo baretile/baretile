@@ -541,9 +541,9 @@ def on_chip(t):  # the holder of a BARETILE tensor that spans its buffer, with i
 
 _tinyjit = tinygrad.engine.jit._TinyJit.__call__
 def tinyjit(self, *args, **kwargs):
-  """TinyJit on BARETILE, like tensor.jit: the second call is recorded, and later calls copy their inputs in and
-  resend the recorded launches as one block. Buffers that the recording stored into get their new values copied back
-  to where it read them.
+  """TinyJit on BARETILE, like tensor.jit: the second call is recorded, or the first after it that can be, and later
+  calls copy their inputs in and resend the recorded launches as one block. Buffers that the recording stored into
+  get their new values copied back to where it read them.
 
   A function isn't replayed, and runs normally, if it does host work, like random numbers (their counter is on the
   host) or downloading a value. The same goes if it stores into an input or into a buffer in another layout, takes an
@@ -562,7 +562,7 @@ def tinyjit(self, *args, **kwargs):
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
-  if self.cnt == 2:
+  if self.cnt == 2 or not hasattr(self, "replay"):  # the second call, or a later one if the second couldn't be recorded
     values, recording, hosted, self.inputs = [h.value for h in holders], {}, 0, (names, info)
     try:
       with tensor.Recording(runtime()) as rec:
