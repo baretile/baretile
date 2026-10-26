@@ -893,6 +893,20 @@ def test_token_accuracy(chip):
   assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
   assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "numpy (rt None) should give the same picks and scores"
 
+def test_benchmark_quick_accuracy():
+  # --quick decodes after a short prompt to save time, but token accuracy has to be scored from the prompt the
+  # reference saw, since its top five came from that context. Scored against its own top five, a model gets 8 of 8.
+  rng = np.random.default_rng(6)
+  c, w = smol(rng, 2, places=96)
+  w |= {k: v * 100 for k, v in w.items() if k.endswith("o_proj")}  # so attention, and with it the context, moves the logits
+  tokens = [int(i) for i in rng.integers(0, 256, 76)]
+  prompt, after = tokens[:68], tokens[68:]
+  logits = llama.forward(prompt + after[:7], list(range(75)), w, c, llama.kv_cache(c, 96, np.zeros), every=True)[67:]
+  top5 = [[int(k) for k in np.argsort(-row)[:5]] for row in logits]
+  short, scored = benchmark.prompts(prompt, benchmark.SIZES[True])
+  assert len(short) == 32 and llama.accuracy(None, w, c, scored, after, top5, 8)[:2] == (1, 1)
+  assert llama.accuracy(None, w, c, short, after, top5, 8)[:2] != (1, 1), "the short prompt should score worse"
+
 def test_benchmark_bytes():
   # The bytes a decode token reads, which B2's effective DRAM bandwidth comes from. Llama-3.1-8B reads 6.20 GB a token,
   # so 41.3 tokens/s is half the card's 512 GB/s.
