@@ -46,8 +46,12 @@ def test_bench(chip):
   # blocks read each input once. B is laid out by columns, like a model's weights.
   from baretile import bench
   for m, k, n, weights in ((1, 1024, 4096, "bfp8"), (320, 1024, 416, "bf16")):
-    reread = bench.bench(chip, m, k, n, weights, repeat=1)[3]
+    *_, reread, peak = bench.bench(chip, m, k, n, weights, repeat=1)
     assert reread == (1 if chip.pci.counts else None), (m, k, n, weights, reread)
+  # The peak counts the grid's workers, where matmuls run, at the clock the card reported. The dispatcher doesn't
+  # multiply, and neither do the workers off the grid.
+  grid, core = Runtime(chip).grid, bh.MVMUL_FLOPS * chip.aiclk * 1e6 / tensor.FIDELITY / 1e12
+  assert round(peak / core) == len(grid[0]) * len(grid[1]) < len(chip.tensix) - 1, (peak, core, grid)
 
 def test_profile(chip):
   # Launches write their start and last report times to host memory, on the dispatcher's clock, and Runtime.profile

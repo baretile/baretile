@@ -14,8 +14,9 @@ from baretile.runtime import Runtime
 
 def bench(chip, m, k, n, weights="bf16", repeat=3):
   """Time (m x k) @ (k x n) with B in the dtype `weights`, laid out by columns. Returns seconds, TFLOPS, the GB/s of
-  reading each input once, and how many times over the inputs were read, which is None where the NIUs don't count
-  bytes. The inputs are 1.0, so the result is easy to check."""
+  reading each input once, how many times over the inputs were read (None where the NIUs don't count bytes), and the
+  peak TFLOPS. Matmuls run on the grid, so the peak counts its workers at the AI clock the card reported, and leaves
+  out the dispatcher and the workers off the grid. The inputs are 1.0, so the result is easy to check."""
   rt = Runtime(chip)
   a, b = (Tensor.frombytes(rt, r, c, b"\x80\x3f" * (r * c)) for r, c in ((m, k), (k, n)))  # bf16 1.0
   b = b.cast(weights).realize().columns()
@@ -25,15 +26,15 @@ def bench(chip, m, k, n, weights="bf16", repeat=3):
   rt.wait()
   seconds, read = (chip.pci.now() - start) / repeat, sum(n for *_, n in rt.profile(since)) / repeat if rt.counts else None
   once = -(-m // 32) * -(-k // 32) * tile_bytes("bf16") + -(-k // 32) * -(-n // 32) * tile_bytes(weights)  # each input's tiles
-  return seconds, 2 * m * k * n / seconds / 1e12, once / seconds / 1e9, read and read / once
+  peak = len(rt.grid[0]) * len(rt.grid[1]) * bh.MVMUL_FLOPS * chip.aiclk * 1e6 / tensor.FIDELITY / 1e12  # a product takes FIDELITY phases
+  return seconds, 2 * m * k * n / seconds / 1e12, once / seconds / 1e9, read and read / once, peak
 
 if __name__ == "__main__":
   chip = Chip(pci.open_device())
   m, k, n = map(int, sys.argv[1:4]) if len(sys.argv) > 3 else (512, 768, 3072)
   if len(sys.argv) > 4: tensor.FIDELITY = int(sys.argv[4])
   weights = sys.argv[5] if len(sys.argv) > 5 else "bf16"
-  seconds, tflops, gbs, reread = bench(chip, m, k, n, weights)
-  peak = len(chip.tensix) * bh.MVMUL_FLOPS * bh.AICLK / tensor.FIDELITY / 1e12  # a product takes FIDELITY phases
+  seconds, tflops, gbs, reread, peak = bench(chip, m, k, n, weights)
   speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (RISC-V work on the critical path, not silicon time)"
            if isinstance(chip.pci, pci.Sim) else
            f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at {tensor.FIDELITY} fidelity phases, {gbs:.0f} GB/s")
