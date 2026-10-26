@@ -927,6 +927,22 @@ def test_batched_decode(chip):
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
       s.append(int(want.argmax()))
 
+def test_serve_timeout(tmp_path):
+  # A request whose text doesn't come within `wait` seconds gets a 504 and gives up its slot, so a hung chip doesn't
+  # hold slots for requests nobody is waiting on. The stand-in engine takes requests and never answers.
+  import queue, urllib.error, urllib.request
+  class Hung:
+    tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(1)
+    offer = serve.Engine.offer
+  hung = Hung()
+  http = serve.server(hung, "hung", port=0, wait=0.2)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  with pytest.raises(urllib.error.HTTPError) as e:
+    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/completions",
+                                                  json.dumps({"prompt": "Hi"}).encode(), {"Content-Type": "application/json"}), timeout=60)
+  http.shutdown()
+  assert e.value.code == 504 and hung.waiting.get_nowait().gone, "the engine should drop a request that timed out"
+
 def bytes_tokenizer(folder):  # writes a byte-level vocabulary of the 256 bytes to tokenizer.json in folder
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
   chars = map(chr, bs + [256 + i for i in range(256 - len(bs))])
