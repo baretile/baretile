@@ -28,7 +28,8 @@
 # tutorial times a matmul. B2 and B3 come from Tenstorrent's demo script (simple_text_demo.py, the performance runs
 # named below) with our prompts and step counts, and its logs go to benchmark-ttnn-<run>.log. TT_KMD=path/to/tt-kmd
 # counts tt-kmd's lines too. On ttsim (TTSIM for baretile, TT_METAL_SIMULATOR for TT-NN) the times are ttsim's clock.
-# --quick shrinks the sizes and cuts the model to two blocks, which is enough to test the script.
+# --quick shrinks the sizes, cuts the model to two blocks and decodes after the last 32 tokens of the prompt, which is
+# enough to test the script.
 # TT-NN's B2 and B3 don't run on ttsim, because Tenstorrent's script warms up prefill with an SFPU mode that ttsim
 # lacks.
 import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
@@ -157,7 +158,13 @@ def model(folder, s, places):  # the model's config at TT's performance precisio
   c.precision = llama.precision(c, "tt")
   return c, {k: v for k, v in w.items() if not k.startswith("layers.") or int(k.split(".")[1]) < c.layers}
 
+def prompts(prompt, s):
+  """The prompt that B2 decodes after, and the prompt its token accuracy is scored from. --quick decodes after the last
+  32 tokens to save time, but accuracy keeps the reference's prompt, because the reference's top five came from it."""
+  return (prompt[-32:] if s.blocks else prompt), prompt
+
 def baretile(folder, prompt, after, top5, book, s):
+  short, prompt = prompts(prompt, s)
   from baretile.chip import Chip
   from baretile.runtime import Runtime
   from baretile.tensor import Tensor, jit
@@ -174,10 +181,10 @@ def baretile(folder, prompt, after, top5, book, s):
     """tokens/s per user, with `users` decoding greedily together after the same prompt, ignoring end-of-sequence.
     The first two steps are warm-up (jit runs, then records). Each step is timed from the token ids on the host to the
     next ones there."""
-    n, size = len(prompt), -(-(len(prompt) + s.steps) // 32) * 32
+    n, size = len(short), -(-(len(short) + s.steps) // 32) * 32
     kv, tokens = llama.kv_cache(c, size * users, llama.zeros(rt, llama.cache_format(c)), users), []
     for u in range(users):  # prefill each user's prompt into its part of the cache, and get its next token
-      tokens.append(int(llama.logits(llama.forward(on(prompt), on(list(range(n))), t, c, llama.slot(c, kv, u, users))).argmax()))
+      tokens.append(int(llama.logits(llama.forward(on(short), on(list(range(n))), t, c, llama.slot(c, kv, u, users))).argmax()))
     step, times = jit(lambda ids, places: llama.forward(ids, places, t, c, kv, users if users > 1 else None)), []
     for i in range(s.steps):
       start = clock()
@@ -207,7 +214,7 @@ def baretile(folder, prompt, after, top5, book, s):
   c, w = model(folder, s, len(prompt) + max(s.steps, s.accuracy))
   t = llama.upload(rt, w, c.precision)
   tps = decode(t, c, 1)
-  read = bytes_per_token(t, c, len(prompt) + (s.steps + 1) / 2)
+  read = bytes_per_token(t, c, len(short) + (s.steps + 1) / 2)
   out["B2 decode, batch 1"] = {"tokens/s": tps, "GB a token": read / 1e9, "effective DRAM bandwidth": tps * read / (bh.DRAM_GBPS * 1e9)}
   tps = decode(t, c, s.users)
   out[f"B2 decode, batch {s.users}"] = {"tokens/s a user": tps, "tokens/s": tps * s.users}
@@ -236,6 +243,7 @@ LOGGED = {"tokens/s a user": (r"@ ([\d.]+) tok/s/user", 1), "tokens/s": (r"\(([\
           "top-1": (r"Top1 Accuracy: ([\d.]+)%", 1e-2), "top-5": (r"Top5 Accuracy: ([\d.]+)%", 1e-2)}
 
 def ttnn(folder, prompt, after, top5, book, s):
+  short = prompts(prompt, s)[0]  # TT's accuracy run reads its own reference file, so this prompt only goes to B2's decode
   import torch
   from transformers import AutoTokenizer
   tt, kmd, sim = os.environ["TT_METAL_HOME"], os.environ.get("TT_KMD"), "TT_METAL_SIMULATOR" in os.environ
@@ -281,12 +289,12 @@ def ttnn(folder, prompt, after, top5, book, s):
     out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12,
                                                        "roofline": roofline(2 * s.n**3, seconds, phases)}
   tok = AutoTokenizer.from_pretrained(folder)
-  text = tok.decode(prompt)  # TT's token accuracy makes its prompt from the reference tokens this way (prepare_ref_tokens)
+  text = tok.decode(short)  # TT's token accuracy makes its prompt from the reference tokens this way (prepare_ref_tokens)
   decoding = ("--stop_at_eos", "0", "--max_generated_tokens", str(s.steps))
   out["B2 decode, batch 1"] = demo("b2-batch-1", "batch-1", ("tokens/s",), *decoding, text=text)
   c, _ = model(folder, s, 1)
   if "tokens/s" in out["B2 decode, batch 1"]:
-    read = bytes_per_token(weights(c), c, len(prompt) + (s.steps + 1) / 2)
+    read = bytes_per_token(weights(c), c, len(short) + (s.steps + 1) / 2)
     b2 = out["B2 decode, batch 1"]
     b2 |= {"GB a token": read / 1e9, "effective DRAM bandwidth": b2["tokens/s"] * read / (bh.DRAM_GBPS * 1e9)}
   out[f"B2 decode, batch {s.users}"] = demo(f"b2-batch-{s.users}", "batch-32 and not log-probs", ("tokens/s a user", "tokens/s"), *decoding,
@@ -324,7 +332,6 @@ def main():
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
   assert stack in ("baretile", "ttnn"), "the stack must be baretile or ttnn"
   prompt, after, top5 = llama.reference(refpt)
-  if s.blocks: prompt = prompt[-32:]  # the reference's next tokens were computed from the uncut prompt
   path = os.environ.get("BOOK") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(refpt))), "tale-of-two-cities.txt.bz2")
   out = {"baretile": baretile, "ttnn": ttnn}[stack](folder, prompt, after, top5, bz2.open(path, "rt", encoding="utf-8").read(), s)
   json.dump(out, open(f"benchmark-{stack}.json", "w"), indent=1)
