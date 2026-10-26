@@ -730,7 +730,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         except (OSError, queue.Empty): r.gone = True  # the client left, or no text came, so let its slot go
         return
       try: text = "".join(iter(lambda: r.out.get(timeout=wait), None))
-      except queue.Empty: return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
+      except queue.Empty:
+        r.gone = True  # nobody is waiting for it now, so let its slot go
+        return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
       if r.finish == "error": return self.reply(500, {"error": {"message": "the engine stopped on an error"}})
       message, (content, made) = parts(text), called(text)
       if made: message |= {"content": content or None, "tool_calls": made}

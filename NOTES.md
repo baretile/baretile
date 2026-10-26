@@ -852,7 +852,8 @@ apart from the answer (`reasoning_content`).
 **HTTP.** It serves `/v1/models`, `/v1/completions` and `/v1/chat/completions`, whole or streamed. A request holds a
 slot from when it arrives until it ends, and a request that finds no free slot gets a 429 immediately. OpenRouter then
 tries the next provider, and it doesn't count 429s against uptime. Usage counts the prompt's cached tokens and comes at
-the end of a stream. A request that produces no text for 600 s ends, with a 504 unless it's streaming.
+the end of a stream. A request that produces no text for 600 s ends and gives up its slot, with a 504 unless it's
+streaming.
 
 ## The cost model
 
