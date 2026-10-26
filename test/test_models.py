@@ -20,6 +20,20 @@ def test_train(chip):
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
+def test_tinygrad_jit_unrecorded(chip):
+  # TinyJit records a function's second call and replays it after that. A second call that can't be recorded, here
+  # because an input isn't on the chip, runs as it is, and the next call that can be recorded is.
+  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
+  pytest.importorskip("tinygrad")
+  from adapters import tinygrad_baretile
+  from tinygrad import Tensor, TinyJit
+  rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)
+  add, x = TinyJit(lambda x, y: (x + y.to("BARETILE")).realize()), Tensor([1.0, 2.0], device="BARETILE")
+  for device in ("BARETILE", "CPU", "BARETILE", "BARETILE", "BARETILE"):
+    assert add(x, Tensor([3.0, 4.0], device=device)).tolist() == [4.0, 6.0], device
+  launches = rt.launches
+  assert add(x, Tensor([5.0, 6.0], device="BARETILE")).tolist() == [6.0, 8.0] and rt.launches > launches
+
 def test_tinygrad(chip):
   # tinygrad builds the graph and baretile runs it, checked against tinygrad's CPU device. Each case must launch on the
   # chip, so we know the host didn't compute it.
