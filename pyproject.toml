@@ -4,16 +4,33 @@ build-backend = "hatchling.build"
 
 [project]
 name = "baretile"
-version = "0.0.1"
+version = "0.0.2"
 description = "A compiler and runtime for Tenstorrent Blackhole, written in Python"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 authors = [{ name = "alkinun" }]
-classifiers = ["Operating System :: POSIX :: Linux"]
+keywords = ["tenstorrent", "blackhole", "tensix", "compiler", "runtime", "driver", "machine learning"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Compilers",
+  "Topic :: System :: Hardware :: Hardware Drivers",
+]
 
 [project.urls]
+Homepage = "https://baretile.com"
+Documentation = "https://github.com/baretile/baretile/blob/main/docs/README.md"
 Source = "https://github.com/baretile/baretile"
+Issues = "https://github.com/baretile/baretile/issues"
 
 # Name the namespace package explicitly because baretile/ has no __init__.py. The sdist includes only this package.
 [tool.hatch.build.targets.wheel]
@@ -21,3 +38,11 @@ packages = ["baretile"]
 
 [tool.hatch.build.targets.sdist]
 only-include = ["baretile"]
+
+# The checks we run before each commit: unused names, long lines and trailing whitespace.
+[tool.ruff]
+line-length = 150
+include = ["baretile/*.py", "models/*.py", "adapters/*.py", "test/*.py", "ramps/*.py"]
+
+[tool.ruff.lint]
+select = ["F", "E501", "W291", "W293"]
