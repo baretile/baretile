@@ -1,8 +1,8 @@
-# Train a small character-level GPT-2 on README and NOTES using fp32 and Adam.
+# Train a small character-level GPT-2 on README and the docs using fp32 and Adam.
 # PyTorch checks the loss and gradients at each step using the same weights. A separate PyTorch
 # run starts from the same weights to compare loss curves; floating-point rounding lets them diverge.
 #   TTSIM=/path/to/libttsim.so python3 test/train.py [steps]
-import math, os, sys, time
+import math, os, pathlib, sys, time
 from types import SimpleNamespace
 import numpy as np
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
@@ -10,7 +10,9 @@ from baretile import tensor
 from baretile.tensor import Tensor
 import gpt2
 
-def text(): return "".join(open(os.path.join(os.path.dirname(__file__), "..", name)).read() for name in ("README.md", "NOTES.md"))
+def text():  # README.md, then the pages in docs/ by name
+  root = pathlib.Path(__file__).parent.parent
+  return "".join(p.read_text() for p in [root / "README.md", *sorted((root / "docs").glob("*.md"))])
 
 def init(c, seed=0):
   """GPT-2's initial weights by name, as float32 numpy. Weights are N(0, 0.02), the position embedding N(0, 0.01), and
@@ -55,7 +57,7 @@ def train(rt, steps, log=None, data=None):
 
   Return a tuple per step: baretile loss, PyTorch loss on the same weights, maximum relative gradient
   error, and the independent PyTorch loss. Normalize each weight's gradient error by its largest
-  reference gradient. data defaults to the text of README.md and NOTES.md."""
+  reference gradient. data defaults to the text of README.md and docs/."""
   import torch
   data = data or text()
   chars = sorted(set(data))

@@ -430,7 +430,7 @@ class Tensor:
 
     An fp32 operand is split into bf16 hi and lo. The kernel sums hi@hi, hi@lo and lo@hi, preserving about
     16 of fp32's 24 bits. The FPU aligns groups of eight products before adding, with error around 2^-11 of
-    the largest terms. See NOTES.md, "Matmul precision".
+    the largest terms. See docs/compiler.md, "Matmul precision".
 
     index is an int32 (rows, k) tensor. For batch entry b, index[b // k, b % k] selects a matrix from x.
     Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero

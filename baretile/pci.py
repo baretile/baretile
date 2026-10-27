@@ -156,7 +156,7 @@ def reset(bdf, timeout=10.0):
 
   PCI_COMMAND's parity bit marks the reset. Two config writes trigger the PCIe interface timer. Once the
   marker clears or the device leaves the bus and returns, remove and rescan it to restore config space. See
-  NOTES.md."""
+  docs/bring-up.md."""
   if os.geteuid() != 0: raise PermissionError("reset needs root to write the card's config space and sysfs")
   path, deadline, gone = f"{SYS}/devices/{bdf}", time.monotonic() + timeout, False
   fd = os.open(f"{path}/config", os.O_RDWR | os.O_SYNC)
