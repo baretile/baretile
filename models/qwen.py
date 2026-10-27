@@ -1,11 +1,7 @@
-# What Qwen3.5, Qwen3.6 and the mixtures of experts add to a Llama. The block in models/llama.py calls into here. Like
-# llama.py, the same code runs on baretile Tensors and on numpy arrays.
-# deltanet is the Gated DeltaNet block of Qwen3.5 and Qwen3.6, and draft is their multi-token prediction layer. moe
-# puts a mixture of experts where the MLP goes, for Qwen3-MoE, Qwen3.6, Mixtral and gpt-oss. gpt-oss has its experts
-# in MXFP4.
-# The kernels that only these models use are here too, and Tensor.run launches them. delta runs a Gated DeltaNet decode
-# step in one kernel. group and touched route tokens to experts on BRISC: group sorts the tokens of a prompt by expert,
-# and touched lists the distinct experts that a decode step uses.
+# Extensions to the Llama model in llama.py: mixtures of experts, Gated DeltaNet and multi-token
+# prediction. The model operations run with baretile tensors or NumPy arrays. Kernels used only by
+# these models live here: delta updates recurrent state, group sorts prompt tokens by expert, and
+# touched lists the experts selected during decode. gpt-oss weights are converted from MXFP4.
 import numpy as np
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
@@ -70,9 +66,8 @@ def deltanet(h, p, c, state, phases, live=None, accept=None):
   return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
 
 class Row:
-  """Row u of the matrices in a tensor that has a row for each sequence. llama.slot uses it to give a sequence its own
-  Gated DeltaNet conv state, where each position is a matrix with a row for each sequence. No view can pick out that
-  row, so reads go through a move and writes through put."""
+  """View row u across a batch of matrices, one row per sequence. llama.slot uses this for DeltaNet convolution
+  history. Tensor views can't select this row directly, so reads use a move and writes use put."""
   def __init__(self, t, u): self.t, self.u, self.at, self.batch, self.rows, self.cols = t, u, Tensor.of(t.rt, [[u]], "int32"), t.batch, 1, t.cols
   def get(self): return self.t[:, self.u:self.u + 1, :]
   def assign(self, x): self.t.put(self.at, x.get() if isinstance(x, Row) else x); return self
@@ -106,10 +101,10 @@ def numpy_delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None,
   return np.stack(out, 2).transpose(1, 0, 2, 3).reshape(vh, n * m, vd)
 
 def step(q, k, v, beta, g, S):
-  """The gated delta rule for one token in numpy, like torch_recurrent_gated_delta_rule in transformers. q and k are
-  columns. Returns the output and the state after the token."""
+  """Apply the gated delta rule to one token in NumPy, matching transformers' torch_recurrent_gated_delta_rule.
+  q and k are columns. Return (output, updated state)."""
   e = np.exp(g)
-  v = beta * (v - e * (k * S).sum(-2, keepdims=True))  # the correction: v minus what the decayed state already says
+  v = beta * (v - e * (k * S).sum(-2, keepdims=True))  # correct the decayed state's prediction toward v
   S = e * S + k * v
   return (q * S).sum(-2, keepdims=True), S
 
@@ -141,7 +136,7 @@ def chunk(q, k, v, beta, g, S, size=64):
   qs, a, kl, u, w = now(q * f.exp(cum)), now((q @ f.t(k)) * decay), now(f.t(k * f.exp(last - cum))), now(u), now(w)  # what the loop reads
   out = f.empty((h, n * s, dv)) if n > 1 else None
   for i in range(n):
-    vnew = piece(u, i) - piece(w, i) @ S  # the corrections, minus what the state before the piece already says
+    vnew = piece(u, i) - piece(w, i) @ S  # subtract the predictions from the state before this chunk
     o = piece(qs, i) @ S + piece(a, i) @ vnew
     if n > 1: f.assign(piece(f.parts(out, n), i), o)
     S = now(S * f.exp(piece(last, i)) + piece(kl, i) @ vnew)
@@ -177,8 +172,8 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   The rule then splits by column. For each value head, each column tile j of its S, and each token in turn, one SFPU
   pass sums u = S^T k and w = S^T q down the tiles of the column. Then d = beta (v - e^g u), the output of the token
   is e^g w + d (k . q), and the new tiles of the column are e^g S + k d, which is the S of the next token.
-  The states after the last token go home to S. With two tokens, those after the first go to first. A sequence that
-  isn't live writes no states. BRISC reads only its live and accept, and sends 0 for its outputs."""
+  Write the final states to S. With two tokens, save the states after the first token in first. For an inactive
+  sequence, BRISC reads only live and accept, leaves the states unchanged, and writes zero outputs."""
   kh, kd, vd = vh // rep, 32 * kt, 32 * vt
   qk, vw = kh * kd, vh * vd
   S_ = lambda e, i, j: f"(F0 + ({e}) * {kt * vt} + ({i}) * {vt} + ({j}))"  # tile (i, j) of the S of value head e
@@ -249,9 +244,9 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   masks = {"columns 4 on": mask_columns("sum", 4), "rows 4 on": mask_rows("sum", 4), "all but place 0": mask_rows("sum", 1) + mask_columns("sum", 1)}
   only = lambda mask: f"{aim_at('h')} {call(mask)}"  # zeroes the tile at h outside the positions that were filled
   conv = lambda x, taps, mask, kind: f"{aim_at(0)} {fills((x, R2), (taps, R3))} {to_h('mul')} {only(mask)} {call(kind)} {aim_at(0)} {silu}"
-  # The (math, pack) words for a result in Dst half h. An intermediate result packs into slot. One that goes home as tile
-  # `home` packs into the output slot of its half. One that does both stays in slot until it has gone home, and keep is
-  # the output slot that it counts as.
+  # Generate (math, pack) words for Dst half h. Pack intermediates into slot and final results into the output slot
+  # for this half, with `home` as the destination tile. A result used both ways stays in slot until written to DRAM;
+  # keep identifies the output slot used to track its completion.
   def result(words, slot=None, home=None, keep=None):
     math = f"{half} {words} {done}" + (" posted++;" if slot is not None else "")
     if home is None: return math, f"{tt(pack('h', slot, SEM_L1))} h ^= {DST_HALF};"
@@ -298,7 +293,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
     {body}
   }}"""
   # For each unit, BRISC waits for its frame to be free, then puts its states, the runs of its channels and its scalars in
-  # place, then writes back the conv inputs that it leaves. Meanwhile it sends results home as they're packed.
+  # place, then writes back the updated conv inputs. It writes results to DRAM as they're packed.
   # Below are the indices in args of first (which is S when m is 1), x, the conv inputs, the taps, dt and decay.
   first, X = (14, 22) if m > 1 else (2, 14)
   C, C2, TAPS = X + 4, X + 8, X + 4 + 4 * m
@@ -315,7 +310,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
 static const unsigned *A;
 static unsigned fetched, events, frame_done[2], sent, alive[4], word[{scalars}];
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
-static void send(void) {{  // sends home what's been packed: the row runs of an output (0 if not live), or the tiles of a live state
+static void send(void) {{  // write packed output rows (zero if inactive) and active state tiles to DRAM
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1), unit = t >> 8 & 0x3FFFFF, s = unit / {vh}, h = unit % {vh};
     unsigned live = alive[unit / {rep} % 4];
@@ -360,7 +355,7 @@ void kmain(volatile unsigned *args) {{
     noc_wait();
     alive[unit % 4] = {value(0, 2)} != 0;
     if (!alive[unit % 4]) {{ ready(); frame_done[u & 1] = ++events; continue; }}  // a sequence that isn't live reads nothing
-    // accept says which states to go on from, after the last step's draft
+    // accept selects the state after the previous token or its draft
     unsigned taken = {value(1) if m > 1 else 1}, from = taken ? 2 : {first}, c = taken ? {C} : {C2};
     for (unsigned e = 0; e < {rep}; e++) for (unsigned i = 0; i < {kt}; i++) for (unsigned j = 0; j < {vt}; j++) {{
       unsigned t = {tile_of('from', f's * {vh} + hk * {rep} + e', 'i', 'j', 'A')};
@@ -398,7 +393,7 @@ void kmain(volatile unsigned *args) {{
         ((volatile unsigned *)SLOT({AA('t', 'e')}))[0] = {value(f'{2 + 3 * rep} + t * {2 * rep} + e')};
       }}
     }}
-    // once read, write back the inputs that token t leaves: sources t + 1 to t + 3
+    // after reading, update convolution history for token t with sources t + 1 to t + 3
     for (unsigned t = 0; t < {m}; t++) for (unsigned d = 0; d < 3; d++) {{
       unsigned into = t == {m - 1} ? {C} : {C2}, src = t + 1 + d, tv = src > 3 ? src - 3 : 0;
       for (unsigned g = 0; g < 2; g++) put_runs(into, d, s, g ? ck : cq, {kt}, {staged('src', 'g')}, 128, 64);
@@ -482,18 +477,17 @@ def numpy_experts(h, p, ids, w, phases, limit=None):  # the GLUs of the experts 
   return np.stack([sum(w[t, j] * expert(h[t], e) for j, e in enumerate(ids[t])) for t in range(len(h))])
 
 def chip_experts(h, p, ids, w, phases, limit=None):
-  """numpy_experts on the chip. The matmuls pick the weights of each expert where they already are (index=).
+  """Run the selected experts on the chip. Indexed matmuls read expert weights where they are stored.
 
-  A few tokens, like a decode step, go dense (touched). The experts that some token picked with a nonzero weight
-  become batch entries, and all the tokens are rows of each. An entry's SwiGLU is weighted by the weight of each token
-  for that expert (0 if the token didn't pick it), and the entries are summed. The weights of each expert are read
-  once, and workers read the token rows once.
-  More tokens, like a prompt, are grouped by expert (group). The run of each expert is padded to a multiple of 32
-  rows, and each of its tiles is a batch entry. The weights of an expert are then read once for every 32 of its
-  tokens. The k outputs of each token are gathered back, weighted and summed.
-  Up to 128 tokens we go dense, since the extra tile rows of dense cost less than gathering 64-byte runs. Past that we
-  take whichever makes fewer tile rows. Both replay, and an entry that picks no expert costs only its zeros. The biases
-  of the experts are gathered by the same picks."""
+  For up to 128 tokens, touched creates a batch entry for each selected expert. Tokens become rows of each
+  entry, with zero routing weight for tokens that didn't select that expert. Multiply the SwiGLU outputs by
+  these weights and sum across entries. Workers read the token rows once and share each expert's weight
+  reads.
+
+  For longer prompts, group sorts tokens by expert and pads each group to 32 rows. Each tile becomes a batch
+  entry, so weights are read once per 32 tokens. Gather the k outputs per token, then weight and sum them.
+  Above 128 tokens, choose the layout with fewer tile rows. Both layouts support replay; unused entries
+  produce zeros. Gather expert biases using the same indices."""
   gate_up, down = p["experts.gate_up"], p["experts.down"]
   (n, k), m, e = ids.shape[1:], down.rows, gate_up.batch
   dense = n <= 128 or -(-n // 32) * min(n * k, e) <= -(-n * k // 32) + min(n * k, e)  # tile rows per matrix, each way
@@ -519,16 +513,13 @@ def chip_experts(h, p, ids, w, phases, limit=None):
 def group_slots(rows, k, n): return -(-rows * k // 32) + min(n, rows * k), -(-rows // 32) * 32
 
 def group_kernel(rows, k, n):
-  """The kernel for group, which sorts the tokens of a mixture of experts by expert. It runs on BRISC alone, on one
-  worker.
+  """Sort token choices by expert on one BRISC worker. Arguments are [first unit, units, order address, tiles
+  address, places address, choices address, choices row tile stride, choices tile offset].
 
-  Arguments: first unit, units, the addresses of order, tiles and places, then the address of the choices, their tile
-  stride for rows, and their tile offset.
-  BRISC reads the choices (rows x k, values below n) and counts each value. The run of slots for a value starts where
-  the runs before it end, each rounded up to a multiple of 32. Each choice takes the next slot in the run of its value.
-  order (the token in each slot, a row), tiles (the value of each tile, a column) and places (k runs of the slot of
-  each choice, a row) are built in L1 as flat arrays and sent a tile at a time. In a tensor, the tile of a row holds
-  the row 32 times, and the tile of a column holds the column 32 times."""
+  Read rows x k choices with values below n. Count each expert, assign consecutive slots, and pad each
+  expert's group to 32. Build order (token per slot), tiles (expert per tile) and places (slot per choice,
+  grouped by choice index) as flat arrays in L1. Send them as tiles, repeating rows or columns to match
+  tensor storage."""
   t, rp = group_slots(rows, k, n)
   fills = DATA + -(-rows // 32) * 4096  # after the choices: the count of each value, then its next slot
   out = (fills + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
@@ -550,7 +541,7 @@ void kmain(volatile unsigned *a) {{
   for (unsigned i = 0; i < {-(-rows // 32)}; i++) {{ unsigned u = a[7] + i * a[6]; noc_get(BANK(u), AT(a[5], u, 4096), IDS + i * 4096, 4096); }}
   for (unsigned e = 0; e < {n}; e++) fill[e] = 0;
   for (unsigned s = 0; s < {32 * t}; s++) order[s] = 0;
-  for (unsigned i = 0; i < {t}; i++) tiles[i] = {n};  // n is none, so a matmul that picks by tiles skips those past the ones used
+  for (unsigned i = 0; i < {t}; i++) tiles[i] = {n};  // n marks unused entries, which indexed matmul skips
   for (unsigned s = 0; s < {k * rp}; s++) places[s] = 0;
   noc_wait();
   for (unsigned r = 0; r < {rows}; r++) for (unsigned j = 0; j < {k}; j++) fill[choice(r, j)]++;
@@ -576,13 +567,13 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 def group(ids, n):
-  """Groups the tokens of a mixture of experts by expert. Each tile of the tokens of an expert is then a batch entry
-  for a matmul that picks its weights (index=tiles). ids are the int32 choices, rows x k with values below n.
-  group_kernel does it on BRISC. It returns three int32 tensors:
-  - order: a row of 32 t slots. The choices of each value have a run of them, rounded up to a multiple of 32. Each
-    slot holds its row, or 0 for none. t comes from group_slots.
-  - tiles: a column of t, the value of each tile, and n past those used
-  - places: a row of k runs, each the rows rounded up to a tile. Run j holds the slot of choice j of each row."""
+  """Group rows x k int32 choices by expert, with IDs below n. Return (order, tiles, places), all int32.
+  group_kernel runs this on BRISC.
+
+  order is a row of 32*t slots, where t is group_slots. Each slot holds the source token row, or zero for
+  padding. Expert groups start on tile boundaries. tiles is a column of t expert IDs, with n for unused
+  tiles. places has k runs, one slot index per token per choice, with each run padded to a tile. Indexed
+  matmul uses tiles to select the expert weights."""
   assert ids.dtype == "int32" and ids.batch == 1 and ids.cols <= 32, "ids must be a matrix of int32 choices, at most 32 to a row"
   x, rows, k = ids.realize(), ids.rows, ids.cols  # a matrix, so there's no repeat to copy
   t, rp = group_slots(rows, k, n)
@@ -683,14 +674,12 @@ def mxfp4(blocks, scales):
   return gpt2.bf16_bits(np.ascontiguousarray(np.swapaxes(v, -1, -2)))
 
 def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
-  """The multi-token prediction layer of Qwen3.5. It's block c.layers, which llama.forward doesn't run. For each token
-  at places, h is its hidden state from llama.forward and ids is the token after it. Returns the logits for the token
-  after that. vLLM runs it the same way.
+  """Predict one token beyond ids using the multi-token prediction block at c.layers. h is the hidden state at
+  places; ids contains the following token. Return logits for the token after ids.
 
-  The embedding of ids and h are each RMS-normed and go side by side through fc. Then come the block, its norm and the
-  output layer of the model. The block writes its keys and values into caches[c.layers] at places. slots and length are
-  as in llama.forward. With every=False, logits come out for the last position, which is what the server needs for a
-  chunk of a prompt: it takes the last draft."""
+  RMS-normalize the embedding and h, concatenate them for fc, then run the block, norm and output layer.
+  Update caches[c.layers] at places. slots and length follow llama.forward. With every=False, return only
+  the last position, as needed after a prompt chunk."""
   f, d, l = llama.fns(h), c.dim, c.layers
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]

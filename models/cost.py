@@ -1,11 +1,9 @@
-# What a model costs to serve on Blackhole cards, worked out from its config.json without the weights (llama.config). It
-# counts what a card holds: the weights in the mode's formats (llama.precision) and the sessions' KV cache rows and Gated
-# DeltaNet states. It counts what a decode step reads, computes and launches: the weights, the experts its tokens pick,
-# and the sessions' rows and states. From those come how many sessions fit, tokens/s per user and per card, and dollars
-# per million tokens. The card's rates come from its spec until you measure them with the probe
-# (python3 -m baretile.probe 8 probe.json, then probe=probe.json here). The launches per block are baretile's, counted
-# on ttsim. It models what baretile would do, and only a card can say how far off it is.
-#   python3 models/cost.py path/to/model [bf16|bfp8|bfp4|tt|experts] [key=value ...]   # keys from CARD and USE
+# Estimate serving memory, throughput and cost from config.json, without loading weights.
+# Count weight and cache traffic, matmuls and launches for the chosen precision. Launch counts come
+# from ttsim; default card rates use specifications and assumptions. To use hardware measurements,
+# run python3 -m baretile.probe 8 probe.json, then pass probe=probe.json here.
+#   python3 models/cost.py path/to/model [bf16|bfp8|bfp4|tt|experts] [key=value ...]
+# Available settings are in CARD and USE.
 import json, math, os, sys
 from types import SimpleNamespace
 import numpy as np
@@ -91,9 +89,8 @@ def shape(c, mode="bf16"):
                          values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1))
 
 def session(c, use, speculative=False):
-  """The bytes a session holds. They're KV cache rows for each attention block, up to a sliding window's, and for the
-  multi-token prediction layer, plus the Gated DeltaNet states. Speculating keeps two copies of the states, from before
-  and after a draft."""
+  """Bytes reserved per session for KV caches and DeltaNet states, including the prediction layer. Sliding
+  windows cap the attention rows. Speculative decoding keeps state before and after the draft."""
   row = 2 * c.kv * llama.head(c) * BYTES[use["kv"]]
   window = lambda l: c.sliding if c.sliding and llama.windowed(c, l) else use["context"]
   kv = sum(row * min(use["context"], window(l)) for l in range(c.layers) if not llama.linear(c, l))
@@ -106,10 +103,9 @@ def session(c, use, speculative=False):
 def touched(c, tokens): return c.experts * (1 - (1 - c.k / c.experts) ** tokens) if c.experts else 0
 
 def regroups(c, m):
-  """The bytes of activations that a prompt chunk of m tokens reads again. When the accumulators for a grid matmul's
-  result tiles don't all fit in L1, workers take their columns a group at a time and read A once per group.
-  kernels.grid_parts plans this for each matmul separately. This counts the blocks' projections and MLPs. A mixture's
-  experts aren't counted, since they run by expert and not on the grid."""
+  """Count activation bytes reread by a prompt chunk of m tokens. If output accumulators don't fit in L1, grid
+  matmul processes groups of columns and rereads A for each. Use grid_parts for the projections and MLPs.
+  Exclude routed experts, which don't use the grid path."""
   hd, d, rt = llama.head(c), c.dim, -(-m // 32)
   def again(k, n):  # the bytes of A that a matmul with K k and N n reads more than once
     plan, w = grid_parts(rt, -(-n // 32), -(-k // 32), GRID, 16, 2) if rt > 1 else None, -(-n // 32)
@@ -122,10 +118,9 @@ def regroups(c, m):
   return sum(again(k, n) for l in range(c.layers) for k, n in matrices(l))
 
 def attention(c, entries, queries, rows, kv):
-  """The bytes an attention block reads in Tensor.attend. A unit is up to eight tile rows of 32 queries, for each of
-  `entries` heads, or key heads with a token's query heads side by side. Units read the `rows` keys and values that
-  their positions reach, the values once and the keys once. Keys past what a part keeps in L1 between its sweeps
-  (attention_store) are read twice. Parts share keys the way attend shares them."""
+  """Count bytes read by Tensor.attend for entries heads over rows keys. A unit handles up to eight tile rows
+  of queries. Read values once and keys once if they fit in L1 between sweeps; reread keys beyond
+  attention_store's capacity. Account for the same splitting and grouped query heads as Tensor.attend."""
   ht, kt, wt = llama.head(c) // 32, -(-rows // 32), kv if kv in ("bfp8", "bfp4") else None
   units = entries * -(-queries // 256)
   parts = attention_parts(ht, queries, wt, kt, units, WORKERS)
@@ -134,10 +129,10 @@ def attention(c, entries, queries, rows, kv):
 def past(kind, n): return float(np.interp(n, *zip(*CONTROL[kind])))  # CONTROL's cycles for kind at n tokens, flat past its counts
 
 def step(c, s, use, card, users, speculative=False, cards=1):
-  """A decode step that serves `users` sessions. A session gets a token, or when speculative a token and a draft, and
-  then a second call makes the next drafts. Returns the bytes read (and the states written), flops, launches, control,
-  seconds and tokens/s per user. The step waits on DRAM or the matmuls, whichever is slower, then on its launches,
-  then on the RISC-V work its kernels do beyond their reads, if the card's matches ttsim's count."""
+  """Estimate a decode step for users sessions. Return traffic bytes (including state writes), FLOPs, launches,
+  control cycles, seconds and tokens/s per user. Speculation verifies a token and draft, then makes the next
+  drafts in a second call. Use the longer of DRAM and matmul time, then add launch overhead and RISC-V work
+  estimated from ttsim."""
   n, one, d, v = users * (1 + speculative), session(c, use, speculative), c.dim, " verify" * speculative
   blocks = sum(not llama.linear(c, l) for l in range(c.layers))
   outputs = lambda tokens: touched(c, tokens) * -(-tokens // 32) * 32 * (3 * c.moe + d) * BYTES["bf16"]  # for a block
@@ -162,15 +157,10 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, rate=rate)
 
 def prompt(c, s, use, card, chunk, cards=1):
-  """Prefills a prompt that fills a session (use's context) in chunks of `chunk` tokens, and returns its seconds and
-  tokens/s. serve.py's engine prefills the same way.
-
-  A chunk reads the matrices other than the experts and the embedding, plus the experts its tokens pick. It reads the
-  session's rows up to its last position, a key head's rows per eight tile rows of a query head (`attention`), and
-  its activations again where a matmul goes a group of columns at a time (`regroups`). It computes its tokens' matmuls,
-  with the output layer for the last token only, and their scores over those rows. A multi-token prediction layer runs
-  over the prompt's positions too. A chunk takes as long as DRAM or the matmuls, whichever is slower. Launches and
-  control are left out."""
+  """Estimate seconds and tokens/s to prefill use's context in chunks, as serve.py does. Count non-expert
+  matrices, selected experts, visible cache rows and activations reread by regroups. Include token matmuls,
+  attention scores and the prediction layer, with the output layer only at the chunk's last token. Use the
+  longer of DRAM and matmul time. Launch and control overhead are omitted."""
   hd, d, n = llama.head(c), c.dim, use["context"]
   blocks = sum(not llama.linear(c, l) for l in range(c.layers)) + c.mtp
   seconds = 0.0

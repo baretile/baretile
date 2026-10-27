@@ -1,4 +1,4 @@
-# Tests for Tensix codegen, the kernels and Tensor (layers 2 and 3). conftest.py says how they run.
+# Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
 import math, os, random, pytest
 import numpy as np
 from baretile import bh, tensix, tensor
@@ -656,9 +656,9 @@ def test_softmax_and_layernorm(chip):
       assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))
 
 def test_attend(chip):
-  # Attention in one kernel (Tensor.attend) computes softmax(q k^T + mask) v, checked against numpy within 1%. The chip
-  # makes the mask from the position of each row, hiding the keys past it. With a window, it also hides the keys a
-  # window or more before it.
+  # Tensor.attend computes softmax(q k^T + mask) v, checked against numpy within 1%. The attention kernel produces
+  # weighted sums; a separate division normalizes them. The mask excludes future keys and, with a window, keys
+  # at least window positions before the query.
   # The cases cover several tile rows of queries, and a key and value head serving two query heads, with the repeat
   # read in place. They cover 256-wide heads that share their positions, a KV cache in bfp8, and keys that end partway
   # through a tile, with three tile rows of queries. Then come a sliding window, and ten tile rows in units of eight
@@ -1032,7 +1032,7 @@ def test_autograd(chip):
 def test_fuzz(chip, monkeypatch):
   # Random expressions mix elementwise ops with broadcasting, unary ops, reductions along any axis and matmuls, with odd
   # shapes and batches. The kernels they turn into are checked against numpy separately, on their inputs as read back
-  # from the chip. bf16 rounding can pile up through a tree, but each kernel must be right about the inputs it got.
+  # from the chip. This isolates kernel errors from bf16 rounding accumulated by earlier operations.
   rt, checked = Runtime(chip), []
   def numpy(e, xs):
     if isinstance(e, int): return xs[e]

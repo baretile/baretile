@@ -1,4 +1,4 @@
-# Tests for the device and the runtime (layers 0 and 1), plus test_layers. conftest.py says how they run.
+# Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
 import ast, collections, ctypes, os, pathlib, random, struct, sys, threading, time, pytest
 from baretile import bh, pci
 from baretile.hello import hello
@@ -90,8 +90,8 @@ def test_raw_places(chip):
   assert [bh.hops((1, 2), b) for b in ((2, 2), (0, 2), (1, 1), (0, 1))] == [1, 16, 11, 27]
 
 def test_cache_prune(tmp_path, monkeypatch):
-  # Compiled images unused for a week are deleted once per process, before its first compile. Using an image touches
-  # it, so it stays. A folder isn't an image, so it stays too. The tests of an older checkout may build one here.
+  # The first compile removes cached images unused for a week. Reusing an image refreshes its timestamp.
+  # Preserve subdirectories, which may contain caches from older checkouts.
   import baretile.runtime as runtime
   monkeypatch.setattr(runtime, "CACHE", tmp_path)
   old, new, folder = tmp_path / "old", tmp_path / "new", tmp_path / "folder"

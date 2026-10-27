@@ -398,7 +398,7 @@ def test_moe(chip):
   grouped, prompts = tensor.jit(lambda h: qwen.moe(h, t, c)), np.random.default_rng(41)  # each replayed call does its own grouping
   for _ in range(3):
     h = Tensor.of(rt, bf16(prompts.normal(0, 1, (160, 64))).tolist())
-    assert np.array_equal(value(grouped(h)), value(qwen.moe(h, t, c))), "a replayed grouping is the grouping"
+    assert np.array_equal(value(grouped(h)), value(qwen.moe(h, t, c))), "replayed expert grouping must match a fresh call"
   c, w = smol(rng, 2)
   c.k = 2
   for l in range(2):
@@ -419,7 +419,7 @@ def test_moe(chip):
   # chip picking numpy's experts. The experts' outputs are large and of either sign, so the sums lose more bits than in
   # a dense MLP, and the tolerance is 6%.
   replayed, alone = decode(True), decode(False)
-  assert all(np.array_equal(a[0], b[0]) for a, b in zip(replayed, alone)), "a replayed step is the step"
+  assert all(np.array_equal(a[0], b[0]) for a, b in zip(replayed, alone)), "replayed decode must match a fresh call"
   assert all(np.abs(got - want).max() < 0.06 * np.abs(want).max() for got, want in alone), [np.abs(g - w).max() / np.abs(w).max() for g, w in alone]
   held = []  # topk and group free the DRAM they take, so the amount held stays the same across calls
   for _ in range(3):
@@ -580,8 +580,8 @@ def test_qwen3_5_sequences(chip):
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
 def test_delta_step(chip):
-  # qwen.delta runs a Gated DeltaNet decode step in one kernel per key head, and must match numpy_delta to 1e-5 with the
-  # conv inputs exact. The shapes go up to Qwen3.6's 32 heads of 128 by 128. The second sequence is dead (live 0). Its
+  # qwen.delta runs Gated DeltaNet decode in one kernel, with a work unit per key head. It must match numpy_delta to 1e-5 with the
+  # conv inputs exact. The shapes go up to Qwen3.6's 32 heads of 128 by 128. The second sequence is inactive (live 0). Its
   # conv and states stay as they were, and where reads are counted, it reads only its live and accept. With m=2 it's a
   # verify step, which starts from the states after both tokens of the last step or after the first, as accept says.
   rt, rng = Runtime(chip), np.random.default_rng(1)
@@ -606,7 +606,8 @@ def test_delta_step(chip):
       for a, b in ((value(ts["conv"]), want_conv),) + (((value(ts["conv2"]), want_conv2),) if m > 1 else ()):
         assert np.array_equal(a, np.float32(b)), (m, n, "the conv's inputs")
       if n == 1: continue
-      assert np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), "a dead sequence's"
+      assert np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), \
+        "inactive sequence state must remain unchanged"
       if chip.pci.counts:  # the same call again with no sequence dead, then with the second dead
         reads = []
         for alive in (np.ones_like(live), live):
@@ -1008,8 +1009,8 @@ def test_sampling():
     assert r.pick(serve.Head.of(logits)) == want, (made, prompt, kw)
 
 def test_shapes(tmp_path):
-  # Request.pick holds an answer to the shape that tool_choice (serve.chosen) or a JSON schema (serve.formatted) asks
-  # for. A model that would rather greet is held to a tool call, and one with random logits still ends with valid JSON.
+  # Request.pick restricts output to the tool call or JSON schema requested. Logits that favor a greeting must still
+  # produce a tool call when required; random logits must produce valid JSON under the schema.
   tok = bytes_tokenizer(tmp_path)
   tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
   call = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"

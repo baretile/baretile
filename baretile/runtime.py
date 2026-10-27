@@ -112,10 +112,10 @@ def _prune():
     except FileNotFoundError: pass  # another process deleted it first
 
 def compile_rv32(src):
-  """Compile C source, with DEVICE before it, to a flat rv32 image linked at 0. `.start` comes first, else `kmain`.
-  The code reaches its own functions and data by PC-relative addresses (medany, no linker relaxation, no jump tables),
-  so the image runs wherever it's loaded. Images are cached in CACHE by a hash of the compiler version, flags, link
-  script and source, and deleted after a week unused."""
+  """Prepend DEVICE to C source, compile for rv32, and link a flat image at address 0. Put .start first if
+  present, otherwise kmain. PC-relative addressing lets the image run wherever it's loaded; this requires
+  medany, no linker relaxation and no jump tables. Cache images by compiler version, flags, linker script
+  and source. Entries expire after a week without use."""
   link = ("SECTIONS { .text 0 : { *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
           ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
@@ -146,10 +146,9 @@ __attribute__((section(".start"))) void kentry(volatile unsigned *args) {
 """
 
 def compile_kernel(*programs):
-  """Build a kernel from C programs for BRISC, then TRISC 0, 1 and 2. Each defines
-  `void kmain(volatile unsigned *args)`, and None or a missing program means that core has nothing to do. The image is
-  a header of four entry points as offsets from its start (0 for none), then the programs. It runs wherever it's
-  loaded."""
+  """Build an image from C programs for BRISC and TRISC0-2, in that order. Each program defines void
+  kmain(volatile unsigned *args). Omitted or None programs leave that core idle. The header gives four entry
+  offsets, with 0 for an absent program, followed by the programs. The image can run at any load address."""
   image, entry = b"", []
   for src in programs + (None,) * (4 - len(programs)):
     entry.append(16 + len(image) if src else 0)
@@ -320,11 +319,10 @@ void loop(void) {{
 """
 
 class Runtime:
-  """Runs kernels on the Tensix cores from start to end, by default all of them. The last core dispatches and the
-  rest are workers. A kernel is loaded into the workers once and stays until kernel space fills up (evict). The
-  dispatcher pulls launches from a ring in host memory, so a launch costs the host one PCIe write, the doorbell. It
-  runs one launch at a time, and writes [ring read pointer, launches done] back to host memory for wait() and send()
-  to poll. A new Runtime halts the cores of any older one that overlaps it."""
+  """Run kernels on the Tensix rectangle from start to end, using the available tiles by default. The last tile
+  dispatches work to the others. Kernels stay in L1 until the kernel area fills. The dispatcher reads
+  commands from host memory and executes them in order. A new Runtime halts any older runtime that overlaps
+  its rectangle."""
   def __init__(self, chip, start=None, end=None, ring=1 << 20):
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
     assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
@@ -332,8 +330,8 @@ class Runtime:
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
     self.chip, self.launches, self.wptr = chip, 0, 0
     self.queued = collections.deque()  # (launch, workers) for each launch that may not be done yet
-    # DRAM: holes is the free (address, size) in order, used maps address -> size, and freed has (launches queued,
-    # address) for memory freed while launches queued before might still use it
+    # DRAM: holes lists free (address, size) ranges; used maps address to size.
+    # freed pairs an address with the last queued launch that could use it.
     self.holes, self.used, self.freed = [(0, bh.DRAM_BANK_SIZE)], {}, []
     # loaded maps each kernel image in L1 to its address, and room is where the next one goes
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS
@@ -389,17 +387,16 @@ class Runtime:
     rect = bh.noc_rect(start, end)
     chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
     chip.write(dx, dy, DONE, bytes(8))
-    chip.write(dx, dy, OUTBOX, bytes(64))  # wait() would read what an earlier dispatcher left here as this one's
+    chip.write(dx, dy, OUTBOX, bytes(64))  # clear completion status left by the previous dispatcher
     self.doorbell = chip.map(dx, dy, DISPATCH)  # its own TLB, so ringing the doorbell doesn't have to move a window first
     for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
     chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
     chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go, and NCRISC stays in reset
 
   def load(self, kernel):
-    """Put a kernel from compile_kernel into the workers' L1, unless it's there already, and return its address. The
-    write is a multicast over the rectangle, so the dispatcher gets a copy that it doesn't use. When kernel space
-    is full, the loaded kernels are evicted once nothing queued can still be running them. The TLB orders writes
-    strictly, so the kernel lands before any later doorbell."""
+    """Load a kernel into the workers' L1 and return its address, reusing an existing copy if present. Loading
+    multicasts over the rectangle, including the dispatcher. If space runs out, wait for queued work before
+    evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
     if kernel not in self.loaded:
       assert len(kernel) <= ZEROS - KERNELS, f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}"
       if self.evicts(kernel): self.evict()
@@ -414,17 +411,16 @@ class Runtime:
     self.loaded, self.room, self.evictions = {}, KERNELS, self.evictions + 1
 
   def launch(self, kernel, args=(), units=None, name=""):
-    """Queue a kernel from compile_kernel, loading it first if needed. Workers see the arguments as
-    [first unit, how many units, *args]. The work is `units` units, by default as many as there are workers, shared out
-    evenly and in order among at most that many workers. name is what profile calls it."""
+    """Queue a compiled kernel, loading it if needed. Divide units between workers in order; the default is one
+    unit per worker. Workers receive [first unit, unit count, *args]. name identifies the launch in
+    profiles."""
     if self.log is not None: self.log.append((kernel, args, units, name))
     self.send(*self.block([(kernel, args, units, name)]))
 
   def block(self, launches):
-    """Turn launches [(kernel, args, units, name)] into a block of commands for send, plus (name, workers) for each.
-    This loads their kernels, and the block holds their addresses, so it can be sent again as long as none has been
-    evicted (evictions). A kernel that has to evict the others sends the block so far first, since evicting waits for
-    the launches already sent."""
+    """Convert [(kernel, args, units, name)] to commands for send, plus (name, worker count) per launch. Load
+    the kernels first, since commands contain their L1 addresses. Commands can be replayed until a kernel is
+    evicted. If loading requires eviction, send the commands built so far before waiting for space."""
     cmds, sent = [], []
     for kernel, args, units, name in launches:
       if cmds and self.evicts(kernel): self.send(b"".join(cmds), sent); cmds, sent = [], []
@@ -458,11 +454,10 @@ class Runtime:
     self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
-    """Wait for the launches after number `since`, and sum them up by name as [(name, launches, cycles, bytes)], most
-    cycles first. A launch's cycles run from its go to the report of its last worker, on the dispatcher's wall clock.
-    Its bytes are what its workers' NoC reads brought in, counted in 64-byte flits. That covers DRAM, the L1 of other
-    tiles, and copies within a tile's L1. Bytes are None where the NIU doesn't count them. Only the last TIMES
-    launches are kept."""
+    """Wait for launches after since and return [(name, launches, cycles, bytes)], grouped by name with the
+    longest first. The dispatcher times from go to the final worker report. Bytes count NoC reads in 64-byte
+    flits, including DRAM, other tiles' L1 and local copies. Bytes are None without NIU counters. Only the
+    last TIMES launches are available."""
     self.wait()
     assert self.launches - since <= TIMES, f"{self.launches - since} launches to profile, but only the last {TIMES} are kept"
     totals = collections.defaultdict(lambda: [0, 0, 0])
@@ -490,8 +485,8 @@ class Runtime:
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):
-    """Free what dram_alloc returned, once the launches queued so far are done, since they may still use it. It merges
-    with the holes on either side. DRAM that a recorded call took stays, so its replays can write it again."""
+    """Release an allocation after the launches queued so far have finished, then merge adjacent free ranges.
+    Keep allocations made during recording, since replay uses the same addresses."""
     if addr in self.pinned: return
     self.freed.append((self.launches, addr))
     self.reclaim()
@@ -516,9 +511,8 @@ class Runtime:
       self.chip.wait(lambda: cond() or self.read_status(1) != done, what, timeout)
 
   def wait(self, timeout=60):
-    """Wait until the queued launches have finished on their workers, by polling host memory. On a timeout, ask the
-    dispatcher which launch it's on, and report the workers that haven't finished it. Then free the DRAM that was
-    waiting for the launches."""
+    """Poll completion status in host memory, then reclaim memory freed by completed launches. On timeout,
+    report the current launch and its unfinished workers."""
     try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
     except TimeoutError as e:
       current = (self.chip.read32(*self.dispatcher, OUTBOX + 20) + 1) % 2**32  # after the last it saw finish (OUT[5])
@@ -530,8 +524,8 @@ class Runtime:
     self.reclaim()
 
   def report(self, core, launch):
-    """Describe a worker that hasn't finished a launch, for a hang: which of its cores are still in it, the SYNC and
-    FLAGS counters, its NoC requests in flight by transaction id, and on a card the pc of each core."""
+    """Describe an unfinished worker: active cores, SYNC and FLAGS, and outstanding NoC requests by transaction
+    ID. On hardware, include each core's program counter."""
     x, y = core
     words = lambda addr, n: struct.unpack(f"<{n}I", self.chip.read(x, y, addr, 4 * n))
     niu = lambda off: self.chip.read32(x, y, bh.NIU + off)

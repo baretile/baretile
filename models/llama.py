@@ -1,23 +1,12 @@
-# A Llama-family model on baretile, like SmolLM-135M: RMSNorm, RoPE, SwiGLU, grouped-query attention and a KV cache. It
-# generates greedily from the pretrained weights and checks each step against the same model in numpy, which uses the
-# same bf16 weights with float32 math. As in models/gpt2.py, the model is written once for baretile Tensors and numpy
-# arrays. The KV cache has a fixed size and a token's position is data, so decode steps launch the same kernels, and from
-# the third step on they're replays (tensor.jit). Several sequences can decode together, with their caches side by side
-# (see forward's slots). A step gives each of them a token, and a sequence reads only its own cache.
-# The language models of Qwen3.5 and Qwen3.6 run too. They have three Gated DeltaNet blocks for each attention block,
-# and a Gated DeltaNet's state is a few fixed-size tensors that don't grow like a cache. They also have a mixture of
-# experts in place of the MLP, as do Qwen3-MoE, Mixtral and gpt-oss. models/qwen.py adds both.
-#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bfp8|bfp4|tt|experts]
-#   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]   # TT's token accuracy
-# The folder has config.json, tokenizer.json and model.safetensors from Hugging Face's HuggingFaceTB/SmolLM-135M. Other
-# Llamas work too, like SmolLM2-360M or Llama-3.1-8B-Instruct, whose weights are split over several model-*.safetensors
-# files with an index. The modes, which precision spells out:
-#   bfp8     the weight matrices in bfp8 on the chip
-#   bfp4     the MLP's gate and up in bfp4 and the rest in bfp8
-#   tt       Tenstorrent's performance precision, with its formats and its fidelity phases
-#   experts  the MLP's matrices in bfp4
-# numpy uses the weight values that the chip holds, in any mode. With numpy, the accuracy run is in numpy with exact
-# products and needs no chip.
+# Llama-family text models, run with baretile tensors or NumPy arrays. The command compares their
+# greedy choices from pretrained weights. Decode uses a fixed KV cache and replays from its third
+# call onward. Several sequences can decode together in separate cache slots.
+# Qwen-specific experts, Gated DeltaNet and multi-token prediction are in qwen.py.
+#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bf16|bfp8|bfp4|tt|experts]
+#   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]
+# The folder needs config.json, tokenizer.json and safetensors weights, with an index for sharded weights.
+# precision() defines the weight formats and fidelity for each mode. NumPy uses the converted weight
+# values too. Append numpy to a reference accuracy command to run it without a chip.
 import functools, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
@@ -26,9 +15,8 @@ from baretile.tensor import Tensor, jit
 import gpt2, qwen
 
 def fns(x):
-  """What numpy and baretile spell differently: gpt2's list plus what a Llama adds. mm's phases are the chip's fidelity
-  phases, and numpy's products are exact at any. sink_softmax is a softmax that also counts gpt-oss's sinks, logits that
-  have no value."""
+  """Adapt NumPy and baretile operations to the same model code. mm accepts fidelity phases for the chip; NumPy
+  uses full products. sink_softmax includes gpt-oss sink logits in the denominator without adding values."""
   if isinstance(x, np.ndarray):
     topk = lambda a, k: (np.take_along_axis(a, i := np.argsort(-a, -1, kind="stable")[..., :k], -1), i)
     def sink_softmax(a, sink):
@@ -135,12 +123,11 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
   return f.now(x + (qwen.moe(h, p, c, phases, live) if "router" in p else mlp(h, p, phases)))
 
 def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
-  """A block's attention over its cache (see layer). RoPE has already scaled q by 1/sqrt(head width).
+  """Compute attention over this block's cache. RoPE has already scaled q by 1/sqrt(head width).
 
-  With slots, sequences attend over their own parts of the cache. The batch has an entry for each key head and
-  sequence, a view of the cache in place, with the rows of its query heads side by side. Key heads aren't repeated,
-  and tokens don't read other sequences' rows. A sequence reads as many rows as its mask is wide (around's length).
-  When attention is one kernel (attends), it reads only the rows its positions reach."""
+  With slots, each sequence uses its own cache rows. Each batch entry pairs a key head with a sequence and
+  groups its query heads as rows. Key heads are views, so they need no copies. Ordinary attention reads to
+  the mask's width. Tensor.attend reads only the rows reached by the token positions."""
   f, gated, hd, rep = fns(h), c.gated, head(c), c.heads // c.kv
   mask, places, window = mask if isinstance(mask, tuple) else (mask, None, 0)  # on the chip, around gives all three
   nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # Qwen3.5's output gate adds a head for each query head, after v's
@@ -231,8 +218,8 @@ def rotary(c, n):
   return [bf16(heads(table(g, v), v)) for g, v in ((np.cos, 1), (np.sin, 0))] + [turn]
 
 class Weight:
-  """A weight that's read from the checkpoint when it's needed, so the host holds at most a matrix or two of a big
-  model at a time. bits() returns its bf16 bits laid out for x @ w, and values() the same as float32."""
+  """Read a checkpoint matrix on demand so the host doesn't need the whole model in memory. bits() returns bf16
+  bits arranged for x @ w; values() returns those values as float32."""
   def __init__(self, bits): self.bits = bits
   def values(self): return gpt2.bf16_floats(self.bits())
 
@@ -292,16 +279,14 @@ def fuse(w, c):
   return w
 
 def around(w, c, places, size, slots=None, length=None):
-  """Returns (rows, rotary, mask, window, live) for tokens at places. rows are the cache rows they write, rotary the
-  table rows for their positions, and mask covers a cache of size rows. window is the sliding window's mask, or None.
-  live says which tokens are live, and None means all of them.
+  """Return (rows, rotary, mask, window, live) for tokens at places. rows selects cache positions; rotary
+  selects RoPE rows. mask covers size positions, window is the sliding-window mask or None, and live marks
+  active tokens (None means all active).
 
-  With slots, the tokens are the sequences' next ones in turn, and a sequence's part of the caches is size / slots
-  rows. The masks are laid out like attention's scores. live is 0 for a token on the last row of its part. Such a
-  token belongs to a free slot, since no sequence reaches that row, and it sees only the first row of its part. length
-  cuts the masks to the first length rows of a sequence, which is the most attention reads. On the chip each mask comes
-  with a column of its rows' positions and its window. Tensor.attend takes those in place of the mask and reads only
-  the rows they reach."""
+  With slots, each sequence owns size / slots cache rows and supplies the same number of tokens. The last
+  row is reserved for a free slot: live is zero there and attention sees only the first cache row. length
+  limits ordinary masks to a prefix of each slot. On the chip, masks also carry positions and window bounds
+  for Tensor.attend, which reads only visible rows."""
   numpy = not isinstance(places, Tensor)
   f, places = fns(w["norm"]), np.asarray(places) if numpy else places
   rotary, n, live = (f.rows(w["cos"], places), f.rows(w["sin"], places), w["turn"]), places.shape[-1], None
@@ -351,18 +336,17 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   return (logits, h) if hidden else logits
 
 def prefill(ids, w, c, caches, tokens, on=lambda row: row):
-  """Runs forward over a prompt from position 0, `tokens` at a time. Tenstorrent's prefill splits a long prompt the same
-  way. Each chunk writes its keys and values into caches before the next chunk reads them, so attention's scores are a
-  chunk's rows by the cache's positions, not the prompt's length squared. Returns the logits for the token after the
-  prompt. on turns a row of ids or positions into what forward takes, which is an int32 tensor on baretile."""
+  """Run a prompt from position 0 in chunks of tokens, returning logits after the final token. Each chunk
+  updates caches before the next runs. Attention scores then have one row per chunk token instead of one per
+  prompt token. on converts IDs and positions to the representation used by forward, an int32 tensor on
+  baretile."""
   for i in range(0, len(ids), tokens): out = forward(on(ids[i:i + tokens]), on(list(range(i, min(i + tokens, len(ids))))), w, c, caches)
   return out
 
 def kv_cache(c, size, zeros, slots=1, speculative=False):
-  """Caches for the blocks, the multi-token prediction block included, made by zeros(shape). An attention block's
-  has the key heads and then the value heads, with a row for each of size positions. A Gated DeltaNet block has its
-  states instead: [the conv's last inputs, S] for slots sequences (qwen.deltanet). They're float32, made by
-  zeros(shape, "float32"), and there are two sets when speculative."""
+  """Allocate caches for the blocks, including the prediction block, using zeros(shape). Attention caches store
+  key heads followed by value heads, with size rows. DeltaNet caches hold [conv history, S] for slots
+  sequences and use zeros(shape, "float32"). Speculative decoding keeps two copies of those states."""
   states = ((c.conv - 1, slots, 2 * c.kh * c.kd + c.vh * c.vd), (slots * c.vh, c.kd, c.vd)) if c.kh else ()
   def cache(l):
     if not linear(c, l): return zeros((2 * c.kv, size, head(c)))
@@ -374,8 +358,8 @@ def linear(c, l): return l < len(c.layer_types or ()) and c.layer_types[l] == "l
 def windowed(c, l): return not c.layer_types or c.layer_types[l] == "sliding_attention"  # whether block l keeps to a sliding window, if any
 
 def slot(c, caches, u, slots):
-  """Views of caches made for several sequences (slots) that cover sequence u alone: its part of each KV cache, and its
-  Gated DeltaNet states, with its row of the conv's."""
+  """View sequence u in caches allocated for slots sequences. Select its KV rows and DeltaNet state.
+  Convolution history uses a Row wrapper because it has a row per sequence."""
   part = lambda kv: kv[:, u * kv.shape[-2] // slots:(u + 1) * kv.shape[-2] // slots, :]
   conv = lambda s: s[:, u:u + 1, :] if isinstance(s, np.ndarray) else qwen.Row(s, u)
   return [[conv(s) if i % 2 == 0 else s[u * c.vh:(u + 1) * c.vh, :, :] for i, s in enumerate(kv)] if linear(c, l) else part(kv)
@@ -391,8 +375,8 @@ DEFAULTS = dict(head_dim=None, rope=None, partial=None, sliding=None, layer_type
 def model(**c): return SimpleNamespace(**DEFAULTS | c)  # a config with the given fields, and DEFAULTS for the rest
 
 def config(folder, places=4096):
-  """Reads a model's config.json. For a model that also sees images, it reads the language model's config. places is
-  the most positions RoPE's tables need rows for, capped at the model's maximum."""
+  """Read config.json, selecting the text config for a multimodal model. Cap places at the model's maximum when
+  sizing RoPE tables."""
   j = read_json(os.path.join(folder, "config.json"))
   j = j.get("text_config", j)
   rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5, else the older two

@@ -1,10 +1,8 @@
-# An OpenAI-compatible server for a Llama-family model on baretile. Requests join and leave a batch that decodes
-# together. Sequences have slots in a shared KV cache (and in the Gated DeltaNet states), and a step is one replayed
-# call for all the slots, or two when speculating. A prompt goes to the free slot that already holds the longest prefix
-# of it, or takes a kept session that holds a longer one. Sessions are kept on the chip, and on the host once the chip
-# is full. A shared prefix, like a system prompt or an agent's conversation so far, isn't prefilled again.
+# OpenAI-compatible HTTP server for the models in llama.py. Requests decode together in separate
+# cache slots. Fixed shapes let steps replay, including when slots are idle. Reuse prompt prefixes
+# from free slots or saved sessions; keep sessions in device DRAM, then host memory as space fills.
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]
-# model is a folder or a Hugging Face model id. Then come the formats of the weights (llama.precision) and the KV cache.
+# model is a local folder or Hugging Face ID. The final two arguments select weight and KV cache formats.
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import codecs, collections, functools, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,9 +15,9 @@ from baretile.tensor import Tensor, jit
 import gpt2, llama, qwen
 
 class Head:
-  """A row of logits as the chip gives it (heads). values and ids are its k largest logits, descending, and their
-  tokens. lse is the log of the sum of exp(x t) over the row, where t is the 1/temperature of the request. row() reads
-  the row back from the chip, for a draw that needs it. Head.of makes a Head from a row of logits in numpy."""
+  """The largest logits in a row, with token IDs in descending logit order. lse is log(sum(exp(x*t))) over the
+  whole row, where t is inverse temperature. row() reads the full row when sampling needs it. Head.of builds
+  the same representation from NumPy logits."""
   def __init__(self, values, ids, lse, row): self.values, self.ids, self.lse, self.row = np.asarray(values, np.float64), ids, float(lse), row
   @staticmethod
   def of(logits, t=1.0, k=64):  # finds the k-th largest with a partition, then sorts the logits at least that large. Ties keep the lower id first
@@ -54,15 +52,13 @@ def heads(logits, t=None, k=64):
   return values.realize(), ids.realize(), lse.realize()
 
 class Request:
-  """A prompt and how to go on from it (pick), until a token in eos, a stop string, or max_tokens.
+  """Track a prompt, sampling settings and generated text. Stop at eos, a stop string or max_tokens. out
+  receives text once it can't begin a stop string, then None at completion. finish records the reason; gone
+  cancels a request after the client leaves.
 
-  Each piece of new text goes into out as soon as no stop string could still begin in it. None follows once the engine
-  is done with the request (end), and finish says why. If the client has gone (gone), the request ends at its next
-  token, or before it takes a slot. cached counts the prompt tokens that its slot or a kept session already held, which
-  weren't prefilled. With logprobs set, probs gets the log probability of each token made, and those of the logprobs
-  most likely tokens, from the raw logits of the model. marks has the length of probs at each piece of text. shape is
-  what the text must keep to (pick), or None. room is the slot that it holds from its offer to its end (Engine.offer),
-  or None if it wasn't offered."""
+  cached counts reused prompt tokens. probs stores log probabilities from raw logits, and marks maps text
+  pieces to positions in probs. shape checks whether text can satisfy an output constraint. room holds the
+  semaphore acquired by Engine.offer until the request ends."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None, top_k=0, min_p=0.0,
                presence=0.0, frequency=0.0, repetition=1.0, logprobs=None, shape=None):
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
@@ -74,18 +70,17 @@ class Request:
     self.room = None
 
   def whole(self):
-    """Whether it needs the row of logits past the head. Penalties can move tokens from past the head into it, a shape
-    may turn down all of the head, and log probabilities are at temperature 1."""
+    """Whether sampling needs the full logit row. Penalties or shape constraints can select tokens outside the
+    head. Log probabilities also need the row at temperature 1."""
     return bool(self.presence or self.frequency or self.repetition != 1 or self.shape or self.logprobs is not None)
 
   def pick(self, head):
-    """The next token. It comes from the head of the logits (Head) when the head decides the draw (sample), else from
-    the row read back. The row first takes the penalties: presence and frequency by the tokens made so far, and
-    repetition by those and the prompt. vLLM applies them the same way. Then draw picks a token.
-    shape is a function of the text made: 0 if the text can't begin anything that fits, 1 if it can, 2 if it fits and
-    is complete. A drawn token is taken if its text can still fit, or for an end of sequence, if the text is complete.
-    Otherwise it's drawn again without that token. Masking 248K tokens a step costs more: once the model is in the
-    shape, this is a check or two."""
+    """Pick a token from Head when possible, otherwise read the full row. Apply presence and frequency
+    penalties to generated tokens, and repetition penalties to prompt and generated tokens, then call draw.
+
+    shape(text) returns 0 for an invalid prefix, 1 for an incomplete valid prefix, or 2 for complete text.
+    Reject a token that makes the prefix invalid and draw again without it. Accept eos only for complete
+    text. This avoids testing every vocabulary token when the first few draws already fit."""
     if not self.whole() and (token := self.sample(head)) is not None: return token
     logits = head.row()
     if self.presence or self.frequency or self.repetition != 1:
@@ -185,30 +180,22 @@ class Request:
     self.out.put(None)
 
 class Engine:
-  """Sequences decoding together on the chip. Each has a slot of `places` rows in the shared KV cache, and Gated
-  DeltaNet states of its own.
+  """Decode sequences together, with places cache rows and separate DeltaNet state per slot. Steps include idle
+  slots to keep shapes fixed for replay. Idle slots use a reserved final row and leave recurrent state
+  unchanged.
 
-  A step runs all the slots, so its shapes don't change and it can be replayed (jit). A slot that's free or still
-  prefilling runs on its last row, which no sequence reaches. It sees only the first row of its slot and leaves its
-  states alone. With attention in one kernel, slots read their rows up to the positions of their sequences, and one
-  replay serves any length. Otherwise attention reads the smallest power of 2 rows (at least 32) that holds the
-  longest sequence, with a replay recorded for each. Either way a step costs what the sequences hold, not the size of
-  their slots. A prompt is prefilled `chunk` tokens at a time, after what its slot already holds, one chunk between
-  steps. A long prompt slows the other sequences down but doesn't stop them.
+  Tensor.attend reads up to each sequence's position. Other attention paths read to the next power of two,
+  at least 32, and keep a replay per length. Prefill one prompt chunk between decode steps so a long prompt
+  doesn't block other requests completely.
 
-  A session is the tokens, cache rows and states of a slot. It's kept when its prompt is in, and again when its
-  request ends. The next turn of an agent starts with its last prompt and answer, so it goes on from where it left
-  off, whichever slot it gets. Sessions are copied on the chip, into DRAM that the caches don't use, up to `park`
-  bytes. By default that's what's free when the engine starts, minus 2 GiB. Past that, the least recently used go to
-  the host, up to `keep` bytes, and past that they're dropped. A copy on the chip, either way, is a few launches and
-  no PCIe. The rows of a KV cache serve any prefix of what they hold, but a Gated DeltaNet state can't be rewound to a
-  prefix of the tokens it took in.
+  Save a session after prefill and at completion. Sessions contain tokens, KV rows and recurrent state and
+  can be restored into any slot. Keep them in device DRAM up to park bytes (free memory minus 2 GiB by
+  default). Move the least recently used sessions to the host up to keep bytes, then discard them. KV rows
+  support shorter prefixes, but DeltaNet state must match the exact tokens that produced it.
 
-  A model with a multi-token prediction layer (Qwen3.5) decodes speculatively. A step verifies the next tokens of the
-  slots, each with a draft after it, in one call (accept in llama.forward). Where the model picks the draft as the
-  second token, it takes that token too. Picks are sampled as usual, so the tokens are the model's own at any temperature.
-  Another call makes the next drafts (qwen.draft). When a draft is turned down, the next step puts back its Gated
-  DeltaNet states."""
+  With a prediction layer, verify each slot's token and draft in one call. Accept the draft when it matches
+  the model's sampled choice, then make new drafts in another call. Rejected drafts restore the state after
+  the first token on the next step."""
   def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=None, keep=4 << 30, park=None):
     assert places % 32 == 0, "places must be a multiple of 32, so that slots are whole tiles"
     self.rt, self.t, self.c, self.tok, self.places, self.keep = rt, t, c, tokenizer, places, keep
@@ -217,7 +204,7 @@ class Engine:
     self.kv = llama.kv_cache(c, slots * places, llama.zeros(rt, llama.cache_format(c)), slots, self.spec)
     self.slot = [llama.slot(c, self.kv, u, slots) for u in range(slots)]  # the caches as slot u sees them
     self.park = max(0, sum(room for _, room in rt.holes) * len(bh.DRAM) - (2 << 30)) if park is None else park
-    self.linear = any(llama.linear(c, l) for l in range(c.layers))  # Gated DeltaNet states then decide where a slot can go on from
+    self.linear = any(llama.linear(c, l) for l in range(c.layers))  # DeltaNet state can resume only from the exact prefix that produced it
     self.attends = llama.attends(c, t)  # attention in one kernel reads the rows up to each position, so a replay serves any length
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
     self.used = [0] * slots  # when each slot last took a request. Of slots that hold as much of a prompt, admit picks the least recently used
@@ -250,8 +237,8 @@ class Engine:
     return self.replays[f, n]
 
   def rows(self, f, n, ts):
-    """The rows from the last call of f that read n rows, as Heads at the 1/temperature of each row (ts). It reads
-    back the heads from the chip, and the logits too, once, if a draw needs them."""
+    """Read Heads from the last call of f at cache length n, using inverse temperatures ts. Read the full
+    logits at most once if sampling needs them."""
     logits, made = self.made[f, n]
     whole = functools.cache(lambda: gpt2.values(logits))
     if made is None: return [Head.of(row, x) for row, x in zip(whole(), ts)]
@@ -280,9 +267,9 @@ class Engine:
     self.held[u], r.cached = r.ids[:n], n
 
   def save(self, u):
-    """Keeps the session of slot u by copying it on the chip: its tokens, its rows of the KV caches (rounded up to a
-    tile) and its states. After a turned-down draft, those are the states after the token before it. Past park bytes
-    on the chip, the least recently used go to the host. Past keep bytes there, they're dropped."""
+    """Save slot u's tokens, KV rows rounded to tiles, and recurrent state. After a rejected draft, save state
+    from before that draft. Copy to device DRAM first. Above park bytes, move the least recently used
+    sessions to the host; above keep bytes there, discard them."""
     key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
     if not key or key in self.sessions or not self.park + self.keep: return
     def copy(x):  # the row of a conv state is copied by a move
@@ -359,8 +346,8 @@ class Engine:
     return logits.realize(), heads(logits, t)
 
   def guesses(self, ids, places, taken, length):
-    """Replayed: the multi-token prediction layer over the last two positions of each slot. Where the draft was turned
-    down, the second is the first again. Returns the logits, and the best token of each row."""
+    """Run the prediction layer over two positions per slot for replay. After rejection, repeat the first
+    position instead of using the second. Return logits and the best token per row."""
     n, d = len(self.busy), self.c.dim
     h = self.hidden[length].reshape(n, 2, d)
     first = h[:, 0:1, :]
@@ -434,7 +421,7 @@ def chat(template, messages, thinking=True, effort="medium", tools=None):
   if kind == "chatml":  # the SmolLM instruct models and Qwen. When Qwen3 isn't thinking, its reasoning is given empty
     prompt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages) + "<|im_start|>assistant\n"
     return prompt if thinking or "<think>" not in template else prompt + "<think>\n\n</think>\n\n"
-  raise ValueError("the chat template isn't one we know: Qwen3.5, gpt-oss, Llama 3 or ChatML")
+  raise ValueError("unsupported chat template; expected Qwen3.5, gpt-oss, Llama 3 or ChatML")
 
 CALLING = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
            "<function=example_function_name>\n"
@@ -446,14 +433,13 @@ CALLING = ("\n\nIf you choose to call a function ONLY reply in the following for
            "not tell the user about function calls\n</IMPORTANT>")  # how to call a tool, word for word from the Qwen3.5 template
 
 def qwen_chat(messages, thinking=True, tools=None):
-  """The chat template of Qwen3.5 and Qwen3.6 (chat_template.jinja, for text). The tools are described in the system
-  turn, tool calls are XML, and tool results go in a user turn of their own. Assistant turns after the last question
-  keep their reasoning. Those turns are the tool calls of an agent since the question, so its next prompt goes on from
-  its last prompt and answer."""
+  """Format text messages as in Qwen3.5/3.6 chat_template.jinja. Describe tools in the system turn, encode
+  calls as XML, and put results in user turns. Keep reasoning in assistant turns after the last question so
+  a tool response can extend the cached conversation."""
   text = lambda m: (m.get("content") or "").strip()
   answered = lambda m: text(m).startswith("<tool_response>") and text(m).endswith("</tool_response>")  # a tool result, sent as a user turn
   question = [i for i, m in enumerate(messages) if m["role"] == "user" and not answered(m)]
-  if not question: raise ValueError("there's no user question among the messages")
+  if not question: raise ValueError("messages must include a user message other than a tool response")
   system = text(messages[0]) if messages[0]["role"] == "system" else None
   out = ""
   if tools: out = "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>" + "".join(
@@ -483,9 +469,8 @@ def qwen_chat(messages, thinking=True, tools=None):
   return out + "<|im_start|>assistant\n" + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
 
 def calls(text, tools=()):
-  """Turns the tool calls of an answer from Qwen3.5's XML into OpenAI's form. Returns (the text before them, the
-  calls), with the arguments of each call as JSON. The schema of the tool decides each value: a string stays as it is,
-  and anything else is read as JSON where it parses."""
+  """Parse Qwen XML tool calls into (preceding text, OpenAI tool_calls). Encode arguments as JSON. Keep
+  schema-declared strings as text; parse other values as JSON when possible."""
   head, mark, rest = text.partition("<tool_call>")
   schema = {t.get("function", t).get("name"): t.get("function", t).get("parameters", {}).get("properties", {}) for t in tools or ()}
   def value(name, key, v):
@@ -498,9 +483,9 @@ def calls(text, tools=()):
   return head.strip(), [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function", "function": call(name, args)} for name, args in found]
 
 def chosen(choice, tools):
-  """The shape that tool_choice gives an answer, as Request.pick takes it, or None for anything (auto). none allows
-  no tool call. required means one or more tool calls and nothing before them. A function by name allows calls to
-  that function and no others. The answer of a thinking model is its text after the reasoning (answer)."""
+  """Build a prefix validator for tool_choice, or None for auto. none disallows calls; required demands calls
+  at the start; a named function allows only that function. For reasoning models, validate the answer after
+  the reasoning."""
   if choice in (None, "auto"): return None
   if choice == "none": return lambda text: 0 if "<tool_call>" in text else 2
   names = [t.get("function", t).get("name") for t in tools or ()]
@@ -517,15 +502,16 @@ class Short(Exception): pass  # the text ends inside a value that could still fi
 class Bad(Exception): pass  # the text can't begin a value that fits
 
 def formatted(form):
-  """The shape that response_format gives an answer, like chosen's, or None for any text. json_object means a JSON
-  object, and json_schema a JSON value that fits its schema.
+  """Build a prefix validator for response_format, or None for unrestricted text. json_object requires an
+  object; json_schema requires a value matching the supported schema fields.
 
-  We keep to type (one or a list), properties, required, additionalProperties, items, minItems and maxItems, enum and
-  const (as json.dumps writes them), anyOf and oneOf, and $ref into $defs or definitions. The rest, like the pattern
-  or format of a string or the bounds of a number, isn't enforced. There's at most one space, tab or newline between
-  tokens, and a number has at most 32 characters, since either could go on forever. A model held to a shape can
-  produce endless whitespace, and Qwen models have done it in vLLM. A comma is allowed only where a key or an item
-  may follow, so no prefix of a shape is a dead end."""
+  Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
+  maxItems, enum, const, anyOf, oneOf and local $ref into $defs or definitions. String patterns, formats and
+  numeric bounds aren't enforced. enum and const use json.dumps representations.
+
+  Allow at most one whitespace character between tokens and 32 characters per number to prevent unbounded
+  generation. Allow commas only where another key or item can follow, so a valid prefix can still be
+  completed."""
   kind = (form or {}).get("type", "text")
   if kind == "text": return None
   if kind not in ("json_object", "json_schema"): raise ValueError(f"response_format: unknown type {kind}")
@@ -636,18 +622,17 @@ def answer(text):
   return reasoning.removeprefix("<think>").strip(), content.lstrip()
 
 def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None):
-  """An HTTP server for the engine, whose thread must be running. It serves /v1/models, /v1/completions and
-  /v1/chat/completions, in one response or streamed as server-sent events.
+  """Create an HTTP server for an engine whose thread is already running. Serve /v1/models, /v1/completions and
+  /v1/chat/completions, with complete responses or server-sent events.
 
-  A model that thinks (its template has <think>, or gpt-oss channels) gives its reasoning apart from its answer, in
-  reasoning_content. Qwen3 doesn't think when chat_template_kwargs has enable_thinking false. gpt-oss reasons as hard
-  as reasoning_effort says: low, medium or high. Given tools (Qwen3.5's template), the tool calls in the answer come
-  as OpenAI's tool_calls, after the text in a stream.
-  usage counts the cached prompt tokens (prompt_tokens_details), which is how OpenRouter bills them. A stream ends
-  with usage in a chunk of its own, which OpenRouter does too. If a piece of text isn't ready in `wait` seconds, the
-  request ends: a hung chip is reported, not waited on. A sampling parameter that a request leaves out comes from
-  defaults: temperature, top_k, top_p, min_p and repetition_penalty from the generation_config.json of the model.
-  vLLM does the same. Failing that, it's OpenAI's default."""
+  Return reasoning separately in reasoning_content. Qwen's enable_thinking=False disables reasoning; gpt-oss
+  uses reasoning_effort (low, medium or high). Qwen tool calls use OpenAI's tool_calls format and follow
+  text when streamed.
+
+  Usage includes prompt_tokens_details.cached_tokens and ends a stream in a separate chunk. End a request if
+  no text arrives within wait seconds. Sampling defaults come from defaults, populated from
+  generation_config.json for temperature, top_k, top_p, min_p and repetition_penalty, then from the
+  handler's built-in defaults."""
   defaults, thinks, harmony = defaults or {}, "<think>" in template, family(template) == "harmony"
   class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body):
@@ -683,8 +668,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
                     repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
       except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens, but a slot holds {engine.places - 2}"}})
-      # OpenRouter wants a 429 when no slot is free, so it can try the next provider for the request. It doesn't count
-      # the 429 against our uptime.
+      # Reject immediately when all slots are busy, so the client can retry or use another provider.
       if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
       head = {"id": f"baretile-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
@@ -741,10 +725,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   return ThreadingHTTPServer(("", port), Handler)
 
 def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
-  """The folder of a model. If model is a folder, it's returned as is. Otherwise it's a Hugging Face model id, and
-  we download its files into cache: the config and tokenizer, the generation and chat configs it has (and
-  chat_template.jinja), and the weights, in one file or in the shards that its index names. HF_ENDPOINT sets the
-  server, and HF_TOKEN is for a gated model. A finished download is marked with .done and isn't fetched again."""
+  """Return a local model folder, downloading a Hugging Face ID if needed. Fetch config, tokenizer, optional
+  chat and generation settings, and safetensors weights or indexed shards. HF_ENDPOINT changes the server;
+  HF_TOKEN authorizes gated downloads. Mark completed downloads with .done and reuse them."""
   if os.path.isdir(model): return model
   folder = os.path.join(cache, model)
   if os.path.exists(os.path.join(folder, ".done")): return folder

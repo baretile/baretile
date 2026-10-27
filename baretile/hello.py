@@ -1,5 +1,5 @@
-# The one-command demo. It boots firmware on the Tensix cores of a rectangle, launches a kernel built with upstream
-# clang and lld on the workers, and reads back what they wrote.
+# Compute Fibonacci numbers on the workers and read the answers back. This is a complete example
+# of compiling and launching a kernel with clang and lld.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.hello
 from baretile import pci
 from baretile.chip import Chip

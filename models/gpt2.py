@@ -1,10 +1,9 @@
-# GPT-2 small on baretile with OpenAI's pretrained weights. It generates greedily and checks each step against the same
-# model in numpy, which uses the same bf16 weights with float32 math. The model is written once and runs on baretile
-# Tensors and numpy arrays. The KV cache has a fixed size and a token's position is data, so decode steps launch the
-# same kernels, and from the third step on they're replays (tensor.jit).
+# GPT-2 on baretile and NumPy, using the same pretrained weights. The command compares greedy
+# choices at each step and continues with NumPy's token. A fixed KV cache lets decode replay from
+# its third call onward (tensor.jit).
 #   TTSIM=/path/to/libttsim.so python3 models/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
-# The weights are model.safetensors from Hugging Face's openai-community/gpt2, and the tokenizer is tiktoken's "gpt2".
-# With bfp8, the weight matrices are bfp8 on the chip, and numpy uses the values the chip holds.
+# Use model.safetensors from openai-community/gpt2 and tiktoken's gpt2 tokenizer. With bfp8,
+# NumPy reads back the converted weights so both versions use the same values.
 import functools, json, math, os, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
@@ -70,11 +69,10 @@ def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 def block(w, pre): return {k[len(pre):]: w[k] for k in w if k.startswith(pre)}  # the weights whose names start with pre, pre cut off
 
 def layer(x, p, mask, heads=HEADS, cache=None, places=None):
-  """A transformer block: attention, then the MLP, each after a layer norm and added back.
-
-  p has the block's weights, named as in the file without "h.<layer>.". mask is 0 where a token may look and -1e9 where
-  it may not. cache has a row per position, the key heads first and then the value heads. One put writes this call's
-  keys and values at places, and attention reads all the cache's rows."""
+  """Run attention and the MLP, each after layer normalization and with a residual addition. p contains weights
+  with the h.<layer>. prefix removed. mask is 0 for visible tokens and -1e9 for hidden ones. cache stores
+  key heads followed by value heads, with one row per position. Write this call's keys and values at places,
+  then read the cache for attention."""
   f, d = fns(x), x.shape[-1]
   hd = d // heads
   qkv = layernorm(x, p["ln_1.weight"], p["ln_1.bias"]) @ p["attn.c_attn.weight"] + p["attn.c_attn.bias"]
@@ -89,11 +87,9 @@ def layer(x, p, mask, heads=HEADS, cache=None, places=None):
   return x + (f.gelu(h) @ p["mlp.c_proj.weight"] + p["mlp.c_proj.bias"])
 
 def forward(ids, w, mask, places=None, caches=None):
-  """Returns the logits for the token after ids. The output layer is the token embedding again, transposed (w["wte.T"]).
-
-  places are the positions of ids in the sequence, from 0 if not given. caches has each block's keys and values (see
-  kv_cache), for decoding a token at a time. ids and places are lists for numpy and int32 rows for baretile, so the
-  positions are data and the steps launch the same kernels (jit)."""
+  """Return logits after ids, using the transposed token embedding as the output layer (w["wte.T"]). places
+  gives token positions, starting at 0 if omitted. caches holds keys and values per block. NumPy takes lists
+  for ids and places; baretile takes int32 rows so positions can change between replays."""
   f, layers = fns(w["wte.weight"]), 1 + max(int(k.split(".")[1]) for k in w if k.startswith("h."))
   x = f.rows(w["wte.weight"], ids) + f.rows(w["wpe.weight"], range(len(ids)) if places is None else places)
   for l in range(layers):
@@ -101,9 +97,9 @@ def forward(ids, w, mask, places=None, caches=None):
   return f.rows(layernorm(x, w["ln_f.weight"], w["ln_f.bias"]), [x.shape[-2] - 1]) @ w["wte.T"]
 
 def mask(places, size, window=None):
-  """The attention mask for tokens at places over size positions. It's -1e9 where a token would look past its own
-  position, or window or more positions back when there's a window, and 0 elsewhere. On the chip it's built from an
-  int32 row of places, so a decode step's mask is data."""
+  """Build a causal attention mask over size positions for tokens at places. Use -1e9 for future tokens and,
+  with window, tokens at least window positions earlier. Other entries are zero. On the chip, places is an
+  int32 row read at runtime."""
   return masked(np.asarray(places)[:, None] if not isinstance(places, Tensor) else places.reshape(1, places.cols, 1), size, window)
 
 def masked(column, size, window=None):  # mask, from places in columns laid out like the rows of attention's scores
@@ -128,8 +124,8 @@ def load(path):
           if name != "__metadata__" and not name.endswith((".attn.bias", ".attn.masked_bias"))}
   return {name: (b, bf16_floats(b)) for name, b in bits.items()}
 
-# Uploads the weights as baretile Tensors and transposes the output layer on the chip. The matrices that matmuls read as
-# B, the blocks' and the output layer, are cast to dtype on the chip and laid out by columns.
+# Upload weights and transpose the output layer once. Store matmul weights in column order,
+# converting them to dtype on the chip.
 def upload(rt, weights, dtype="bf16"):
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
   t["wte.T"] = t["wte.weight"].T.realize()  # transpose once, so no token reads it transposed
@@ -147,11 +143,9 @@ def logits(ids, w):  # the logits for the token after ids, in numpy, as a vector
   return forward(ids, w, mask(range(len(ids)), len(ids)))[0]
 
 def generate(enc, ids, steps, chip, numpy):
-  """Generates on baretile and numpy side by side, the prompt in the first step and then a token per step.
-
-  chip(ids, places, i) returns baretile's logits at step i, and numpy(ids, places) returns numpy's. The two continue
-  with numpy's pick, so a near tie can't send them down different paths. Prints the text, baretile's pick where it
-  differs, and how often the two agree."""
+  """Run baretile and NumPy on the prompt, then one token per step. chip(ids, places, i) returns device logits;
+  numpy(ids, places) returns reference logits. Continue both with NumPy's choice to keep their inputs
+  identical. Print generated text, differing device choices and the agreement count."""
   new, agree = ids, 0
   print(enc.decode(ids), end="", flush=True)
   for i in range(steps):
