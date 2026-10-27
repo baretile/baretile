@@ -1,0 +1,31 @@
+# Runs ruff and the test suite on ttsim for every push and pull request. Tests that need checkpoints, PyTorch,
+# transformers or tinygrad skip themselves here.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install clang, lld and the Python packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          python -m pip install numpy pytest ruff
+      - name: Download ttsim
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh.so --dir "$RUNNER_TEMP/ttsim"
+      # Compiled kernels are cached by their source, so a cache from an older commit only saves time.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/baretile
+          key: kernels-${{ github.sha }}
+          restore-keys: kernels-
+      - run: ruff check
+      - run: python -m pytest -s test
+        env:
+          TTSIM: ${{ runner.temp }}/ttsim/libttsim_bh.so
