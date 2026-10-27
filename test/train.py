@@ -1,6 +1,6 @@
-# Trains a tiny character-level GPT-2 (models/gpt2.py) on baretile in fp32 with Adam, on README and NOTES. PyTorch
-# checks each step's loss and gradients on the same weights. It also trains its own copy from the same start, and the
-# two loss curves drift apart like any two fp32 runs do (see train()).
+# Train a small character-level GPT-2 on README and NOTES using fp32 and Adam.
+# PyTorch checks the loss and gradients at each step using the same weights. A separate PyTorch
+# run starts from the same weights to compare loss curves; floating-point rounding lets them diverge.
 #   TTSIM=/path/to/libttsim.so python3 test/train.py [steps]
 import math, os, sys, time
 from types import SimpleNamespace

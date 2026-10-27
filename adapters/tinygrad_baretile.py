@@ -1,11 +1,10 @@
-# baretile as a tinygrad device. tinygrad is the frontend, baretile the compiler and runtime. Realizing a BARETILE
-# tensor hands tinygrad's graph to baretile before scheduling, and baretile fuses and launches it.
-# Movement stays a View of a baretile tensor until an op needs the data. A multiply summed over axes that both operands
-# span is a matmul. What baretile can't do runs on tinygrad's CPU device, like the integer math of random numbers and
-# other dtypes. TinyJit replays a call's launches, like tensor.jit.
+# Use baretile as a tinygrad device. This adapter compiles tinygrad graphs before scheduling.
+# Movement operations remain views until an operation needs their data. Unsupported operations,
+# including random-number generation and other dtypes, run on tinygrad's CPU device.
+# TinyJit records and replays launches through tensor.jit.
 #   import adapters.tinygrad_baretile, then DEV=BARETILE or Tensor(..., device="BARETILE")
-#   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_baretile.py script.py [args]   # a tinygrad script, unchanged
-# PyTorch runs through tinygrad's torch frontend (extra/torch_backend, the "tiny" device).
+#   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_baretile.py script.py [args]
+# PyTorch uses tinygrad's torch frontend (extra/torch_backend, the "tiny" device).
 import collections, dataclasses, math, os, runpy, sys, types
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -60,8 +59,9 @@ class View:
     offset = self.offset - sum(a * s for (a, _), s in zip(widths, self.strides))
     return View([n + a + b for n, (a, b) in zip(self.shape, widths)], self.strides, offset, mask)
   def reshape(self, shape):
-    """The same elements in a new shape without moving them, or None. Axes of 1 come and go. Each new axis merges a run
-    of old ones or splits an old one, and axes only merge where their strides line up."""
+    """Return a view with the new shape, or None if reshaping requires a copy. Ignore axes of size 1. Merge
+    adjacent axes only when their strides are contiguous; split an axis when its size is divisible by the
+    new size."""
     if math.prod(shape) != math.prod(self.shape): return None
     if self.contiguous(): return View(shape)
     if self.mask is not None and any(w != (0, n) for w, n in zip(self.mask, self.shape)): return None  # an axis of 1 can be all padding
@@ -117,9 +117,9 @@ def grouping(shape, shape3):  # split shape's axes into three consecutive groups
   return None
 
 def materialize(v, groups=None):
-  """v as a baretile tensor of three axes, each a group of v's axes, by default the groups that fold makes. It tries
-  the cheapest first: the tensor as stored, a transpose, one move, or moves that swap blocks of axes. Anything else
-  goes through the host."""
+  """Convert v to a baretile tensor with three axes, grouping its axes as fold does by default. Try the
+  existing layout, a transpose, a single move, then several moves to swap axis groups. Fall back to a host
+  copy if none works."""
   groups = groups or groups3(v.shape)
   shape3, t = tuple(math.prod(v.shape[k] for k in g) for g in groups), v.t
   if v.whole() and t.shape == shape3: return t
@@ -134,9 +134,9 @@ def materialize(v, groups=None):
   return upload(download(v).reshape(shape3), v.t.dtype)
 
 def transposes(v):
-  """A view that only reorders axes, like (B, T, H, D) as (B, H, T, D), as moves that each swap two blocks of axes. A
-  move reads its source as row-major elements and ignores the source's shape, so a swap is one move, and splitting
-  heads out or back takes two. Returns None for other views."""
+  """Convert an axis permutation, such as (B, T, H, D) to (B, H, T, D), into moves that swap two groups of
+  axes. Each move treats its source as row-major elements. Splitting attention heads out or merging them
+  back takes two moves. Return None for other views."""
   axes = [k for k, n in enumerate(v.shape) if n > 1]
   order = sorted(axes, key=lambda k: -v.view.strides[k])  # the axes in the order the tensor stores them
   if v.view.offset or v.view.mask or [v.view.strides[k] for k in order] != list(View([v.shape[k] for k in order]).strides): return None
@@ -165,7 +165,8 @@ def download(v):  # bf16 as raw bits
   return out
 
 def upload(a, dtype=None, shape3=None):
-  """numpy a (bf16 as raw bits) to the chip as dtype, by default fp32, or int32 for ints and bools."""
+  """Upload NumPy array a as dtype. The default is fp32, or int32 for integers and booleans. Pass bf16 values
+  as raw bits."""
   dtype = dtype or ("int32" if a.dtype.kind in "iub" else "fp32")
   shape3 = shape3 or fold(a.shape)
   return tensor.Tensor.frombytes(runtime(), *shape3[1:], np.ascontiguousarray(a, NP[dtype]).tobytes(), shape3[0], dtype)
@@ -180,8 +181,8 @@ def common_groups(shape, values):  # fold an elementwise op the way an operand's
   return next((g for v in values if isinstance(v, Value) and v.whole() and (g := grouping(shape, v.t.shape))), groups3(shape))
 
 def operand(v, shape, groups):
-  """v as an operand of an elementwise op of shape, folded in groups. Broadcast axes stay 1, for baretile to
-  broadcast, if the groups then fold to their full size or to 1. Otherwise the broadcast is materialized too."""
+  """Prepare v for an elementwise operation with the given shape and axis groups. Keep broadcast dimensions at
+  size 1 when each group folds to either 1 or its full size. Otherwise materialize the broadcast."""
   whole = [not v.view.mask or v.view.mask[k] == (0, n) for k, n in enumerate(v.view.shape)]
   small = [1 if s == 0 and n > 1 and whole[k] else n for k, (n, s) in enumerate(zip(v.view.shape, v.view.strides))]
   view = View(small, [0 if n == 1 else s for n, s in zip(small, v.view.strides)], v.view.offset, v.view.mask and
@@ -195,8 +196,9 @@ def spread(t, shape, groups):  # expand an elementwise result to shape when all 
   return t if t.shape == shape3 else t.expand(*shape3)
 
 def reduce(x, axes, op):
-  """Sum (op "sum") or max x over axes, as a baretile tensor of the kept axes in row-major order. If the axes are
-  already the first or last one or two axes of x's tensor, it reduces along those. Otherwise one move puts them last."""
+  """Reduce x over axes using sum or max. Return a baretile tensor with the remaining axes in row-major order.
+  Reduce directly when axes covers the first or last one or two tensor dimensions; otherwise move the
+  reduced axes to the end first."""
   kept = [k for k in range(len(x.shape)) if k not in axes]
   w = x.view.permute(kept + list(axes))
   f = math.prod(x.shape[k] for k in axes)
@@ -238,8 +240,8 @@ def to_chip(v, dtype):
 
 fixed = {}  # host operands that read no buffer, like constant math or an arange, by UOp. they can't change
 def up(x, dtype, shape3):
-  """A host tensor as a chip operand folded to shape3: a number if its values are all equal, else a tensor. A host
-  tensor that reads no buffer is computed and uploaded once, and the last 256 of those are kept."""
+  """Convert a host tensor to a chip operand with shape3. Use a scalar if all values are equal. Cache up to 256
+  constant host tensors that read no buffer, computing and uploading each once."""
   if (key := (x.uop, dtype, shape3)) in fixed: return fixed[key]
   a = array(x.float() if x.dtype is dtypes.bfloat16 else x)  # values, not bf16 bits
   v = (int(c) if isinstance(c := a.flat[0].item(), bool) else c) if a.size and (a == a.flat[0]).all() else upload(a, dtype, shape3)
@@ -314,9 +316,9 @@ class Evaluator:
     return Value(reduce(x, list(range(u.arg[1])), "sum" if u.arg[0] is Ops.ADD else "max"), View(tuple(u.shape)), u.dtype)
 
   def matmul(self, u):
-    """REDUCE(ADD) u as a matmul, or None. Its source must be a MUL of a and b, maybe behind a PERMUTE, and neither may
-    broadcast along the summed axes. Of the other axes, those that both span are the batch, those that only a spans
-    are the rows, and those that only b spans are the columns."""
+    """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
+    through a PERMUTE. Both operands must span the reduced axes. Of the remaining axes, those spanned by
+    both become batch dimensions; those spanned by a become rows, and those spanned by b become columns."""
     p = u.src[0]
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
     m = p.src[0] if p.op is Ops.PERMUTE else p
@@ -343,8 +345,8 @@ class Evaluator:
     return Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
 
   def movement(self, u, x):
-    """A view of x, which becomes one move or none when an op needs the data. A reshape that the view can't follow
-    moves x first."""
+    """Apply a movement operation as a view. Materialize x first if the requested reshape can't be represented
+    by its view."""
     shape = tuple(u.shape)
     if u.op is Ops.RESHAPE: view = x.view.reshape(shape)
     elif u.op is Ops.PERMUTE: view = x.view.permute(u.arg)
@@ -362,8 +364,9 @@ class Evaluator:
     return [(a, n - old - a) for a, n, old in zip(start, size, u.src[0].shape)]
 
   def on_host(self, u, srcs):
-    """u on tinygrad's CPU device, lazily, so tinygrad fuses what runs there and computes it only when the chip needs
-    it. Random numbers need this: they sum a padded view that tinygrad doesn't materialize."""
+    """Build u lazily on tinygrad's CPU device. Tinygrad fuses these operations and computes them when the chip
+    needs the result. Random-number generation uses this path because it sums a padded view that tinygrad
+    doesn't materialize."""
     def there(s, v):  # a source for tinygrad: a chip value is downloaded (host work), a host value stays
       if not isinstance(v, (Value, Tensor)): return s
       return (note_host_work() or cpu(download(v)) if isinstance(v, Value) else v).cast(s.dtype).uop
@@ -398,9 +401,9 @@ class Evaluator:
     return self.on_host(u, x)
 
   def lay_out(self, u, x):
-    """Lay a BARETILE buffer out in the shape that a use reshapes it to, and keep it that way. tinygrad makes weights
-    flat, so this uploads host bytes in that shape, or moves a tensor of another shape into it once. Returns None
-    otherwise."""
+    """Store a BARETILE buffer in the shape requested by its reshape. Tinygrad creates flat weight buffers;
+    upload their host bytes in the requested shape, or move the existing tensor once. Return None when this
+    layout can't be used."""
     h = u.src[0].buffer._buf
     if isinstance(h, Part): return None
     if isinstance(x, Tensor) and constant(x) is None and u.dtype in DTYPES and h.value is None:
@@ -417,7 +420,8 @@ class Evaluator:
     return self.movement(x, v) if isinstance(v, Value) else self.on_host(x, [v] + [self.values.get(s) for s in x.src[1:]])
 
   def read(self, v):
-    """v, or if it's a buffer, its contents now: a chip value or bytes for BARETILE, bytes for another device."""
+    """Return v, resolving buffers to their current contents. A BARETILE buffer contains a chip value or bytes;
+    other devices supply bytes."""
     if not (isinstance(v, UOp) and v.op in (Ops.BUFFER, Ops.ALLOC)): return v
     buf = v.buffer
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
@@ -433,9 +437,8 @@ class Evaluator:
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
 
   def store(self, target, value):
-    """Store value into the buffer target, maybe reshaped, or into a part of it through a view. A part is written on
-    the host: its elements are replaced and the buffer gets new bytes, so a value read from the buffer earlier keeps
-    what it had."""
+    """Store value into target, reshaping if needed. Writes through a view update part of the buffer on the
+    host and replace its bytes. Values read before that write retain the old contents."""
     chain = []
     while target.op not in (Ops.BUFFER, Ops.ALLOC):
       ok = target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None
@@ -454,7 +457,7 @@ class Evaluator:
       a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
       buf._buf.set(a.tobytes())
       return None
-    if isinstance(buf._buf, Part): raise NotImplementedError("a store into part of a BARETILE buffer")
+    if isinstance(buf._buf, Part): raise NotImplementedError("storing into part of a BARETILE buffer is not supported")
     data = lambda: host(value, target.dtype)
     if not on_baretile(target): note_host_work(); buf.copyin(memoryview(flat(data(), n, npd)))
     elif isinstance(value, Value):
@@ -495,7 +498,7 @@ class BaretileAllocator(Allocator):
   lru = False  # with the LRU cache, a new buffer could get the old contents of a freed one
   def _alloc(self, size, options): return BufferStorage(Holder())
   def _copyin(self, dest, src):
-    if isinstance(dest, Part): raise NotImplementedError("a copy into part of a BARETILE buffer")
+    if isinstance(dest, Part): raise NotImplementedError("copying into part of a BARETILE buffer is not supported")
     dest.set(bytes(src))
   def _copyout(self, dest, src): dest[:] = c[:len(dest)] if (c := contents(src)) is not None else bytes(len(dest))
   def _offset(self, buf, size, offset): return Part(buf, offset, size)
@@ -541,14 +544,14 @@ def on_chip(t):  # the holder of a BARETILE tensor that spans its buffer, with i
 
 _tinyjit = tinygrad.engine.jit._TinyJit.__call__
 def tinyjit(self, *args, **kwargs):
-  """TinyJit on BARETILE, like tensor.jit: the second call is recorded, or the first after it that can be, and later
-  calls copy their inputs in and resend the recorded launches as one block. Buffers that the recording stored into
-  get their new values copied back to where it read them.
+  """Record the second TinyJit call that runs on BARETILE, or a later call if the second can't be recorded. For
+  replay, copy inputs into the recorded buffers and submit the recorded launches as a block. Copy updated
+  buffers back to the addresses that the recording reads.
 
-  A function isn't replayed, and runs normally, if it does host work, like random numbers (their counter is on the
-  host) or downloading a value. The same goes if it stores into an input or into a buffer in another layout, takes an
-  input that's part of a buffer or isn't on BARETILE, or binds a symbolic variable. A recording that can't be
-  replayed keeps its DRAM."""
+  Run the function normally if it downloads data, generates random numbers using the host counter, binds a
+  symbolic variable, or uses inputs outside BARETILE. Also skip replay for partial-buffer inputs and stores
+  into inputs or differently laid-out buffers. A recording that can't be replayed retains its DRAM
+  allocations."""
   global recording, hosted
   given = [*args, *(v for _, v in sorted(kwargs.items()))]  # inputs as tinygrad finds them: tensors, and tensors in containers
   ins = [t for t in given if t.__class__ is Tensor]
@@ -557,7 +560,7 @@ def tinyjit(self, *args, **kwargs):
   if not JIT or Device.DEFAULT != "BARETILE" and not any(on_baretile(t.uop) for t in ins): return _tinyjit(self, *args, **kwargs)
   _, var_vals, names, info = _prepare_jit_inputs(args, kwargs)  # tinygrad checks the inputs and realizes them
   holders, self.cnt = [on_chip(t) for t in ins], self.cnt + 1
-  if recording is not None: raise RuntimeError("having TinyJit inside another TinyJit is not supported")
+  if recording is not None: raise RuntimeError("nested TinyJit calls are not supported")
   if self.cnt == 1 or getattr(self, "replay", None) is False or None in holders or var_vals:
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
@@ -569,8 +572,8 @@ def tinyjit(self, *args, **kwargs):
         ret = self.fxn(*args, **kwargs)
         if params := get_parameters(ret): Tensor.realize(*params)
         _check_no_non_tensor_return(ret)
-        # buffers whose new values go back to where the recording read them. inputs are left out: an input that was
-        # laid out anew gets laid out again in replays, from its copy
+        # Copy updated buffers back to the addresses read by the recording. Skip inputs: replay copies them in first
+        # and reapplies any layout changes.
         back = [(h, old) for h, old, _ in recording.values() if old is not None and h not in holders]
         same = lambda h, old: isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
         into_input = any(stored and h in holders for h, _, stored in recording.values())  # a replay would lose that store
@@ -579,7 +582,7 @@ def tinyjit(self, *args, **kwargs):
           if h.value.t is not old.t: old.t.assign(h.value.t)
           h.value = Value(old.t, h.value.view, h.value.dtype)
     finally: recording = None
-    if not rec.launches: raise JitError("didn't JIT anything!")
+    if not rec.launches: raise JitError("no launches were recorded")
     return ret
   rec, values, ret = self.replay
   if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")

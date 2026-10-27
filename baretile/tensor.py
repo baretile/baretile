@@ -54,10 +54,9 @@ class Tensor:
 
   @classmethod
   def frombytes(cls, rt, rows, cols, data, batch=1, dtype="bf16"):
-    """Make a tensor from little-endian values of dtype in row-major order, matrix after matrix. Weights load through
-    here, so it's fast: a strided copy per 8-byte word of a 16-value run covers the tiles along a row, and each DRAM
-    bank gets one write."""
-    assert dtype not in BFP, "a block float is made on the chip, by cast"
+    """Upload little-endian values in row-major order, with matrices stored consecutively. Convert to tile
+    layout in 8-byte chunks and write each bank once. Model weights use this path."""
+    assert dtype not in BFP, "upload as bf16, then cast on the chip to a block-float format"
     t, n, tr, tc, data = cls(rt, rows, cols, batch=batch, dtype=dtype), ITEMSIZE[dtype], -(-rows // 32), -(-cols // 32), memoryview(data).cast("B")
     assert len(data) == n * batch * rows * cols, f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}"
     tb, run = tile_bytes(dtype), 2 * n  # bytes per tile, and 8-byte words per run of 16 values (a row of a face)
@@ -111,8 +110,8 @@ class Tensor:
     return m if self.batch > 1 else m[0]
 
   def gather(self, ids):
-    """Rows ids of this matrix, an embedding lookup. ids is a list, or an int32 row that the chip reads, so it can be
-    computed there. Nothing checks its bounds."""
+    """Read rows selected by ids. Accept a Python list or an int32 tensor row, so indices can be computed on
+    the chip. Python indices are bounds-checked; tensor indices aren't."""
     if not isinstance(ids, Tensor):
       assert all(0 <= i < self.rows for i in ids)
       ids = Tensor.of(self.rt, [list(ids)], "int32")
@@ -123,13 +122,12 @@ class Tensor:
                    -(-self.cols // 32), ids.cols, ids.addr, ids.offset, name="gather")._track("gather", (self,), ids)
 
   def put(self, ids, x):
-    """Write the rows of x into rows ids of each matrix, in place: the inverse of gather. A KV cache takes new keys this
-    way. The position is data, not part of a shape, so a decode step launches the same kernels for each token. Into a
-    block float, x is bf16 and rounds the way cast does."""
-    assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "rows of x, by a row of int32 positions"
+    """Write x into rows selected by ids, in place. Models use this to update KV caches without changing the
+    shape of a decode step. For a block-float destination, x is bf16 and is rounded as in cast."""
+    assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "ids must be an int32 row with one position per row of x"
     assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype), \
       f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
-    assert self.rep == 1, "into a tensor of its own, not a repeat"
+    assert self.rep == 1, "put requires a tensor with rep=1"
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     assert 2 * x.rows + tr <= 2**17, "too many rows to track in a worker's L1"
     return self.realize().run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
@@ -170,9 +168,9 @@ class Tensor:
     t.map = (offset, *strides, *lo, *(hi or shape))
     return t
   def _map(self, shape, axes, starts, steps):
-    """A tensor of shape (batch, rows, cols) whose index e on axis a reads index starts[a] + steps[a] * e on axis
-    axes[a] of this tensor, or 0 outside it. On a move that isn't made yet, the two maps compose, like tinygrad's views,
-    so a chain of moves is one launch."""
+    """Map output index e on axis a to starts[a] + steps[a] * e on source axis axes[a], using zero outside the
+    source. Return shape (batch, rows, cols). Compose with an unrealized move so a chain of maps can run in
+    one launch."""
     if self.op == "move": x, offset, strides, lo, hi = self.srcs[0], self.map[0], self.map[1:4], self.map[4:7], self.map[7:]
     else: x, offset, strides, lo, hi = self, 0, (self.rows * self.cols, self.cols, 1), (0, 0, 0), self.shape
     inside = [_inside(o, s, lo[k], hi[k], n) for k, o, s, n in zip(axes, starts, steps, shape)]
@@ -214,9 +212,8 @@ class Tensor:
     return v._track("repeat", (self,), n)
 
   def split(self, n, axis=2):
-    """Cut the matrix along axis (2 for columns, 1 for rows) into n equal, tile-aligned parts, as a batch, without
-    copying. Attention gets its heads this way, and a KV cache splits the rows of each matrix of a batch. An unrealized
-    sum of realized tensors splits term by term."""
+    """Split along axis (2 for columns, 1 for rows) into n equal tile-aligned parts and view them as a batch.
+    No data is copied. Split an unrealized sum of realized tensors term by term."""
     if terms := _terms(self): return sum((t.split(n, axis) for t in terms[1:]), terms[0].split(n, axis))
     assert axis in (1, 2)
     if self.runs:  # by columns, split cuts K: each part reads further along the same runs
@@ -229,8 +226,8 @@ class Tensor:
     return self._view(self.rows // n, self.cols, self.batch * n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
   def merge(self):
-    """Put the batch side by side as one matrix, the inverse of split: x.split(n).merge() is x. If this isn't computed
-    yet, its kernel writes each matrix into its columns of the result. Otherwise it's copied there."""
+    """Place batch matrices side by side, reversing split: x.split(n).merge() is x. An unrealized expression
+    writes directly into the result columns. Otherwise, copy the matrices there."""
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
     (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # + 0 copies a realized tensor or a move in
     return out._track("merge", (self,))
@@ -244,8 +241,8 @@ class Tensor:
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch, self.dtype)
 
   def realize(self, into=None):
-    """Compute it now and return it. The result goes into new DRAM, or into `into`, which is a view when merge calls
-    this and a tensor when assign does."""
+    """Queue the computation and return this tensor. Allocate DRAM for the result, or write into the tensor or
+    view passed as into."""
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       assert into is None, "a transpose or a move writes a tensor of its own"
@@ -277,7 +274,8 @@ class Tensor:
     """Write x into this tensor in place, as an optimizer updates a weight. An unrealized x is computed into this
     tensor's DRAM, which is safe because elementwise kernels read each tile before writing it. Matmuls and moves read
     other tiles too, which may already be overwritten, so they're realized first and copied in."""
-    assert self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype), "a realized tensor, and x of its shape and dtype"
+    assert self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype), \
+      "assign requires a realized tensor with rep=1 and an x of the same shape and dtype"
     if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     if x.op is not None: x.realize(self); return self
     x = _plain(x)
@@ -285,9 +283,9 @@ class Tensor:
                     -(-self.rows // 32), -(-self.cols // 32), name="copy")
 
   def run(self, key, make, *args, units=None, name=""):
-    """Queue the kernel that make() builds, once per key, over units of this tensor (its tiles by default). Tensors in
-    args are realized and passed as address, batch stride, row stride and offset. Nothing waits here: launches run in
-    order, and tobytes waits for them."""
+    """Build a kernel with make(), cache it by key, and queue it over units (tiles by default). Realize tensors
+    in args and pass their address, batch stride, row stride and offset. Launches execute in order; this
+    call doesn't wait for completion."""
     args = [_plain(a.realize()) if isinstance(a, Tensor) else a for a in args]  # the list keeps each copy alive until it's queued
     self.rt.launch(_cached(key, make), tuple(v for a in args for v in (a._where() if isinstance(a, Tensor) else (a,))), units or self.tiles, name)
     return self
@@ -320,9 +318,9 @@ class Tensor:
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
                    -(-self.rows // 32) * tc, name="bfp4")
   def columns(self):
-    """Lay this out the way a matmul's B reads it, in long requests: column j's tiles are one run down K in bank j % 8,
-    with a block float's exponents first. The result can only be read back or used as a matmul's B: as it is, picked
-    by index=, or split along K."""
+    """Store B by columns so matmul can read several K tiles per request. Column j goes to bank j % 8, with
+    block-float exponents before values. The result supports readback and use as matmul's B, including
+    indexed selection and splits along K."""
     assert self.dtype in ("bf16", *BFP), "bf16 or a block float: a matmul's B"
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
@@ -382,10 +380,10 @@ class Tensor:
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
   def topk(self, k, parts=1, labels=None):
-    """The k largest values of each row, largest first, as (values, int32 indices). Ties keep column order. BRISC does
-    the work alone, a worker per row, and compares exactly. It takes bf16 or fp32 and k up to 64, with no gradient.
-    For rows too wide for L1, parts gives the k best of each part side by side, indexed by column in the original row.
-    A second topk, with those indices as labels, finishes."""
+    """Return (values, int32 indices) for the k largest entries in each row, descending. Ties keep column
+    order. BRISC compares bf16 or fp32 values exactly, with k <= 64 and no gradient. For rows too wide for
+    L1, parts returns k entries per part, labelled by original column. Run topk again with those labels to
+    combine the parts."""
     cols = self.cols // parts
     assert self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols, "bf16 or fp32, k up to 64, and equal parts"
     assert labels is None or (labels.dtype == "int32" and labels.shape == self.shape and parts == 1), "labels need int32, x's shape and parts=1"
@@ -396,10 +394,10 @@ class Tensor:
     return values.run(key, lambda: topk_kernel(*key[1:]), values.addr, ids.addr, *x._where(), x.rows,
                       *(labels._where() if labels else ()), units=x.batch * parts * -(-x.rows // 32) * 32, name="topk"), ids
   def to(self, rt, ch, back):
-    """Copy this tensor to the DRAM of rt's chip over the Ethernet link at our channel ch, which is channel back on that
-    chip (Chip.links). It waits for both chips' queued launches and zeroes the flags, which a replay wouldn't redo, so
-    it can't run in a recording."""
-    assert rt is not self.rt and self.rt.log is None and rt.log is None, "two chips' runtimes, outside a recording"
+    """Copy to rt's chip over Ethernet channel ch, with channel back at the peer (see Chip.links). Wait for
+    queued launches on both chips before clearing the transfer flags. This can't be recorded because replay
+    wouldn't clear those flags again."""
+    assert rt is not self.rt and self.rt.log is None and rt.log is None, "to requires different runtimes with neither recording launches"
     x = self.realize()
     assert not x.runs, "a tensor by columns can only be a matmul's B, or read back"
     if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # copy a view into a tensor of its own first
@@ -422,15 +420,16 @@ class Tensor:
 
   def __matmul__(self, x): return self.matmul(x)
   def matmul(self, x, dtype=None, fidelity=None, index=None):
-    """Matrix by matrix through a batch, where a batch of 1 repeats. Products sum in fp32 in Dst.
+    """Multiply matrices by batch, repeating a batch of one. Products accumulate in fp32 Dst. With bf16 self, x
+    may be bfp8 or bfp4 to reduce bytes read.
 
-    fp32 goes as bf16x3: each operand is hi + lo in bf16, and the products other than lo@lo are summed, which keeps
-    about 16 of fp32's 24 bits. The FPU adds products 8 at a time to about 2^-11 of the largest, which bounds any
-    matmul (NOTES, "Matmul precision"). x can be a block float when self is bf16, read in about half (bfp8) or a
-    quarter (bfp4) of the bytes.
+    An fp32 operand is split into bf16 hi and lo. The kernel sums hi@hi, hi@lo and lo@hi, preserving about
+    16 of fp32's 24 bits. The FPU aligns groups of eight products before adding, with error around 2^-11 of
+    the largest terms. See NOTES.md, "Matmul precision".
 
-    index, an int32 (rows, k) tensor, picks the matrix of x for batch entry b at (b // k, b % k). The chip reads it, so
-    a replay uses the experts its tokens chose. An entry of x.batch or more gives zeros and reads nothing."""
+    index is an int32 (rows, k) tensor. For batch entry b, index[b // k, b % k] selects a matrix from x.
+    Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero
+    without reading a matrix."""
     fidelity = fidelity or FIDELITY
     if index is not None:
       assert index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols), \
@@ -462,12 +461,13 @@ class Tensor:
     return out
 
   def attend(self, k, v, places, window=0, fidelity=None, parts=None):
-    """softmax(self @ k^T + mask) @ v in one kernel, with the scores kept in L1. No gradient.
+    """Compute softmax(self @ k^T + mask) @ v using an attention kernel followed by normalization. Keep scores
+    in L1. No gradient.
 
-    k and v can be a block float (a KV cache) or a repeat, read in place. places is an int32 column with the last key
-    that each row sees. With a window, the first key is window - 1 before it. Only the keys that places reach are
-    read. parts splits each unit's keys among workers, which attention_parts does for a decode step's few units. k's
-    length and q's rows are kernel arguments, so the same kernel serves many lengths."""
+    k and v may use block-float storage or repeat views. places is an int32 column giving the last visible
+    key per query row. With window, the first visible key is window - 1 positions earlier. Read only keys
+    within these bounds. parts divides keys between workers when decode has too few units. Key length and
+    query row count are kernel arguments, so one compiled kernel handles several lengths."""
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
     assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
     assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows
@@ -528,8 +528,8 @@ class Tensor:
         if gs is not None and s.requires_grad: grads[id(s)] = grads[id(s)] + gs if id(s) in grads else gs
     return [_full(grads[id(t)], t.shape) if id(t) in grads else None for t in targets]
   def backward(self, gradient=None):
-    """Add the gradient of self to .grad of the leaves that it came from and that require grad. PyTorch and tinygrad
-    do the same. Returns self."""
+    """Accumulate gradients in .grad for leaves that require them, and return self. Existing gradients are
+    added to, as in PyTorch and tinygrad."""
     leaves, seen = [], set()
     def visit(t):
       if id(t) in seen: return
@@ -596,11 +596,10 @@ def _backward(t, g):
   raise NotImplementedError(f"no backward for {op}")
 
 def _fit(t):
-  """Realize parts of t's tree first, so the rest fits one kernel. A reducing kernel sweeps in passes that each
-  recompute what they read, so long matmuls go first, along with elementwise values that a reduction shares with
-  something else. Then, while t is over MAX_OPS, the biggest value that two ops read goes first, like the residual
-  stream of an RMSNorm. If there's none, the first part that fits down the heaviest branch goes, so the top of the
-  tree stays fused."""
+  """Realize subexpressions until the remaining tree fits a kernel. Realize long matmuls before reductions to
+  avoid recomputing them on each pass. Also realize elementwise values shared with work outside the
+  reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
+  heaviest branch."""
   if any(u.op in COMBINE for u in _lazy(t, set())):
     for u in [u for u in _lazy(t, set()) if u.op == "matmul" and u.srcs[0].cols > 256]: u.realize()
     lazy = list(_lazy(t, set()))
@@ -625,8 +624,8 @@ def _parts(t):  # an fp32 matmul operand as bf16 (hi, lo), lo None for bf16. a t
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # copy a repeat, for a kernel that finds tiles by their position
 def _rows_free(e):
-  """True if e's kernel needs the row count of the result's last tile, which is an argument, and none of the inputs'.
-  Reductions along rows, a transposed B and a B picked by an index need the inputs' counts."""
+  """Whether the kernel needs only the output row count, supplied as an argument. Row reductions, transposed B
+  and indexed B also need input row counts."""
   if isinstance(e, int): return True
   if FOLDS.get(e[0]) == 1 or e[0] == "matmul" and isinstance(e[2], tuple) and e[2][0][0] in "TI": return False
   return all(_rows_free(x) for x in e[1:] if isinstance(x, tuple))
@@ -685,10 +684,10 @@ def _name(e):  # a kernel's name in profiles: its ops, operands first, each once
   return " ".join(ops)
 
 def _expr(t, shape, inputs, kernel):
-  """The tree of unrealized ops under t, for a kernel of t's shape. kernel is [axis it sweeps, sweep length in tiles,
-  reductions it holds (two at most), dtype it computes in, root]. These are realized first instead of fused: an op of
-  another dtype, a cast, a matmul in an fp32 kernel, an op of size 1 along an axis the kernel keeps (so it's computed
-  once), and a reduction along another axis, of another length, or past the second."""
+  """Build the unrealized expression under t for a kernel of t's shape. kernel holds [axis, sweep length in
+  tiles, reductions (at most two), dtype, root]. Realize dtype changes, casts, fp32 matmuls and values that
+  are constant along a kept axis separately. A reduction also runs separately if its axis or length differs,
+  or two reductions are already included."""
   if t.op is None:
     assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
     assert not t.runs, "a tensor by columns can only be a matmul's B, or read back"
@@ -724,9 +723,8 @@ def _input(t, inputs):  # the index of a realized tensor among a kernel's inputs
   return len(inputs) - 1
 
 class Recording:
-  """Launches recorded once, with their DRAM kept, and sent again as one block of commands. The block is repacked
-  when its kernels have left L1 (Runtime.evictions). Kernels that don't fit there together leave it between sends,
-  and their block is repacked before it's sent again."""
+  """Record launches and keep their DRAM allocations for replay. Rebuild commands when a kernel has been
+  evicted from L1. If the kernels don't fit together, replay reloads them in batches."""
   def __init__(self, rt): self.rt, self.launches, self.block = rt, [], None
   def __enter__(self): self.rt.log = []; return self
   def __exit__(self, *_): self.launches, self.rt.log = self.rt.log, None
@@ -737,12 +735,12 @@ class Recording:
     self.rt.send(*self.block[:2])
 
 def jit(f):
-  """Replay f, a function from tensors to a tensor, from a recording. The first call runs, the second is recorded,
-  and later calls copy their inputs in and resend the recorded launches as one block of commands.
+  """Run f normally on the first call, record the second, then replay its launches. Later calls copy inputs
+  into the recorded buffers.
 
-  Inputs must keep their shapes and dtypes. Other tensors that f reads must not change, and f can't read back. The
-  result and the tensors that f keeps, like a gradient in .grad, are the same tensors from call to call, and the next
-  call overwrites them."""
+  Input shapes and dtypes must stay fixed. Other tensors read by f must not change, and f must not read back
+  to the host. The result and retained tensors, including .grad, reuse their buffers. The next call
+  overwrites them."""
   calls, inputs, out, rec = 0, (), None, None
   def run(*xs):
     nonlocal calls, inputs, out, rec

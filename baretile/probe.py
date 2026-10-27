@@ -1,14 +1,10 @@
-# Measures the numbers that ttsim can't give, on a card (NOTES.md, "Bring-up on a p150"): launch cost and how it grows
-# with the rectangle, DRAM bandwidth by request size and reads in flight, the latency of a DRAM read and of the NoC,
-# the rates of the Tensix units (MVMUL, a matmul step with its unpacks, the packer and the SFPU), BRISC's topk, and
-# PCIe both ways. Each number decides something: DEPTH, CHUNK and CHUNKS, how the weights lie in DRAM, whether a
-# token's matmul reads one bank per worker, how many fidelity phases a matmul gets before its unpacks hold it back, how
-# many launches a token can afford, and whether a router's choices are cheap enough on a RISC-V core. The probes are
-# small kernels built from the pieces in tensix.py and timed by the tile's wall clock. On ttsim the numbers mean
-# nothing, since Tensix instructions take no time there, and neither do NoC and DRAM reads. There it checks that the
-# probes run.
+# Measure launch cost, DRAM and NoC latency, bandwidth, Tensix throughput, BRISC topk and PCIe
+# transfers on a card. See NOTES.md, "Bring-up on a p150". Use these measurements to choose
+# buffer depths, request sizes, bank assignments and matmul fidelity.
+# The probes use small kernels built with tensix.py and timed by the tile's wall clock.
+# ttsim can check that they run, but its timings don't predict card performance.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.probe [MiB] [out.json]
-# MiB is how much to upload and read back (default 8). out.json gets the numbers, for models/cost.py.
+# MiB is the upload and readback size (default 8). models/cost.py can read out.json.
 import functools, json, sys, time
 from baretile import bh, pci
 from baretile.chip import Chip
@@ -183,7 +179,7 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
 if __name__ == "__main__":
   chip = Chip(pci.open_device())
   sim = isinstance(chip.pci, pci.Sim)
-  print("ttsim: these numbers show that each probe runs, and say nothing about silicon" if sim else f"{chip.pci.sys}: the card")
+  print("ttsim: probes completed; timings do not predict card performance" if sim else f"{chip.pci.sys}: the card")
   rows = probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20)
   for what, value, against, unit in rows: print(f"  {what:72s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
   if len(sys.argv) > 2: json.dump({what: value for what, value, _, _ in rows}, open(sys.argv[2], "w"), indent=1)

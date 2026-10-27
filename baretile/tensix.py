@@ -1,12 +1,12 @@
-# Tensix instructions, written from the ISA with no LLK, and the programs that kernels.py writes its kernels in. A
-# kernel is four programs for each worker tile. BRISC fetches operand tiles into L1 over the NoC and sends results
-# home. The TRISCs feed instructions to the three Tensix threads, which unpack, do the math and pack. The threads run
-# at the same time, on different tiles.
+# Tensix instructions and kernel programs, implemented from the ISA without LLK.
+# Each worker runs four programs. BRISC reads operand tiles into L1 and writes results to DRAM.
+# The three TRISCs supply instructions to the unpack, math and pack threads, which process
+# separate tiles concurrently.
 #
-# A tile is four 16x16 faces in row-major order (top-left, top-right, bottom-left, bottom-right), and each face is
-# row-major too. Datum (r, c) is then at (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16. The ISA has no notion
-# of a tile. This is the layout that the 16x16 matrix multiply of the FPU wants. An unpacker reads all four faces into
-# a SrcA or SrcB bank, so face f lands in rows 16f..16f+15. Dst holds the result the same way.
+# A 32x32 tile has four 16x16 faces: top-left, top-right, bottom-left, bottom-right. Each face
+# is row-major. Datum (r, c) is at (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16.
+# This layout matches the FPU's 16x16 matrix multiply; the ISA doesn't define tiles.
+# Unpacking puts face f in rows 16f..16f+15 of SrcA or SrcB. Dst uses the same layout.
 import math, struct
 from baretile import bh
 from baretile.runtime import DATA, FLAGS, SYNC, SYNC_NAMES
@@ -316,8 +316,7 @@ def sin(phase):
   the two are within a factor of 2 of each other. Then sin(r) = r p(r^2) with p a polynomial, and the low bit of k,
   moved to the sign bit, flips the sign.
 
-  From |x| = 2^24 on, an fp32 x is an integer that says nothing about the turn, and the rounding trick fails. The
-  result there is 0. inf and NaN give NaN."""
+  For finite |x| >= 2^24, this range reduction fails and the function returns 0. inf and NaN give NaN."""
   hi = 1.5707964  # pi/2 in fp32. math.pi / 2 - hi is what it leaves out
   return (sfp_const(1, 1 / math.pi),
           [sfp_load(), sfp_bf16(7, phase), mad(4, 0, 1, 7), sfp_bf16(5, 1.5 * 2**23), mad(6, 4, ONE, 5), mad(4, 6, ONE, 5, neg=2),  # LReg 4: k
@@ -463,8 +462,9 @@ def mask_rows(kind, m, d=0):
       p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6), sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False))]
   return p + [CC_OFF]
 def mask_rows_at(m):
-  """mask_rows("sum", m) for a C expression m that's only known when the kernel runs: the rows the last tile holds,
-  1 to 31. The words for each group of 4 rows get pushed with immediates worked out from the group's position."""
+  """Generate mask_rows("sum", m) with m supplied as a C expression at run time. m is the number of valid rows
+  in the final tile, from 1 to 31. Compute instruction immediates for each group of four rows before pushing
+  them."""
   p, identity = masking("sum")
   cut, store = at_least(15, 0, 6), sfp_store(identity, step=False)
   imm12, imm10 = bh.TENSIX_OPS["SFPIADD"][1]["imm12"][0], bh.TENSIX_OPS["SFPSTORE"][1]["imm10"][0]
@@ -476,9 +476,9 @@ MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i ==
 MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
 def allocate(names):
-  """Map each run to its index in the math thread's replay buffer. SFPU bodies replay 32 times a tile, so they come
-  first, longest first. Matmul and mul phases replay up to 4 times, so they come next. What doesn't fit is pushed word
-  by word."""
+  """Assign runs to the math thread's replay buffer. Prioritize SFPU bodies because they repeat 32 times per
+  tile, allocating the longest first. Matmul and mul phases repeat at most four times and get the remaining
+  space. Push runs that don't fit one word at a time."""
   slots, at = {}, 0
   # the name breaks ties, so different processes build the same kernel
   for name in sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), -len(MATH_RUNS[n]), n)):
@@ -524,10 +524,10 @@ def elementwise(op, slots, dst=0):
   return [ins("SETRWC", bit_mask=0b1111)] + [ins(fpu, dst=dst) for _ in range(7)] + [release(ins(fpu, dst=dst))]
 
 def reduce_step(kind, slots, acc, first, edge=0, src=None):
-  """Math for a tile of a reduction. The tile comes into Dst as SrcA (the tile) plus SrcB (zeros), or for fp32 by a
-  fill from slot src. The first tile lands in the accumulator once it's free. Later ones land in scratch, and the SFPU
-  folds them in. edge is how many of the tile's rows or columns along the axis belong to the tensor, when the tile is
-  the last of its line and the tensor ends inside it."""
+  """Accumulate one tile of a reduction. Load bf16 through SrcA plus zeros in SrcB, or fill fp32 from L1 slot
+  src. Put the first tile in the accumulator after waiting for it to become free. Load subsequent tiles into
+  scratch and combine them with the SFPU. For a partial final tile, edge gives the number of valid rows or
+  columns along the reduction axis."""
   row, sem = ACCS[acc]
   mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
   put = lambda d: fill(src, row + d) + FILLED if src is not None else elementwise("add", slots, dst=d)
@@ -609,7 +609,7 @@ B8_SLOTS = bh.BFP_FIRST_DATUM // 1024
 #   READY: set by TRISC0 once the backend config and semaphores are set up
 #   PACKED: results that the pack thread has packed, written by TRISC2. RING says where they go, in four [slot, tile]
 #     entries.
-#   SENT: packed results that BRISC has sent home
+#   SENT: packed results that BRISC has written to DRAM
 SYNC_WORDS = f"""
 enum {{ {", ".join(name.upper() for name in SYNC_NAMES)}, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})
@@ -630,7 +630,7 @@ KMAIN = "void kmain(volatile unsigned *args) {\n  const unsigned *a = (const uns
 def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # unrolled, with no table to load from
 
 def brisc_program(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0, wt="bfp8", outs=OUTS, b8_at=None, near=False):
-  # BRISC moves tiles: inputs into L1 ahead of the unpackers, and results home behind the packer.
+  # BRISC reads inputs into L1 before unpacking and writes results to DRAM after packing.
   #   decls: statics and tables that the body needs. tail: the body's last words.
   #   b8: slots of block floats wt, a matmul's B, at b8_at (B8 by default).
   #   outs: where results in another dtype are packed. near: BANK goes through NEAR.
@@ -649,7 +649,7 @@ static void flipped(unsigned base, unsigned t, unsigned slot) {{
     noc_get(BANK(t), AT(base, t, {tb}) + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
 }}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
-static void send(void) {{  // sends the results packed so far home, in the order they were packed
+static void send(void) {{  // write completed results to DRAM in pack order
   for (; sent < peek(PACKED); SYNC[SENT] = ++sent) {{
     unsigned slot = peek(RING + sent % 4 * 2), t = peek(RING + sent % 4 * 2 + 1);
     noc_put(OUT_SLOT(slot), BANK(t), AT(out, t, {to}), {to}); noc_wait();
@@ -657,7 +657,7 @@ static void send(void) {{  // sends the results packed so far home, in the order
 }}
 // A slot gets fetched into again once thread 0 has unpacked what was there. For a frame that's the frame two back,
 // and for a stream slot the step DEPTH steps back. Thread 0 reports each frame and step in turn, and events counts them
-// the same way. Results go home while BRISC waits.
+// the same way. BRISC writes results to DRAM while waiting.
 static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // Fetches block-float tile t into slot s past B8, which is slot s % b8 of region s / b8. Its 64 exponents go among the
 // region's exponents, and its values among their values.
@@ -680,7 +680,7 @@ static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, uns
   tagged(s + 1);
   if (b_slot != KEPT) {{ if (bfp) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
   if (a_slot != KEPT) get(a, a_tile, a_slot);
-  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 hears of them
+  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 sees ISSUED
   stream_done[s] = ++events;
   SYNC[ISSUED] = ++steps;
 }}
@@ -712,7 +712,7 @@ static void stepc(unsigned bfp, unsigned j, unsigned run, unsigned len, unsigned
 static unsigned part_done[{CHUNKS}], chunks;
 static unsigned chunk_part(void) {{ unsigned p = chunks++ % {CHUNKS}; reached(part_done[p]); tagged(p + 1); return p; }}
 static void chunk_issued(unsigned p, unsigned k) {{
-  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 hears of them
+  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 sees ISSUED
   part_done[p] = events += k;
   SYNC[ISSUED] = steps += k;
 }}
@@ -729,7 +729,7 @@ static void kept_step(void) {{ SYNC[ISSUED] = ++steps; ++events; }}  // a matmul
 // (unflag). By then all the flags of the launch have arrived, and nobody writes one again before the next go.
 #define FLAGS ((volatile unsigned *){FLAGS:#x})
 static unsigned col_end[3];  // events at the end of the last column in each B buffer
-static void await(unsigned i, unsigned n, unsigned v) {{  // until flags i to i + n - 1 reach v, sending results home
+static void await(unsigned i, unsigned n, unsigned v) {{  // wait for flags i..i+n-1 to reach v while writing results to DRAM
   for (unsigned k = i; k < i + n; k++)
     for (;;) {{ asm volatile("fence" ::: "memory"); if (FLAGS[k] >= v) break; send(); }}
 }}
@@ -815,14 +815,14 @@ static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  /
 {body}
 }}"""
 
-# TRISC2. slots is the number of output slots. A slot is packed into again once its last result has gone home.
+# TRISC2. Reuse an output slot after BRISC has written its previous result to DRAM.
 def pack_program(body, slots=2, decls=""):
   return TRISC + decls + f"""
 static unsigned outputs, relayed, used[{slots}];
 static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // hands packed results to BRISC
-// The next result is packed into slot, which is output slot s, and goes home as tile t. Each frame has an output slot,
-// or the frames share one. Once the last result packed there has gone home and RING has room (at most four wait to go
-// home), this tells BRISC through RING.
+// Pack the next result into L1 slot, tracked as output slot s, for DRAM tile t. Frames may share an output slot.
+// Wait until BRISC has written the previous result from this slot and RING has space, then queue the next result.
+// RING holds at most four results awaiting transfer.
 static void output(unsigned s, unsigned slot, unsigned t) {{
   while (peek(SENT) < used[s] || peek(SENT) + 4 <= outputs) relay();
   SYNC[RING + outputs % 4 * 2] = slot; SYNC[RING + outputs % 4 * 2 + 1] = t;

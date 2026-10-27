@@ -1,6 +1,5 @@
-# A Blackhole, reached through its PCIe device interface. NoC reads and writes go through a shared 2 MiB TLB window,
-# or through a TLB of their own (map). Chip also waits with a timeout, finds each tile on the raw grid (raw), talks to
-# ARC and reads its telemetry, resets cores, and drives the Ethernet links (links, send).
+# NoC access through PCIe TLB windows. Chip also reads ARC telemetry and coordinate tables,
+# resets Tensix cores, and transfers data through Ethernet links.
 import struct, time
 from baretile import bh
 
@@ -47,10 +46,9 @@ class Chip:
   def raw(self, x, y): return (x if y < 2 else self.noc_x[x]), self.noc_y[y]  # tile (x, y) on the raw NoC0 grid, for bh.hops
 
   def map(self, x, y, addr, start=None, tlb=None):
-    """Point a TLB at the 2 MiB block that holds NoC address (x, y, addr), and return the BAR0 offset that reaches
-    addr. With start, writes go to that block in the Tensix cores of the rectangle from start to (x, y). Without tlb,
-    the block keeps a TLB of its own, and later calls reuse it. A Runtime maps its doorbell this way, so a new Runtime
-    with the same dispatcher doesn't take another TLB."""
+    """Map the 2 MiB block containing (x, y, addr) and return its BAR0 offset. With start, writes multicast
+    over the rectangle from start to (x, y). If tlb is omitted, reserve a window and reuse it on later calls
+    for the same block. Runtimes with the same dispatcher therefore share a doorbell mapping."""
     base = addr & ~(bh.TLB_WINDOW - 1)
     if tlb is None:
       if (x, y, base, start) not in self.kept:
@@ -122,8 +120,8 @@ class Chip:
   def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold BRISC, NCRISC and the TRISCs in reset
 
   def links(self):
-    """Return this chip's ASIC id, and its Ethernet links that are up as {channel: (peer's ASIC id, peer's channel)}.
-    Tenstorrent's Ethernet firmware reports them in the L1 of each Ethernet tile, in chip_info for both ends."""
+    """Return (ASIC id, links), where links maps a channel to (peer ASIC id, peer channel). Include links that
+    firmware reports as up. The chip_info records for both ends are in each Ethernet tile's L1."""
     enabled, me, up = self.telemetry().get(bh.TAG_ETH_ENABLED, 0), None, {}
     for ch, (x, y) in enumerate(bh.ETH):
       if enabled >> ch & 1 and self.read32(x, y, bh.ETH_PORT_STATUS) == bh.ETH_PORT_UP:
@@ -132,10 +130,10 @@ class Chip:
     return me, up
 
   def send(self, ch, src, dst, n, timeout=1.0):
-    """Copy n bytes from src in the L1 of channel ch's tile to dst in the L1 of the tile at the other end of the link.
-    It's a TT-link write by TX queue 0, which the link delivers once and in order: a write sent after it lands after
-    it, and that's how you know it has landed. send returns while the queue may still be reading src, so don't change
-    src until the queue is free again. The next send waits for that."""
+    """Copy n bytes from src in Ethernet channel ch's L1 to dst in the peer's L1, using TX queue 0. TT-link
+    delivers writes once and in order, so a flag sent after the data confirms its arrival. The queue may
+    still be reading src when this returns. Leave src unchanged until the queue is free; the next send waits
+    for it."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
     assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, "16-byte aligned, below the firmware's L1"
     def free():  # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)

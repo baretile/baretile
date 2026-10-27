@@ -14,8 +14,8 @@
 #     start from a shared system prompt, and each turn adds the last answer and a tool result. It reports tokens/s per
 #     user and for the card, time to first token, and the share of prompt tokens the server had cached. B4 has no
 #     TT-NN side, since TT-NN serves through vLLM, but `load` can drive any OpenAI-compatible server.
-# `table` puts the two side by side. For each timed benchmark it shows baretile's speed over TT-NN's, which we want
-# above 1, and each number's share of the card's roofline. The roofline is the peak matmul rate at the benchmark's
+# `table` compares both stacks. It reports the speed ratio (baretile / TT-NN; above 1 means baretile is faster)
+# and the fraction of the card's theoretical limit. That limit is the peak matmul rate at the benchmark's
 # fidelity for B1 and B3, and the DRAM bandwidth for B2.
 #   python3 test/benchmark.py baretile path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py ttnn path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]

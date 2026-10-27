@@ -1,9 +1,6 @@
-# Times a bf16 matmul across the workers. B is the weights, in bf16 or a block float, laid out by columns the way the
-# models upload them. On a card the time is wall time. On ttsim it's simulated cycles of the RISC-V work on the
-# critical path, which isn't silicon's speed: queued Tensix instructions cost ttsim nothing, and its DRAM reads take no
-# time. bench also counts the bytes that the reads brought in, where the NIUs count them (a card or ttsim-chaos), and
-# compares them with reading each input once. On silicon a big matmul waits on DRAM more than on its MVMULs, and decode
-# (M of 1) is bound by DRAM, so on a card bench also reports the GB/s of reading each input once.
+# Time a matmul with B stored by columns, as model weights are. Report throughput and the bytes read
+# relative to reading each input once. Byte counts need a card or ttsim-chaos. On ttsim, timings reflect
+# RISC-V work; Tensix instructions and DRAM reads take no time. Use a card for performance measurements.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.bench [M K N [fidelity phases [bf16|bfp8|bfp4]]]
 import sys
 from baretile import bh, pci, tensor
@@ -13,10 +10,11 @@ from baretile.tensor import Tensor
 from baretile.runtime import Runtime
 
 def bench(chip, m, k, n, weights="bf16", repeat=3):
-  """Time (m x k) @ (k x n) with B in the dtype `weights`, laid out by columns. Returns seconds, TFLOPS, the GB/s of
-  reading each input once, how many times over the inputs were read (None where the NIUs don't count bytes), and the
-  peak TFLOPS. Matmuls run on the grid, so the peak counts its workers at the AI clock the card reported, and leaves
-  out the dispatcher and the workers off the grid. The inputs are 1.0, so the result is easy to check."""
+  """Time (m x k) @ (k x n), with B stored by columns in weights format. Return (seconds, TFLOPS, input GB/s,
+  read ratio, peak TFLOPS). Input GB/s assumes each input is read once. The read ratio compares counted
+  bytes with that minimum, or is None without NIU counters. Peak TFLOPS uses the grid workers and reported
+  AI clock, excluding the dispatcher and workers outside the grid. Inputs are 1.0 so the result is easy to
+  check."""
   rt = Runtime(chip)
   a, b = (Tensor.frombytes(rt, r, c, b"\x80\x3f" * (r * c)) for r, c in ((m, k), (k, n)))  # bf16 1.0
   b = b.cast(weights).realize().columns()

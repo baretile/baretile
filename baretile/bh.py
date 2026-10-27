@@ -1,6 +1,5 @@
-# Blackhole's hardware facts, kept as data: addresses, sizes, limits, and how instructions and config are encoded. The
-# modifier values of an instruction stay in the compiler, next to the code that uses them. NOTES.md says where each
-# number comes from.
+# Blackhole addresses, sizes, limits and instruction encodings. Modifier values stay in the
+# compiler beside the instructions that use them. NOTES.md lists the sources.
 
 VENDOR, DEVICE = 0x1E52, 0xB140
 # Writing these (offset, value) pairs to config space, in order, resets the chip. They set the target of the PCIe

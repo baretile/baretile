@@ -1,16 +1,15 @@
-# The device at the PCIe level: config space, BAR0, and host memory that the device can DMA to. There are two backends
-# with the same methods. Sim drives ttsim's libttsim.so, and Card drives a card through sysfs. reset() is a chip-level
-# reset, for a card that hangs.
+# PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
+# BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
 import array, ctypes, gc, mmap, os, time
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # where the kernel shows the PCI bus. a test points it at a made-up one
 
 class Sim:
-  """A virtual Blackhole in libttsim.so, driven by forwarding config and BAR0 accesses to it. bdf is its PCI address,
-  since a multi-chip build has several. There's one library per process, so Sims share it, its clock and the host
-  memory it reaches. counts says whether it models NIU_MST_RD_DATA_WORD_RECEIVED, the count of 64-byte flits that
-  a core's reads bring in, for Runtime.profile. ttsim-chaos does, and ttsim as released stops on it."""
+  """A Blackhole in libttsim.so. bdf selects the PCI device in builds with several chips. Sim instances share
+  one library, clock and set of DMA buffers per process. counts is true when the library implements
+  NIU_MST_RD_DATA_WORD_RECEIVED for profiling. ttsim-chaos implements it; released ttsim stops if you read
+  it."""
   lib, dma, clocks, counts = None, [], 0, False  # dma: (bus address, size, host address, buffer). clocks: chip cycles so far
   def __init__(self, path, bdf=0):
     Sim.load(path)
@@ -66,9 +65,8 @@ class Sim:
   def now(self): return Sim.clocks / bh.AICLK  # seconds of chip time by ttsim's clock, which doesn't match silicon
 
 class Card:
-  """A card, driven from userspace. Config space and BAR0 go through sysfs, and DMA memory comes from locked
-  hugepages. It needs root, and the IOMMU off or in passthrough so that bus addresses are physical addresses. It
-  unbinds the kernel driver if one is bound."""
+  """Access a card through sysfs, using locked hugepages for DMA. Requires root and the IOMMU disabled or in
+  passthrough mode, since the card uses physical addresses. Opening the card unbinds its kernel driver."""
   counts = True  # a card's NIUs count what their reads bring in (see Sim)
   def __init__(self, bdf):
     if os.geteuid() != 0: raise PermissionError("Card needs root for config space, the BARs, and physical addresses for DMA")
@@ -102,13 +100,13 @@ class Card:
   def write(self, off, data): _store(self.bar0 + off, data)
 
   def alloc(self, size):
-    """Allocate a locked 2 MiB hugepage, which is physically contiguous. Returns (memoryview, bus address). The page
-    goes back to the kernel's pool once nothing refers to the memoryview. A Runtime keeps its ring and status in it, so
-    the page lives as long as the Runtime does."""
+    """Allocate a locked, physically contiguous 2 MiB hugepage and return (memoryview, bus address). The page
+    returns to the kernel's pool when the memoryview is no longer referenced. A Runtime keeps a reference
+    for its command ring and status words."""
     assert size <= 1 << 21, "Card.alloc gives at most one 2 MiB hugepage"
     MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages, even if the host's default differs
-    # A dropped Runtime can sit in a reference cycle, since the number tensors it caches refer back to it. It then
-    # holds its page until gc collects it, so when no page is free we collect and try once more.
+    # Cached scalar tensors refer back to their Runtime, so dropping a Runtime can leave a reference cycle.
+    # Collect those cycles before giving up: an unused Runtime may still hold a hugepage.
     for tries in (1, 0):
       try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED | MAP_HUGE_2MB); break
       except OSError:
@@ -152,12 +150,13 @@ def open_device(n=0):
   return Sim(os.environ["TTSIM"], Sim.chips(os.environ["TTSIM"])[n]) if "TTSIM" in os.environ else Card(find_cards()[n])
 
 def reset(bdf, timeout=10.0):
-  """Reset the chip the way tt-kmd's ASIC reset does, for a card whose NoC or firmware hangs. A hung kernel doesn't
-  need it, since the next Runtime resets the cores it uses.
+  """Reset a card whose NoC or firmware has hung, following tt-kmd's ASIC reset. Close all processes using the
+  card first. For a hung kernel, creating a new Runtime is enough to reset the cores. This chip reset is
+  untested on hardware.
 
-  The parity bit of PCI_COMMAND marks the reset, and two config writes fire the interface timer of the PCIe controller.
-  The reset is over when the bit clears, or when the card has left the bus and come back. Then a remove and rescan
-  restores the config space as it was at boot. Nothing may have the card open. Untested on silicon (NOTES.md)."""
+  PCI_COMMAND's parity bit marks the reset. Two config writes trigger the PCIe interface timer. Once the
+  marker clears or the device leaves the bus and returns, remove and rescan it to restore config space. See
+  NOTES.md."""
   if os.geteuid() != 0: raise PermissionError("reset needs root to write the card's config space and sysfs")
   path, deadline, gone = f"{SYS}/devices/{bdf}", time.monotonic() + timeout, False
   fd = os.open(f"{path}/config", os.O_RDWR | os.O_SYNC)

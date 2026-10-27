@@ -1,7 +1,7 @@
-# The kernels, written with tensix.py's instructions and programs. tensor.py builds a tree of elementwise ops, matmuls,
-# SFPU programs and reductions, and fused_kernel turns it into one kernel. That kernel fetches each input tile once,
-# keeps intermediates in L1 and writes the result to DRAM. The other kernels do attention, data movement, topk and the
-# like.
+# Compile tensor expressions using the instructions and programs in tensix.py.
+# fused_kernel handles elementwise operations, matmuls, SFPU programs and reductions. It keeps
+# intermediates in L1 and writes results to DRAM. The remaining kernels implement attention,
+# data movement, topk and format conversion.
 import collections
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
@@ -13,14 +13,16 @@ from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CHUN
                             slot_base, step_unpack, table, take, tile_bytes, tile_of, to_bf16, tt, unpack, unpack_program, walk)
 
 def grid_parts(rt, w, kt, grid, base, more=0):
-  """Decide how a grid matmul (mc) of rt x w result tiles with a K of kt tiles fits in L1, using slots from `base` on.
+  """Choose L1 buffers for a grid matmul (mc) producing rt x w tiles with kt tiles along K. Slots below base
+  are already in use.
 
-  Returns None when A's rows and B's three buffers fit below slot 256, so K needn't be split. Otherwise it returns
-  (kp, q, acc): K goes in parts of kp tiles, workers do q of their columns at a time, and result tiles sum their parts
-  in fp32 accumulators from L1 address acc up. A's rows are read again for each group of q columns. It prefers parts
-  of at least 4 tiles, even if the groups get smaller, and leaves `more` slots for single inputs. Returns False if no
-  split leaves room for the accumulators. The answer doesn't depend on B's format, so a block-float B gives the same
-  result as bf16 with the same values, bit for bit."""
+  Return None if A's rows and B's three buffers fit below slot 256. Otherwise return (kp, q, acc): split K
+  into kp-tile parts, process q columns per worker at a time, and accumulate the partial results in fp32
+  from L1 address acc. Read A again for each group of q columns. Prefer parts of at least 4 tiles, reducing
+  q if necessary, and reserve more slots for single inputs. Return False if the accumulators won't fit.
+
+  Choose the layout independently of B's format, so a block-float B and a bf16 B containing the same values
+  produce bitwise-identical results."""
   bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
   if base + (bp + 3) * kt <= UNPACKABLE: return None
   for least in (min(4, kt - 1), 1):
@@ -51,18 +53,18 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   For example, ("add", ("matmul", 0, ("bfp8", 1)), 2) is input 0 times input 1 in bfp8, plus input 2, and
   ("sum2", ("mul", 0, 0)) sums the squares along each row of input 0.
 
-  shapes holds each input's (batch, rows, columns) as Tensor lays it out. A dimension of 1 broadcasts. dtype is what
-  the inputs are and what the kernel computes in. out is what the root is written as: a cast, or a matmul written as
-  fp32. The packer switches to it for the root's pack. grid is Runtime.grid, so that a matmul can share its tiles
-  between workers. reps holds each input's repeat (Tensor.repeat_interleave), 1 by default: matrix b of the input is
-  stored at b // rep. readers is Runtime.readers. With it, workers of a token's matmul read B from their assigned banks.
+  shapes contains (batch, rows, columns) for each input; dimensions of size 1 broadcast. dtype specifies the input
+  and computation format. out specifies the root's output format, for a cast or a matmul that produces fp32. grid
+  is Runtime.grid, which lets matmul workers share input tiles. reps gives the repeat count for each input
+  (Tensor.repeat_interleave), defaulting to 1: matrix b is stored at b // rep. readers is Runtime.readers; it assigns
+  DRAM banks to workers for token matmuls.
 
   The kernel's arguments:
   - a[0] and a[1]: the first unit and the number of units.
   - a[2] to a[5]: the result's DRAM address, tile strides for batch and row, and tile offset, as in Tensor.
   - a[6 + 4 i] to a[9 + 4 i]: the same four for input i.
-  - Last, the rows that the result's last tile row holds, with 0 meaning 32. Rows past it come out zero, even where
-    shapes has more. A compiled kernel then works for any row count that fills the same tiles.
+  - Last, the number of valid rows in the final tile row; 0 means 32. Zero the remaining rows even if shapes
+    includes them. This lets the same compiled kernel handle row counts that occupy the same number of tiles.
 
   A unit is a tile of the result. With one matmul and nothing reducing, it's a block of up to 4 x 4 tiles, or a
   worker's block of the grid. If the expression reduces along an axis, a unit is a line of tiles along that axis: a
@@ -150,7 +152,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   n = [max([ext(op["shape"], ax) for op in ops] + [ext(size(r), ax) for op in ops for r in operands(op)]) for ax in range(3)]
   nb, rt, w = n
   L = n[axis]  # the length of a sweep
-  assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), "a kernel sweeps its lines at one length"
+  assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), \
+    "all operands along the reduction axis must broadcast or have the same tile count"
   swept = lambda r: r != "zero" and ext(size(r), axis) == L and not reduced(r)  # r varies along the sweep. If not, it's one tile a line
   assert len(ops) <= MAX_OPS, f"SEM_L1 counts at most {MAX_OPS} intermediates"
   # Passes. A swept op runs in the first pass after the reductions it depends on have finished. A narrow op is ready
@@ -587,7 +590,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     unsigned unit = a[0] + u, {outer} = unit / {m}, {inner} = unit % {m};
 {sweeps}
   }}"""
-  total = f"a[1] * {L if swept(me) else 1}" if reducing else f"tiles / {n_parts}" if parts else "tiles"  # results this worker sends home
+  total = f"a[1] * {L if swept(me) else 1}" if reducing else f"tiles / {n_parts}" if parts else "tiles"  # result tiles to write to DRAM
   first = ""
   # With bcast, a worker waits for A's row before its first tile. The first grid row of its matrix reads and sends it.
   if bcast:
@@ -642,11 +645,12 @@ def attention_l1(ht, rows, wt, parts):
   return R, fs, T, (p_slot, p_slot + R, p_slot + 2 * R), oacc, places, p_slot + 2 * R + R * ht, places - 64
 
 def attention_store(ht, rows, wt, parts):
-  """Find where a unit's keys can stay in L1 between attention_kernel's two sweeps, and how many key rows fit.
+  """Reserve L1 space to retain keys between the two attention sweeps. Return the storage location and the
+  number of key rows that fit.
 
-  For bf16 that's the first free slot. For a block float it's the bases of regions that hold complete key rows, up to
-  64 slots each, which is as far as the unpacker reaches. They go below B8 past the slots in use, and past the frames'
-  regions."""
+  For bf16, use the first free slot. For block floats, return region bases. Each region holds complete key
+  rows in at most 64 slots, the unpacker's limit. Allocate below B8 after the slots in use, and above the
+  regions reserved for frames."""
   *_, used, top = attention_l1(ht, rows, wt, parts)
   if not wt: return used, (UNPACKABLE - used) // ht
   per = 64 // ht  # key rows in a region
@@ -656,18 +660,18 @@ def attention_store(ht, rows, wt, parts):
   return bases, len(bases) * per
 
 def attention_parts(ht, rows, wt, kt, units, workers):
-  """Pick how many parts Tensor.attend splits each unit's kt key tiles into, when it isn't told.
+  """Choose how many workers share a unit's kt key tiles when Tensor.attend has no explicit parts argument.
 
-  Units of more than two tile rows of queries aren't split. A decode step's units of one or two get as many parts as
-  the workers allow, up to 8 and with at least 8 tiles each, since combining the parts costs a few launches. If a
-  part's keys wouldn't all stay in L1 (attention_store), it takes more parts until they do, still at most 8."""
+  Keep units with more than two tile rows of queries together. For one or two tile rows, use up to 8 parts
+  with at least 8 key tiles per part, limited by the available workers. Combining parts costs additional
+  launches. If the keys still exceed attention_store's capacity, increase the number of parts, up to 8."""
   if -(-rows // 32) > 2: return 1
   room = lambda P: attention_store(ht, rows, wt, P)[1]
   P = max(1, min(8, kt // 8, workers // units))
   return max(P, min(8, -(-kt // room(2)))) if -(-kt // P) > room(P) else P
 
 def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=False):
-  """Attention in one kernel: softmax(q k^T + mask) v for a batch of heads, with the scores kept on the chip.
+  """Compute weighted sums and normalizers for softmax(q k^T + mask) v, keeping scores on the chip.
 
   q is (E, rows, 32 ht). k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV cache, and each of
   their matrices serves rep heads of q. places is (E or 1, rows, 1) int32 and holds the last key that each row sees.
@@ -705,7 +709,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   R, fs, T, (p_slot, m_slot, q_row), oacc, places, used, ranges = attention_l1(ht, rows, wt, parts)
   per = -(-ra // R)  # units per head
   ones, none, fr0 = 1, 2, 3  # tiles of ones and of -1e9, made by the SFPU once a launch, then the frames
-  assert parts == 1 or R <= 2, "only units of one or two tile rows (decode's) take parts"
+  assert parts == 1 or R <= 2, "splitting attention keys requires units of at most two tile rows"
   # The slot of frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j. A block
   # float's are in the frame's region at B8. into() is where BRISC puts a tile: getb's region and slot.
   mask = lambda r: f"{fr0} + fr * {fs} + {r}"
@@ -812,7 +816,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
                "")
   out = lambda j: f"r * {T} + {j}"  # row r's output tile j. Its sums are at j = ht and its largest at ht + 1
   largest_out = (f" while (peek(SENT) < outputs) relay(); {tt(repack(cfg, first) + pack(f'{acc} + 64 * r', out(ht + 1)) + repack(first, cfg))}"
-                 if parts > 1 else "")  # each part's largest goes home with its p v
+                 if parts > 1 else "")  # write each part's maximum alongside p v
   packed = lambda slot: tt(pack("h", slot, SEM_L1)) + f" h ^= {DST_HALF};"
   packer = units(f"needed++; while (peek(FETCHED) < needed) relay(); {read} needed += 2 * (k1 - k0 + 1);",
                  "" if held else each(packed(largest)),
@@ -823,7 +827,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
                  each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(pack('h', out('j')))} h ^= {DST_HALF}; }}") + " " +
                  each(f"{tt(pack('h', out(ht)))} h ^= {DST_HALF};") +
                  f" if (kt == k0) {{ {tt(repack(first, cfg))} }} else {{ {tt(repack(onto, cfg))} }}",
-                 each(f"for (unsigned j = 0; j < {T}; j++) {{ while (peek(SENT) + 4 <= outputs) relay(); "  # all of it goes home
+                 each(f"for (unsigned j = 0; j < {T}; j++) {{ while (peek(SENT) + 4 <= outputs) relay(); "  # write all output tiles
                       f"SYNC[RING + outputs % 4 * 2] = {out('j')}; SYNC[RING + outputs % 4 * 2 + 1] = {tile_of(2, ob, 'i0 + r', 'j')}; outputs++; "
                       f"{tt([ins('SEMPOST', sem_sel=SEM_PACKED)])} }}"))
   # The SFPU makes two tiles once a launch: ones for the sums, and -1e9 for the mask of an empty part.
