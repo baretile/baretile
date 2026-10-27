@@ -15,14 +15,12 @@ from baretile.tensor import Tensor
 
 EMPTY = "void kmain(volatile unsigned *a) {}"
 
-# BRISC alone. Each worker keeps a[3] reads of a[6] bytes in flight, for a[4] rounds, from DRAM at a[2], and writes
-# the cycles it took into a[5]. a[0] is the worker's unit, which picks the reads it makes. Where they go:
-# - if a[9] isn't 0, workers read their own banks, through the ports in `reader`, a table from Runtime.readers that
-#   goes before this code.
-# - else if a[7] isn't 0, the reads go to the bank at NoC x | y << 6 = a[7].
-# - else the reads are interleaved over the banks the way tiles are.
-# If a[8] isn't 0, each read is two requests: a[8] bytes, then the rest. getb reads a block-float tile this way, its
-# exponents first and then its values.
+# BRISC measures DRAM reads from base address a[2]. Each worker issues a[3] reads of a[6] bytes per round,
+# for a[4] rounds, and stores elapsed cycles in a[5]. a[0] selects the worker's share of the data.
+# With a[9], use the worker's bank and port from the `reader` table prepended from Runtime.readers.
+# Otherwise, a nonzero a[7] selects one bank by NoC coordinates x | y << 6. With neither, interleave reads
+# across banks as in ordinary tensor storage. A nonzero a[8] splits each read into that many bytes followed
+# by the remainder, matching getb's separate requests for block-float exponents and values.
 DRAM_READS = BANKS + f"""
 void kmain(volatile unsigned *a) {{
   unsigned d = a[3], n = a[6], s = a[8], t0 = CLOCK;

@@ -38,8 +38,9 @@ def cross_entropy(logits, onehot):  # the mean of -log p(target) over positions,
 B1, B2, EPS = 0.9, 0.999, 1e-8  # Adam's defaults in PyTorch
 LR = 3e-3
 def adam(params, state, lr, bias2):
-  """PyTorch's Adam, written the same way. lr is the step's lr / (1 - B1^step) and bias2 is 1 / sqrt(1 - B2^step).
-  Both are 1 x 1 tensors, so a recorded step (jit) takes them as inputs."""
+  """Update parameters and optimizer state using PyTorch's Adam equations.
+  lr is the bias-corrected learning rate, LR / (1 - B1^step). bias2 is 1 / sqrt(1 - B2^step).
+  Both are 1 x 1 tensors so their values can change between recorded steps."""
   for p in params:
     g, (m, v) = p.grad.realize(), state[id(p)]
     m.assign(m * B1 + g * (1 - B1))
@@ -47,15 +48,14 @@ def adam(params, state, lr, bias2):
     p.assign(p - m * lr / (v.sqrt() * bias2 + EPS))
 
 def train(rt, steps, log=None, data=None):
-  """Trains for `steps` steps on baretile, with PyTorch checking each one.
+  """Train for steps steps on baretile and compare each step with PyTorch on the same weights.
+  Also train an independent PyTorch copy from the same initial weights. Small rounding differences
+  can make the two loss curves diverge: Adam's first update depends on the gradient's sign, which
+  matmul error can change for gradients near zero.
 
-  Each step, PyTorch computes the loss and gradients on baretile's current weights. It also trains a copy of its own
-  from the same start. The two runs drift apart even though each step is right. Adam's first step moves weights by LR
-  times the sign of their gradients, so a weight whose gradient is below the matmul's error (about 2^-12) can move
-  either way.
-  Returns a tuple for each step: baretile's loss, PyTorch's loss on the same weights, the worst gradient error as a
-  fraction of the largest gradient in the same weight, and the loss of PyTorch's own run. data defaults to README and
-  NOTES."""
+  Return a tuple per step: baretile loss, PyTorch loss on the same weights, maximum relative gradient
+  error, and the independent PyTorch loss. Normalize each weight's gradient error by its largest
+  reference gradient. data defaults to the text of README.md and NOTES.md."""
   import torch
   data = data or text()
   chars = sorted(set(data))

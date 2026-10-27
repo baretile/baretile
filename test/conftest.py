@@ -1,6 +1,6 @@
-# The chip, and the helpers that tests of several layers share. test_device.py tests layers 0 and 1, test_kernels.py
-# layers 2 and 3, and test_models.py layer 4. They run on ttsim when TTSIM points at libttsim.so. Without it they run on
-# the first Blackhole on the PCI bus, as root (see "Bring-up" in NOTES.md).
+# Shared chip fixture and tensor helpers. test_device.py covers the device and runtime; test_kernels.py covers
+# code generation and tensors; test_models.py covers models, serving and adapters. Set TTSIM to libttsim.so to
+# use the simulator. Otherwise tests open the first Blackhole on the PCI bus as root (see NOTES.md, "Bring-up").
 import pytest
 import numpy as np
 from baretile import pci

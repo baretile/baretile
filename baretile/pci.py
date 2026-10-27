@@ -3,7 +3,7 @@
 import array, ctypes, gc, mmap, os, time
 from baretile import bh
 
-SYS = "/sys/bus/pci"  # where the kernel shows the PCI bus. a test points it at a made-up one
+SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
 
 class Sim:
   """A Blackhole in libttsim.so. bdf selects the PCI device in builds with several chips. Sim instances share

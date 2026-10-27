@@ -18,9 +18,9 @@ def bf16_bits(a, packer=False):  # to bf16 bits, rounded to nearest even like up
 def bf16_floats(bits): return (np.asarray(bits).astype(np.uint32) << 16).view(np.float32)  # bf16 bits to float32 values
 
 def bfp(a, dtype="bfp8"):
-  """Rounds a to a block float the way the chip does when it casts or writes a bfp8 KV cache, and returns the values.
-  It rounds to bf16 first. Then each run of 16 values along a row shares its largest exponent and keeps 7 bits of
-  magnitude below it, rounded half up. bfp4 keeps 3 bits, rounded to nearest."""
+  """Round values to a block-float format as the chip does, and return the converted values.
+  First round to bf16. Each run of 16 values along a row then shares its largest exponent. bfp8 keeps
+  seven magnitude bits with half-up rounding; bfp4 keeps three with rounding to nearest."""
   bits = bf16_bits(a).astype(np.uint32)
   s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
   runs = lambda x: x.reshape(*x.shape[:-1], -1, 16)
@@ -45,7 +45,7 @@ def tensor_bits(data, t, transpose=False):  # a tensor as bf16 bits. fp32 is rou
   bits = bits.reshape(t["shape"] if len(t["shape"]) >= 2 else (1, -1))  # gpt-oss's experts come as a batch of matrices
   return np.ascontiguousarray(bits.T) if transpose else bits
 
-def fns(x):  # what numpy and baretile spell differently
+def fns(x):  # adapt NumPy and baretile operations to the same model code
   if isinstance(x, np.ndarray):
     split = lambda a, n: a.reshape(a.shape[0], n, -1).transpose(1, 0, 2)
     softmax = lambda a: (e := np.exp(a - a.max(-1, keepdims=True))) / e.sum(-1, keepdims=True)
@@ -66,7 +66,7 @@ def fns(x):  # what numpy and baretile spell differently
 
 def layernorm(x, g, b): return fns(x).layernorm(x) * g + b
 
-def block(w, pre): return {k[len(pre):]: w[k] for k in w if k.startswith(pre)}  # the weights whose names start with pre, pre cut off
+def block(w, pre): return {k[len(pre):]: w[k] for k in w if k.startswith(pre)}  # select weights with prefix pre and remove that prefix
 
 def layer(x, p, mask, heads=HEADS, cache=None, places=None):
   """Run attention and the MLP, each after layer normalization and with a residual addition. p contains weights
@@ -117,14 +117,14 @@ def columns(rt, size): return Tensor.frombytes(rt, 1, size, np.arange(size, dtyp
 def kv_cache(layers, size, zeros): return [zeros((2 * HEADS, size, 64)) for _ in range(layers)]  # a cache per block, made by zeros(shape)
 
 def load(path):
-  """Reads a safetensors file into {name: (bf16 bits, the same values as float32)}, with vectors as one-row matrices.
+  """Read a safetensors file into {name: (bf16 bits, float32 values)}, with vectors as one-row matrices.
   The file is 8 bytes of header size, a JSON header with each tensor's dtype, shape and byte range, then the data."""
   header, data = safetensors(path)
   bits = {name: tensor_bits(data, t) for name, t in header.items()  # skip attention's causal masks
           if name != "__metadata__" and not name.endswith((".attn.bias", ".attn.masked_bias"))}
   return {name: (b, bf16_floats(b)) for name, b in bits.items()}
 
-# Upload weights and transpose the output layer once. Store matmul weights in column order,
+# Upload weights and transpose the output layer once. Store matmul weights by tile columns,
 # converting them to dtype on the chip.
 def upload(rt, weights, dtype="bf16"):
   t = {name: Tensor.frombytes(rt, *bits.shape, bits.tobytes()) for name, (bits, _) in weights.items()}
@@ -156,7 +156,7 @@ def generate(enc, ids, steps, chip, numpy):
     ids += new
     print(enc.decode(new) + ("" if got.argmax() == want.argmax() else f"[baretile: {enc.decode([int(got.argmax())])!r}]"), end="", flush=True)
     print(f" ({time.time() - start:.0f}s, logits within {np.abs(got - want).max():.2f})", end="", file=sys.stderr, flush=True)
-  print(f"\nbaretile picked the same token as numpy {agree} times out of {steps}")
+  print(f"\nbaretile picked the same token as NumPy {agree} times out of {steps}")
 
 def main():
   import tiktoken

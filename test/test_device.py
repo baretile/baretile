@@ -9,7 +9,7 @@ def test_layers():
   # helpers in conftest, import nothing above that layer. Outside the tests, no file uses the private names of another
   # file, whether it imports them or uses them as attributes that only the other file defines.
   root = pathlib.Path(__file__).parent.parent
-  order = ["bh", "pci", "chip", "runtime", "hello", "tensix", "kernels", "tensor", "bench", "probe", "viz"]  # layers 0-1, then 2-3, each with its commands
+  order = ["bh", "pci", "chip", "runtime", "hello", "tensix", "kernels", "tensor", "bench", "probe", "viz"]  # layers and their commands
   trees = {p: ast.parse(p.read_text()) for d in ("baretile", "models", "adapters") for p in sorted((root / d).glob("*.py"))}
   assert sorted(order) == sorted(p.stem for p in trees if p.parent.name == "baretile"), "every module in baretile/ needs a layer"
   def imports(name, tree, below, also=()):  # each import is from the standard library, from also, or a baretile module in below
@@ -248,9 +248,8 @@ def test_queue(chip):
   for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
 
 def test_hung_kernel_times_out(chip):
-  # A launch that hangs times out with a report from each stuck worker: which of its cores are still in the kernel, the
-  # kernel's counters, and its NoC requests in flight. The first kernel hangs BRISC. The second hangs TRISC1, and BRISC
-  # waits for it.
+  # A timeout reports unfinished workers, active cores, synchronization counters and outstanding NoC requests.
+  # Check both a stuck BRISC and a stuck TRISC1 that leaves BRISC waiting for completion.
   rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]\n  \(1, 2\): launch 1 not finished by "

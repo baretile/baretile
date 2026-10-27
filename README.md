@@ -13,8 +13,9 @@ tt-metal, tt-umd or LLK.
 
 ## Try it
 
-You'll need Python 3, clang with a RISC-V target, lld, and a Blackhole build of
-[ttsim](https://github.com/tenstorrent/ttsim). In a ttsim checkout, build the library:
+You'll need Python 3.12 or later, clang with a RISC-V target, lld, and a Blackhole
+build of [ttsim](https://github.com/tenstorrent/ttsim). In a ttsim checkout, build
+the library:
 
 ```sh
 ./make.py src/_out/release_bh/libttsim.so
@@ -28,10 +29,10 @@ python3 -m baretile.chip
 python3 -m baretile.hello
 ```
 
-With 120 Tensix cores, `baretile.hello` prints:
+With 120 Tensix tiles, `baretile.hello` prints:
 
 ```text
-119 Tensix cores computed fib(30) = {832040}, and one more core dispatched the work
+119 Tensix workers computed fib(30) = {832040}, and one tile dispatched the work
 ```
 
 Keep `TTSIM` set for the examples below. Without it, baretile tries to open a
@@ -59,6 +60,10 @@ The matmul and ReLU run when you call `tolist()`. Until then, they're an
 expression waiting to be compiled. They run in one kernel here, with the matmul's
 result kept in local memory for the ReLU.
 
+Run `python3 ramp.py` for more examples, from tensor operations and gradients to
+compiling a C kernel and reading DRAM. [ramp.py](ramp.py) explains each example
+and checks the results with assertions.
+
 Tensors support broadcasting, reductions, views and autograd. Storage formats are
 bf16, fp32, int32, bfp8 and bfp4. [NOTES.md](NOTES.md#tensors-and-kernels) explains
 the layout and precision limits.
@@ -76,10 +81,10 @@ python3 -m pip install numpy pytest
 python3 -m pytest -s test
 ```
 
-The tests include small GPT-2, Llama, mixture-of-experts and Gated DeltaNet models.
-They compare results with NumPy. Some comparisons need PyTorch and transformers,
-and pytest skips them if those packages aren't installed. Tests that need
-checkpoint files are opt-in.
+The tests run small GPT-2, Llama, mixture-of-experts and Gated DeltaNet models
+and compare their results with NumPy. Some comparisons need PyTorch and
+transformers, and pytest skips them if those packages aren't installed. Tests
+that need checkpoint files are opt-in.
 
 To generate text from a local SmolLM-135M checkpoint:
 
@@ -108,7 +113,8 @@ example request.
 
 ## Reading the code
 
-Start with [hello.py](baretile/hello.py) to see a kernel launched and read back.
+Start with the examples in [ramp.py](ramp.py). [hello.py](baretile/hello.py) is a
+short example of compiling a kernel, launching it and reading the result.
 [pci.py](baretile/pci.py) opens the device and [chip.py](baretile/chip.py) reads and
 writes its memory. [runtime.py](baretile/runtime.py) loads programs, allocates
 memory and queues work.

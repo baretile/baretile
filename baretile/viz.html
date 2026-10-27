@@ -1,8 +1,7 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>baretile viz</title>
-<!-- viz.py puts the launches into the data script below and writes this out as one file. It needs no server and loads
-nothing else. -->
+<!-- viz.py inserts launch data below and writes a standalone HTML file. No server or external resources are needed. -->
 <style>
   :root { color-scheme: dark; scrollbar-color: #3a3a3a #101010; --bg: #101010; --line: #2a2a2a; --text: #d8d8d8; --dim: #8a8a8a; --pick: #1e2a38; }
   * { box-sizing: border-box; }
@@ -35,8 +34,8 @@ nothing else. -->
 </style>
 <header><b>baretile viz</b><span id="tabs"></span><span id="summary"></span></header>
 <canvas id="timeline"></canvas>
-<main><div id="kernels"></div><div id="kernel"><p class="dim">This page draws itself with JavaScript. If this message stays, open the
-file in a browser: previews often don't run scripts.</p></div></main>
+<main><div id="kernels"></div><div id="kernel"><p class="dim">Open this file in a browser with JavaScript enabled to see the launch data.
+File previews that don't run scripts can't display it.</p></div></main>
 <div id="tip"></div>
 <script id="data" type="application/json">{data}</script>
 <script>
@@ -52,7 +51,7 @@ function show(r) {
   $("tabs").innerHTML = runs.length > 1 ? runs.map((u, i) => `<button class="${i == r ? "on" : ""}" onclick="show(${i})">${esc(u.title)}</button>`).join(" ") : esc(run.title);
   const [first, last] = [run.launches[0], run.launches.at(-1)], cycles = run.kernels.reduce((a, k) => a + k.cycles, 0);
   $("summary").innerHTML = (first ? `launches ${first[1]} to ${last[1]} of ${run.total}, ${run.kernels.length} kernels, ${num(cycles)} cycles` : "no finished launches") +
-    (run.sim ? ` <span class="dim">· on ttsim, cycles count RISC-V work: Tensix instructions and NoC reads take no time</span>` : "");
+    (run.sim ? ` <span class="dim">· simulator cycles don't predict card performance</span>` : "");
   whole();
   const order = run.kernels.map((k, i) => i).sort((a, b) => run.kernels[b].cycles - run.kernels[a].cycles), bytes = run.kernels[0]?.bytes != null;
   $("kernels").innerHTML = `<table><thead><tr><th>kernel</th><th>launches</th><th>cycles</th><th>%</th>${bytes ? "<th>bytes read</th>" : ""}</tr></thead><tbody>` +
@@ -68,15 +67,15 @@ function pick(i) {
   const k = run.kernels[i], workers = new Set(run.launches.filter(l => l[0] == i).map(l => l[5]));
   let h = `<h2>${esc(k.name || "(no name)")}</h2><p>${k.launches} launch${k.launches > 1 ? "es" : ""} on ${[...workers].join(" or ")} worker${Math.max(...workers) > 1 ? "s" : ""}, ` +
     `${num(k.cycles)} cycles${k.bytes != null ? `, ${num(k.bytes)} bytes read` : ""}</p>`;
-  if (k.graph) h += `<p class="dim">fused, computing in ${k.dtype}${k.out != k.dtype ? ` and writing ${k.out}` : ""}, in ${k.units} unit${k.units > 1 ? "s" : ""}</p>` + graph(k.graph);
-  h += k.text ? `<pre>${esc(k.text)}</pre>` : `<p class="dim">launched with Runtime.launch, not made through tensor.py, so there's nothing more to show</p>`;
+  if (k.graph) h += `<p class="dim">fused kernel: computes in ${k.dtype}${k.out != k.dtype ? `, writes ${k.out}` : ""}, ${k.units} work unit${k.units > 1 ? "s" : ""}</p>` + graph(k.graph);
+  h += k.text ? `<pre>${esc(k.text)}</pre>` : `<p class="dim">No expression or cache key is available for this kernel.</p>`;
   $("kernel").innerHTML = h;
   draw();
 }
 
-// A fused expression, inputs at the top and the result at the bottom. A node's row is one below its lowest operand. An
-// edge that skips rows passes through a point in each row between, so it goes around the nodes there instead of under
-// them. In each row, nodes and points go under the mean of what they read and are pushed apart until they don't overlap.
+// Lay out the expression from inputs at the top to the result at the bottom. Place each node one row below its
+// lowest operand. Add intermediate points to edges that skip rows so the edges avoid nodes in those rows.
+// Center nodes and points below their operands, then separate any that overlap.
 function graph(nodes) {
   const CHAR = 7.2, H = 36, GAP = 18, ROW = H + 34;
   const row = [], items = nodes.map(([label, detail]) => ({ w: Math.max(label.length, detail.length) * CHAR + 20, reads: [] })), edges = [];
@@ -93,9 +92,8 @@ function graph(nodes) {
   items.forEach((it, k) => (rows[it.row] ??= []).push(k));
   for (const r of rows) {  // inputs all want 0, so they spread out from there in the order the expression reads them
     const want = k => items[k].reads.length ? items[k].reads.reduce((a, j) => a + items[j].x, 0) / items[k].reads.length : 0;
-    // Items that would overlap form a block, which sits where its members want on average. Merging a block into the one
-    // before it can make that one overlap the one before it in turn. An item that touches nothing stays where it wants,
-    // so an edge's points line up and the edge is straight.
+    // Group overlapping items and center each group at its members' average target position. Merge with earlier
+    // groups until none overlap. Leave isolated items at their target positions so straight edges stay straight.
     const blocks = [];  // each is [items, their offsets from the first, sum of want minus offset]
     for (const k of [...r].sort((a, b) => want(a) - want(b))) {
       let b = [[k], [0], want(k)];
@@ -185,6 +183,6 @@ const whole = () => { const l = run.launches.at(-1); view = [0, Math.max(1, l ? 
 canvas.ondblclick = () => { if (run) whole(), draw(); };
 onresize = () => run && draw();  // keeps the zoom
 if (runs.length) show(0);
-else $("kernel").innerHTML = "<p>There are no launches in this page. viz.py fills in this template: run a script with " +
-  "<code>python3 -m baretile.viz script.py</code> and open the viz.html that it writes.</p>";
+else $("kernel").innerHTML = "<p>This file contains no launch data. Run " +
+  "<code>python3 -m baretile.viz script.py</code>, then open the generated viz.html in a browser.</p>";
 </script>

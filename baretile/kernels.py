@@ -36,61 +36,60 @@ def grid_parts(rt, w, kt, grid, base, more=0):
   return False
 
 def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None):
-  """Compile an expression into one kernel. Returns the kernel's image and the number of units in the result.
+  """Compile an expression into one kernel. Return (image, work units).
 
-  The expression is nested tuples, and an int is an input: its index in `shapes`.
-  - (op, x, y) for add, sub, mul and the binary SFPU ops.
-  - (op, x) for the unary ops, cast, and the reductions in FOLDS (sum0, max2, ...).
-  - ("matmul", a, b) or ("matmul", a, b, phases), where phases is the fidelity, 4 by default. a is an input. b is an
-    input, or a tuple (how, x) that says how to read input x:
-    - "T" reads it transposed.
-    - "bfp8" or "bfp4" reads a block float, which unpacker 0 turns into bf16 on its way into SrcA. "Tbfp8" and
-      "Tbfp4" read x as a transposed block float, like a key cache.
-    - "C", "Cbfp8" or "Cbfp4" read x laid out by columns (Tensor.columns). Its strides are then those of its runs.
-    - Any of these with an "I" in front takes an int32 input ids too, like ("Ibfp4", x, ids). "I" alone reads x as it
-      is. Batch entry b uses the matrix of x that ids holds at (b // k, b % k), where ids has k columns. An index past
-      x's batch picks no matrix and gives zeros.
-  For example, ("add", ("matmul", 0, ("bfp8", 1)), 2) is input 0 times input 1 in bfp8, plus input 2, and
-  ("sum2", ("mul", 0, 0)) sums the squares along each row of input 0.
+  Expressions use nested tuples. An integer refers to an input by its index in shapes:
+  - (op, x, y) for add, sub, mul and binary SFPU operations.
+  - (op, x) for unary operations, cast and reductions in FOLDS (sum0, max2, ...).
+  - ("matmul", a, b[, phases]) for matmul, with four fidelity phases by default. a is an input.
+    b is an input or (mode, input[, ids]), where mode controls how B is read:
+    - T transposes B during unpack.
+    - bfp8 and bfp4 convert block floats to bf16 in SrcA. Tbfp8 and Tbfp4 also transpose B.
+    - C, Cbfp8 and Cbfp4 read the layout produced by Tensor.columns; strides describe column runs.
+    - Prefix any mode with I to select B's matrices using int32 ids. For example, ("Ibfp4", x, ids).
+      I alone uses ordinary bf16 storage. With k columns in ids, result batch entry b selects
+      x[ids[b // k, b % k]]. An index past x's batch returns zeros without reading a matrix.
+  For example, ("add", ("matmul", 0, ("bfp8", 1)), 2) multiplies inputs 0 and 1, with input 1 in bfp8,
+  then adds input 2. ("sum2", ("mul", 0, 0)) sums the squares in each row of input 0.
 
-  shapes contains (batch, rows, columns) for each input; dimensions of size 1 broadcast. dtype specifies the input
-  and computation format. out specifies the root's output format, for a cast or a matmul that produces fp32. grid
-  is Runtime.grid, which lets matmul workers share input tiles. reps gives the repeat count for each input
-  (Tensor.repeat_interleave), defaulting to 1: matrix b is stored at b // rep. readers is Runtime.readers; it assigns
-  DRAM banks to workers for token matmuls.
+  shapes lists (batch, rows, columns) per input; dimensions of size 1 broadcast. dtype sets the input
+  and computation format. out sets the final storage format, allowing a cast or an fp32 matmul result.
+  grid and readers come from Runtime: grid enables multicast sharing, and readers assigns DRAM banks
+  and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep.
 
-  The kernel's arguments:
-  - a[0] and a[1]: the first unit and the number of units.
-  - a[2] to a[5]: the result's DRAM address, tile strides for batch and row, and tile offset, as in Tensor.
-  - a[6 + 4 i] to a[9 + 4 i]: the same four for input i.
-  - Last, the number of valid rows in the final tile row; 0 means 32. Zero the remaining rows even if shapes
-    includes them. This lets the same compiled kernel handle row counts that occupy the same number of tiles.
+  Kernel arguments:
+  - a[0:2]: first work unit and unit count.
+  - a[2:6]: output DRAM address, batch tile stride, row tile stride and tile offset.
+  - a[6 + 4*i:10 + 4*i]: the same four values for input i.
+  - Final word: valid rows in the last output tile row, with 0 meaning 32. Zero the remaining rows.
+    Passing this count at runtime lets one compiled kernel handle several row counts.
 
-  A unit is a tile of the result. With one matmul and nothing reducing, it's a block of up to 4 x 4 tiles, or a
-  worker's block of the grid. If the expression reduces along an axis, a unit is a line of tiles along that axis: a
-  row, a column, or a tile position through the batch. That keeps the reduction on the chip.
+  A work unit is normally one output tile. With one matmul and no reduction, it is a block of up to
+  4 x 4 tiles, or a worker's block on the grid. With a reduction, it is a line of tiles along that axis:
+  a row, a column, or the same tile position across the batch.
 
-  bf16 goes through SrcA, SrcB and the FPU. fp32 and int32 can't, since those registers hold 19 bits. For them the math
-  thread fills Dst with the operands from L1, and the SFPU does all the math, add and sub too. There's no matmul.
+  bf16 arithmetic uses SrcA, SrcB and the FPU. fp32 and int32 elementwise kernels bypass the 19-bit
+  Src registers: the math thread loads operands into Dst, and the SFPU computes every operation.
+  These kernels contain no matmul; Tensor handles fp32 matmul through bf16 parts.
 
-  Ops compute into Dst, and their results are packed into L1 slots. Two frames of slots alternate between tiles. A
-  frame holds the inputs, then a slot for each op. Intermediates go to L1 in the kernel's dtype, so bf16 rounds the
-  same as if each op were a separate kernel. An SFPU op that runs in place sees the unrounded result in Dst.
-  - An elementwise op reads its operands' slots. A unary op runs on the SFPU, in place on the result of the op below
-    it if no other op reads that result. Otherwise it runs on its operand plus the zero tile in slot 0.
-  - A matmul sums K pairs of tiles. B streams through DEPTH slots, with up to DEPTH reads in flight. A's row stays in
-    L1 while the result tiles stay in its row, if it fits below slot 256. Otherwise A streams too. With a grid and more
-    than one row of tiles, the workers share tiles by multicast, so each input tile comes from DRAM once.
-  - A reduction folds its operand's tiles into an accumulator in Dst. Then it folds across the tile with across_rows
-    or across_cols, and packs the result.
+  Two L1 frames alternate between tiles. Each holds input slots and intermediate results. Packing
+  an intermediate in dtype rounds it as a separate kernel would. An SFPU operation can instead run
+  in place on an unshared result in Dst, before that rounding. Other unary operations load their
+  operand by adding the zero tile.
 
-  A line goes in passes, each a sweep over its tiles. A reduction's result can't be read until the pass after its
-  sweep. Passes recompute the swept values they need, so softmax computes exp twice. Lines of intermediates aren't
-  kept in L1. Inputs still come from DRAM once. An input that several passes read keeps its line of tiles in L1 from
-  the first pass, if they fit. Values that are a tile long along the axis are narrow: reductions, ops on them, and
-  inputs of 1 there. They're computed once a line, in the first tile of the pass that needs them, into their own slots.
+  A matmul sums pairs of tiles along K. B streams through DEPTH slots with up to DEPTH reads in
+  flight. Keep A's row in L1 when it fits; some decode layouts use space above the ordinary slots.
+  Otherwise A streams too. With several tile rows, grid workers share inputs by multicast.
+  If K must be split, grid_parts chooses the buffers and output groups; A is read again for each group.
 
-  The four programs run the same loops over units, passes and tiles. Each does its share of the work on a tile."""
+  A reduction accumulates along a line in Dst, reduces within the tile with across_rows or
+  across_cols, then packs its result. Dependent operations use that result on a later pass.
+  Passes recompute intermediates, so softmax computes exp twice. Inputs reused across passes stay
+  in L1 when they fit. Values only one tile long along the sweep, including reduction results,
+  get separate slots and are computed once per line when first needed.
+
+  All four programs follow the same loops over work units, passes and tiles. BRISC moves data;
+  the three TRISCs handle unpack, math and pack."""
   uses, seen_exprs = {}, set()
   def count(e):  # how many ops read each subexpression
     if isinstance(e, int) or e in seen_exprs: return
@@ -207,7 +206,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # long: a row of A too long for the slots below 256, like the down projection of a decode step with a K of 448 tiles.
   # It stays in L1 above the slots the kernel uses, if it fits there. Unpacker 1 reaches it in regions of 256 slots,
   # and its base moves region to region between a tile's steps.
-  # local: with one matrix whose width is a multiple of 8 tiles, and B neither transposed nor picked, column j of B is
+  # local: with one matrix whose width is a multiple of 8 tiles, and B neither transposed nor picked, tile column j of B is
   # in bank (j + B's tile offset) % 8 if its row stride is a multiple of 8. B by columns works at any width. Then grid
   # workers take the columns in the bank that Runtime.readers gives them, in turn with the bank's other readers. A
   # worker reads that bank through the port it was given, and other banks through port 0. local holds each worker's
@@ -390,7 +389,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
         live = f"if (ids(b) < {shapes[op['y']][0]}) " if op["ids"] is not None else ""  # an entry that picks no matrix reads nothing: zeros
         km = "(k0 + m)" if parts else "m"  # a step's tile along K. With parts, it counts from the part's first tile
         b_tile = f"{in_batch}{bj} * a[{y + 2}] + {km} + a[{y + 3}]" if bt else f"{in_batch}{km} * a[{y + 2}] + {bj} + a[{y + 3}]"
-        # B by columns. Column j's run is in bank j % 8. In each bank the runs start at a[y], with a[y + 1] runs a
+        # B by columns. Tile column j's run is in bank j % 8. In each bank the runs start at a[y], with a[y + 1] runs a
         # matrix and a[y + 2] tiles a run. Tile m along K is at k_of(m) in its run. With K cut into a batch, each matrix
         # starts a[y + 3] tiles further along the same runs.
         if op["bc"]:
@@ -548,7 +547,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                 " kept_done[k] = events;" * (p == last_read(False)) + " line_done[k] = events;" * (p == computed[-1]))
     passes.append((bool(swept_ops or reductions), c))
   # A unit's first column. With local, it's the first column in the worker's bank, plus 8 for each reader of that bank
-  # before this one. Column j of B is in bank (j + B's tile offset) % 8, or in bank j % 8 for B by columns.
+  # before this one. Tile column j of B is in bank (j + B's tile offset) % 8, or in bank j % 8 for B by columns.
   col0 = f"unit % {bc} * {bq}"
   if local:
     first_b = "0" if ops[matmuls[0]]["bc"] else f"a[{arg(ops[matmuls[0]]['y']) + 3}]"
@@ -693,8 +692,9 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
     by the values and by a tile of ones, which gives each row's sum of p. The packer adds each product onto its output
     tile in L1, in fp32.
 
-  The result is (E, rows, 32 ht + 1) in fp32: each head's p v, then each row's sum of p. softmax(...) v is the first
-  divided by the second. Value tiles come from DRAM once a unit and key tiles once a sweep. No score leaves L1.
+  The result is (E, rows, 32 ht + 1) in fp32: each head's p v, followed by each row's sum of p. Divide
+  p v by the sum to obtain softmax(...) v. Read value tiles once per unit. Key tiles are read on each
+  sweep unless keep retains them in L1. Scores stay in L1.
 
   parts splits each unit's key tiles between that many workers, for a decode step's few units over a long cache. The
   result is then (E parts, rows, 32 ht + 33): each part's p v and sums, then a tile of its rows' largest scores, for
@@ -702,8 +702,8 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   tile of -1e9. The largest is held at -1e4 or more, so a row that sees no key in a part gets p of 0 and a weight of
   0. The largest is also rounded to bf16 in Dst, so p is made against the same value that the caller weighs it by.
 
-  keep holds a unit's first key rows in L1 from the first sweep to the second, as many as attention_store has room
-  for, so those come from DRAM once a unit."""
+  With keep, retain as many initial key rows as attention_store can hold between sweeps, so those rows
+  are read from DRAM once per unit."""
   assert ht >= 2, "a head needs at least 64 columns"
   ra = -(-rows // 32)
   R, fs, T, (p_slot, m_slot, q_row), oacc, places, used, ranges = attention_l1(ht, rows, wt, parts)
@@ -853,16 +853,15 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
                         pack_program("static unsigned needed;" + packer))
 
 def gather_kernel(dtype):
-  """Gather rows of a tensor into a new tensor. BRISC does it alone.
+  """Copy selected tensor rows into a new tensor using BRISC.
 
-  args: [first unit, units, out, the tensor's address, tile stride and tile offset, the result's tile columns and rows,
-  then the address and tile offset of the int32 row of indices].
+  args: [first unit, units, out, input address, input tile stride, input tile offset,
+  result tile columns, result rows, index address, index tile offset]. Indices form an int32 row.
 
-  For each result tile, BRISC reads the tile of indices, then each row's two 16-datum runs, the left and right face,
-  from the row's position in the tensor. A NoC read from DRAM must keep the low 6 bits of its address, so each run comes
-  in as the 64-byte block that holds it. A tile's blocks are read together, then the runs are copied into place. A
-  result of one row fills its tile with copies. The row comes in once, and NoC copies inside L1 double it down the
-  tile."""
+  Each unit writes one result tile. It reads the index tile, then two runs of 16 values per selected
+  row, one from each face. DRAM reads must preserve the low six address bits, so each run is fetched
+  as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place.
+  A single-row result repeats that row throughout its tile using NoC copies within L1."""
   tb, item = tile_bytes(dtype), ITEMSIZE[dtype]
   return compile_kernel(f"""
 #define SLOT {DATA:#x}
@@ -894,11 +893,12 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 def copy_kernel(dtype):
-  """Copy tiles as they are, from a tensor or view into another of the same shape. assign uses it for values that are
-  already computed, block floats too. BRISC does it alone, a tile a unit, and reads a tile while it writes the last.
+  """Copy tiles unchanged between tensors or views of the same shape, including block-float storage.
+  assign uses this for results that are already computed. Each BRISC unit copies one tile, overlapping
+  its read with the previous tile's write.
 
-  args: [first unit, units, the result's and x's address, tile strides for batch and row, and tile offset, then the tile
-  rows and columns]."""
+  args: [first unit, units, output address, output batch stride, output row stride, output tile offset,
+  input address, input batch stride, input row stride, input tile offset, tile rows, tile columns]."""
   tb = tile_bytes(dtype)
   return compile_kernel(f"""
 {BANKS}
@@ -1217,7 +1217,7 @@ def readback_kernel(dtype, runs=False):
   a block-float tile takes two reads."""
   n, item = tile_bytes(dtype), 0 if dtype in BFP else ITEMSIZE[dtype]
   place, get = "from = b / a[9] * a[4] + i * a[5] + j + a[6]", f"noc_get(BANK(from), AT(a[3], from, {n}), l1, {n});"
-  if runs:  # tile m of column j's run, in bank j % 8, as columns_kernel lays it out
+  if runs:  # tile m of tile column j's run, in bank j % 8, as columns_kernel lays it out
     place = f"run = a[3] + (b * a[4] + j / {len(bh.DRAM)}) * a[5] * {n}, m = b * a[6] + i"
     get = (f"noc_get(BANK(j), run + 64 * m, l1, 64); noc_get(BANK(j), run + 64 * a[5] + {BFP[dtype]} * m, l1 + 64, {BFP[dtype]});"
            if dtype in BFP else f"noc_get(BANK(j), run + m * {n}, l1, {n});")
@@ -1243,13 +1243,15 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 def columns_kernel(dtype):
-  """Lay out a matrix, or a batch of them, by columns (Tensor.columns). BRISC does it alone, a tile a unit.
+  """Store each tile column of a matrix or batch together, as used by Tensor.columns.
+  BRISC copies one tile per work unit.
 
-  args: [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's tile columns, tiles a
-  matrix, runs a matrix in each bank, tiles a run].
+  args: [first unit, units, out, input address, input batch stride, input row stride, input tile offset,
+  input tile columns, tiles per matrix, runs per matrix per bank, tiles per run].
 
-  A tile is read in full and written to its position in the run for its column j, in bank j % 8. A block-float tile is
-  written in two parts: its exponents go with the run's exponents, and its values with the run's values."""
+  Tile column j forms a run in bank j % 8. Read each tile in full, then write it at its position in
+  that run. For block floats, write exponents into the run's exponent region and values into its
+  value region."""
   tb = tile_bytes(dtype)
   put = (f"noc_write(IN, BANK(j), run + 64 * i, 64); noc_write(IN + 64, BANK(j), run + 64 * a[10] + {BFP[dtype]} * i, {BFP[dtype]});"
          if dtype in BFP else f"noc_write(IN, BANK(j), run + i * {tb}, {tb});")
@@ -1345,14 +1347,12 @@ def move_kernel(dtype):
   Element (b, r, c) of the result is element offset + b sb + r sr + c sc of x, counted in row-major order, if it's
   inside the bounds. Outside them it's 0.
 
-  A NoC read can't land 2 bytes at any address, so x's tiles come into a cache in L1, in full, as they're needed. A
-  result tile inside the bounds that's an unchanged tile of x, like a pad, slice or cat on tile boundaries, comes in
-  with a NoC read that skips the cache. A result tile that's a tile of x transposed is built face by face from the
-  cached tile. Other tiles start as a copy of the zero tile and get the datums inside the bounds in lines, along their
-  rows or down their columns, whichever lie in x as runs. A run goes as far as a face allows. Otherwise datums go one
-  at a time, stepping through x without a division.
-  A result of one column is made once and copied across. A result of one row is made once and doubled down its tile by
-  NoC copies inside L1."""
+  NoC alignment rules prevent arbitrary two-byte reads, so fetch complete input tiles into an L1 cache.
+  If an output tile is an unchanged input tile within the bounds, copy it directly, bypassing the cache.
+  Build transposed tiles face by face from cached data. For other tiles, start with zeros and copy valid
+  values in runs along rows or columns, whichever are contiguous in x. Stop each run at a face boundary.
+  When neither axis forms a run, copy individual values without dividing at each step.
+  Repeat a single output column across its tile. Repeat a single row using NoC copies within L1."""
   tb = tile_bytes(dtype)
   return compile_kernel(f"""
 #define OUT {DATA:#x}

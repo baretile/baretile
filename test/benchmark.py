@@ -308,8 +308,9 @@ def ttnn(folder, prompt, after, top5, book, s):
   return out
 
 def table(baretile, ttnn):
-  """Returns the two stacks' results side by side as a markdown table, with rooflines. For each timed benchmark it adds
-  baretile's speed over TT-NN's, with times inverted, so above 1 means baretile is faster."""
+  """Return a Markdown table comparing both stacks and their shares of the hardware limits.
+  Report baretile / TT-NN for rates and TT-NN / baretile for times, so a speed ratio above 1 always
+  means baretile is faster."""
   show = lambda v: ", ".join(f"{k} {x:.4g}" if isinstance(x, float) else f"{k} {x}" for k, x in v.items()) if isinstance(v, dict) else str(v)
   rows = ["| | baretile | TT-NN | speedup over TT-NN |", "|---|---|---|---|"]
   speeds = {"B1": ("ms", -1), "B2 decode": ("tokens/s", 1), "B3": ("seconds to first token", -1)}  # -1: a time, so the ratio is inverted

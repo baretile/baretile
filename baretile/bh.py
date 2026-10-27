@@ -20,7 +20,7 @@ TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "x_start": (5
 STRICT = 1  # ordering: each write is acknowledged before the next one starts
 MCAST_VC = 2  # multicast on a static VC must use class 2. umd uses it too (ISA NoC/MemoryMap.md NOC_CTRL)
 
-# NoC endpoints, in translated coordinates. Firmware sets these up at boot so harvesting is invisible. The good Tensix
+# NoC endpoints, in translated coordinates. Firmware maps these at boot to skip harvested columns. Available Tensix
 # columns come first in TENSIX_X: a p150 has 12, and telemetry says how many. Tensix rows are 2..11.
 TENSIX_X, TENSIX_Y = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16), range(2, 12)
 DRAM = [(17 + b // 4, 12 + 3 * (b % 4)) for b in range(8)]  # bank b, which also answers at y+1 and y+2
@@ -36,7 +36,7 @@ ARC_FAILED = 240  # a response's low byte is an error code from here up
 ARC_QUEUES = 0x8003042C  # SCRATCH_RAM[11]: address of the queue control block, {base, entries | count << 8}
 ARC_IRQ = 0x80030100, 1 << 16  # ARC_MISC_CNTL IRQ0 tells ARC to look at its queues
 # SCRATCH_RAM[13] has the address of the telemetry table, {version, count, tag | index << 16 for each tag}.
-# SCRATCH_RAM[12] has the address of the values, which index picks from.
+# SCRATCH_RAM[12] points to the value array; each tag's index selects its value.
 ARC_TELEMETRY = 0x80030434, 0x80030430
 APP_QUEUE = 3  # queues 0..3 are for kmd, monitoring, tools, applications
 ARC_QUEUE_ENTRY = 32  # bytes. a queue is a header, then n requests and n responses of this size
@@ -46,7 +46,7 @@ ARC_QUEUE_PTRS = (0x0, 0x4, 0x10, 0x14)
 # POWER_SETTING with all 15 flags valid and set: max AI clock, GDDR PHY awake, and the Tensix and L2CPU clocks on
 POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
 # ARC messages. ASIC_STATE0 takes the chip out of the state tt-kmd leaves it in when it unbinds (its 0xA3, ASIC_STATE3).
-# tt-kmd's probe sends it too. AICLK_GO_BUSY puts the AI clock at its busiest, which UMD also asks for.
+# tt-kmd's probe sends it too. AICLK_GO_BUSY requests the busy AI clock, as UMD does.
 ASIC_STATE0, AICLK_GO_BUSY = 0xA0, 0x52
 # BAR0 offset of the NIU config of the PCIe tile. With this bit set, the NoC takes translated coordinates, which are
 # the ones in this file. UMD and kmd read it too.

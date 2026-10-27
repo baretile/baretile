@@ -1,11 +1,11 @@
 # Tensix instructions and kernel programs, implemented from the ISA without LLK.
-# Each worker runs four programs. BRISC reads operand tiles into L1 and writes results to DRAM.
+# Tensor kernels use four programs per worker. BRISC reads operand tiles into L1 and writes results to DRAM.
 # The three TRISCs supply instructions to the unpack, math and pack threads, which process
 # separate tiles concurrently.
 #
 # A 32x32 tile has four 16x16 faces: top-left, top-right, bottom-left, bottom-right. Each face
 # is row-major. Datum (r, c) is at (r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16.
-# This layout matches the FPU's 16x16 matrix multiply; the ISA doesn't define tiles.
+# Faces match the FPU's 16-column operands; each MVMUL computes eight output rows. The ISA doesn't define tiles.
 # Unpacking puts face f in rows 16f..16f+15 of SrcA or SrcB. Dst uses the same layout.
 import math, struct
 from baretile import bh
@@ -54,17 +54,18 @@ def config(**fields):  # backend config as {word index: value}. fields left out 
 
 FORMAT = {"bf16": bh.BF16, "fp32": bh.FP32, "int32": bh.INT32, "bfp8": bh.BFP8, "bfp4": bh.BFP4}
 def kernel_config(dtype="bf16", out="bf16", transposing=False):
-  """The backend config of a kernel.
+  """Build the unpacker and packer configuration for a kernel.
 
-  An UNPACR reads a tile of 1024 datums, and Z picks the slot, with a Z stride of a tile. bf16 goes into a SrcA or
-  SrcB bank. fp32 skips the Src banks and goes into Dst through context 1 of unpacker 0, where channel 1's Y is the
-  32-bit Dst row. The FPU writes Dst in fp32.
+  UNPACR reads 1024 values per tile. Its Z counter selects an L1 slot with a stride of one tile.
+  bf16 values enter SrcA or SrcB. fp32 values bypass those banks and enter Dst through unpacker 0's
+  context 1, where channel 1's Y counter selects the 32-bit Dst row. The FPU writes Dst in fp32.
 
-  The packer reads 4 Dst rows per PACR and writes them as out, rounding fp32 to bf16. Its Dst row stride is in bytes of
-  out, or of fp32 for a block float. Its channel 1 Y picks the slot, with a Y stride of a tile of out.
+  Each PACR reads four Dst rows and writes them in format out, rounding when out is bf16. The Dst row
+  stride uses bytes of out, or fp32 bytes for a block float. Channel 1's Y counter selects the output
+  slot with a stride of one output tile.
 
-  Base addresses are in 16-byte units, minus 1, and unpacker 0's rows are biased by 4 (64 datums). transposing makes
-  unpacker 0 transpose each 16x16 face into SrcA."""
+  Base addresses use 16-byte units minus 1. Unpacker 0's rows have a bias of 4 (64 values).
+  With transposing, unpacker 0 transposes each 16 x 16 face as it enters SrcA."""
   base, fmt, pack = slot_base(dtype) // 16 - 1, FORMAT[dtype], FORMAT[out]
   # The packer's own input format. Packing a block float from fp32 rounds each value once. From bfp8 it would round
   # twice.
@@ -164,9 +165,9 @@ def reload(at, z):  # fp32 tile z of the accumulator at `at` into SrcA, with zer
   # mantissa. ttsim truncates it.
   return (reconfigure(SEC0_format=bh.FP32, SEC0_out_format=bh.TF32, SEC0_base=at // 16 - 1) + unpack(z, ZERO_SLOT) +
           reconfigure(SEC0_format=bh.BF16, SEC0_out_format=bh.BF16, SEC0_base=slot_base("bf16") // 16 - 1))
-# Sets unpacker 0 to read block floats wt from region `region` of `slots` slots past B8, or at base. A matmul's B is
-# laid out like this, with the exponents of the slots first and their values after. Each value goes into SrcA as the
-# bf16 it is. With 0 slots, unpacker 0 reads bf16 from the slots again.
+# Configure unpacker 0 for block floats in a region of `slots` tiles, at base or B8 + region * region size.
+# The region stores all exponents before the values. The unpacker converts each value to bf16 in SrcA.
+# With 0 slots, restore the ordinary bf16 configuration.
 def bfp_b(wt, slots, region=0, base=None):
   fmt, base = (FORMAT[wt], base or B8 + region * slots * tile_bytes(wt)) if slots else (bh.BF16, slot_base("bf16"))
   return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)

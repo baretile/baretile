@@ -74,7 +74,7 @@ class Chip:
 
   def read(self, x, y, addr, n): return b"".join(self.pci.read(off, size) for off, size in self.chunks(x, y, addr, n))
   def write(self, x, y, addr, data, start=None):
-    """Write data at NoC address (x, y, addr). With start, multicast to the Tensix cores from start to (x, y)."""
+    """Write data at NoC address (x, y, addr). With start, multicast to the Tensix tiles from start to (x, y)."""
     done = 0
     for off, size in self.chunks(x, y, addr, len(data), start):
       self.pci.write(off, data[done:done + size])
@@ -135,16 +135,16 @@ class Chip:
     still be reading src when this returns. Leave src unchanged until the queue is free; the next send waits
     for it."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
-    assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, "16-byte aligned, below the firmware's L1"
+    assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, \
+      "Ethernet addresses and size must be 16-byte aligned and stay below firmware L1"
     def free():  # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)
       self.read32(x, y, reg("CMD"))
       return not self.read32(x, y, reg("STATUS")) & bh.ETH_BUSY
     self.wait(free, f"free Ethernet channel {ch}'s TX queue", timeout)
     for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
 
-# Prints what a card reports: its firmware, clock, cores, DRAM banks and telemetry. It's the first thing to run on a new
-# card, or on ttsim with TTSIM set. With `reset` it resets the card first (pci.reset), for a card whose NoC or firmware
-# hangs.
+# Report firmware, clock, Tensix tiles, DRAM banks and ARC telemetry. Run this before loading kernels on a new
+# card, or set TTSIM to inspect the simulator. The optional reset argument calls pci.reset before opening the card.
 if __name__ == "__main__":
   import os, sys
   from baretile import pci
@@ -157,5 +157,5 @@ if __name__ == "__main__":
   t = chip.telemetry()
   fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
   print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware {fw} is up and Tensix is powered. The AI clock is {t.get(bh.TAG_AICLK, 0)} MHz. "
-        f"{len(chip.tensix)} Tensix cores in raw columns {sorted({chip.raw(x, y)[0] for x, y in chip.tensix})}. DRAM banks {chip.banks} trained.")
+        f"{len(chip.tensix)} Tensix tiles in raw columns {sorted({chip.raw(x, y)[0] for x, y in chip.tensix})}. DRAM banks {chip.banks} trained.")
   print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))
