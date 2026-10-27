@@ -1,16 +1,15 @@
-# A page that shows what a program launched: a timeline of the launches on the dispatcher's clock, the kernels by the
-# cycles they took, and the expression each fused kernel computes, drawn as a graph. The page is one HTML file with
-# the data in it, so you can open it in any browser or send it to someone.
+# Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings and
+# graphs of fused expressions. It contains its own data and needs a browser with JavaScript enabled.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args]
-# runs the script the way python3 would, then writes viz.html for every runtime the script made.
+# The page includes every runtime created by the script.
 import json, pathlib, runpy, struct, sys
 from baretile import pci, tensor
 from baretile.runtime import TIMES, Runtime
 
 def save(path, *runtimes, since=0):
-  """Write the page for each runtime's finished launches after since. A runtime keeps the times of its last TIMES
-  launches, so the page leaves out earlier ones. save doesn't wait, which lets it run after a hang or an interrupt.
-  Call rt.wait() first, or tolist(), to include everything queued."""
+  """Write completed launches after since for each runtime, limited to its last TIMES launch records.
+  This doesn't wait for queued work. Call rt.wait() first to include it, or save the completed work after
+  a timeout or interrupt."""
   made = {v if isinstance(v, bytes) else v[0]: (k, v) for k, v in tensor.kernels.items()}  # what each image was compiled from
   data = json.dumps([_runtime(rt, since, made) for rt in runtimes]).replace("</", "<\\/")  # nothing in it can close the script tag
   pathlib.Path(path).write_text(pathlib.Path(__file__).with_name("viz.html").read_text().replace("{data}", data))
@@ -34,16 +33,16 @@ def _runtime(rt, since, made):
               launches=launches, kernels=kernels, total=rt.launches)
 
 def _kernel(key, value):
-  """How a kernel was made, from its key in tensor.kernels: the expression of a fused kernel, as a graph, or the key of
-  any other kernel. A kernel launched with Runtime.launch alone isn't in the cache, so nothing is known about it."""
+  """Return a fused kernel's expression graph, or another tensor kernel's cache key. Kernels absent from
+  tensor.kernels have no compiler details to display."""
   if key is None: return {}
   if isinstance(value, bytes): return dict(text=repr(key))
   e, shapes, dtype, out, _, reps, _ = key
   return dict(text=repr(e), dtype=dtype, out=out, units=value[1], graph=_graph(e, shapes, reps))
 
 def _graph(e, shapes, reps):
-  """A fused expression as nodes of [label, detail, operands], operands first. Each distinct subexpression is one node,
-  since fused_kernel computes it once."""
+  """Return [label, detail, operands] nodes, with operands before the operations that use them. Each distinct
+  subexpression has one node, even when a reduction computes it on several passes."""
   nodes, at = [], {}
   def visit(e, b=False):  # b: e is how a matmul reads its B
     if e in at: return at[e]
@@ -57,12 +56,12 @@ def _graph(e, shapes, reps):
   visit(e)
   return nodes
 
-def _how(mode):  # a matmul's mode for B in words. fused_kernel's docstring has the modes: I picks by ids, C by columns, T transposes
+def _how(mode):  # describe B's read mode: I selects matrices by index, C stores tile columns together, T transposes
   rest = mode.removeprefix("I")
   return ", ".join(w for w in ("picked by ids" * (rest != mode), {"C": "by columns", "T": "transposed"}.get(rest[:1], ""), rest.lstrip("CT")) if w)
 
 if __name__ == "__main__":
-  # Keep every runtime the script makes, and write the page even if the script stops early, as after a hang or Ctrl-C.
+  # Keep runtimes alive until save, including when the script raises an exception or receives Ctrl-C.
   if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.viz script.py [args]")
   runtimes, init = [], Runtime.__init__
   def keep(rt, *args, **kwargs):
@@ -75,4 +74,4 @@ if __name__ == "__main__":
   finally:
     if runtimes:
       save("viz.html", *runtimes)
-      print(f"wrote viz.html with the launches of {len(runtimes)} runtime{'s' * (len(runtimes) > 1)}. Open it in a browser")
+      print(f"wrote viz.html for {len(runtimes)} runtime{'s' * (len(runtimes) > 1)}. Open it in a browser")

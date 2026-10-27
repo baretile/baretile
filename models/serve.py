@@ -2,7 +2,7 @@
 # cache slots. Fixed shapes let steps replay, including when slots are idle. Reuse prompt prefixes
 # from free slots or saved sessions; keep sessions in device DRAM, then host memory as space fills.
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]
-# model is a local folder or Hugging Face ID. The final two arguments select weight and KV cache formats.
+# model is a local folder or Hugging Face ID. The final two arguments select the precision mode and KV cache format.
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import codecs, collections, functools, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -128,10 +128,10 @@ class Request:
     return int(head.ids[keep[min(int(np.searchsorted(w, self.rng.random() * w[-1], side="right")), len(keep) - 1)]])
 
   def draw(self, logits):
-    """Draws from a row of logits: greedy at temperature 0, else sampled at that temperature. It keeps the top_k most
-    likely (0 for all), then the fewest of those whose probabilities sum to top_p, then those at least min_p of the most
-    likely. It looks for the fewest among the 1,024 most likely first, since sorting a vocabulary of 248K takes 5 ms on
-    the host."""
+    """Choose the highest logit at temperature 0; otherwise sample at the requested temperature.
+    Apply top_k first (0 keeps all tokens), then keep the smallest prefix whose probability reaches
+    top_p, then remove tokens below min_p times the highest probability. Try the 1,024 largest logits
+    first to avoid sorting the whole vocabulary when they contain enough probability."""
     if self.temperature == 0: return int(logits.argmax())
     p, keep = np.exp((logits - logits.max()) / self.temperature), None  # None means no cut
     if self.top_k or self.top_p < 1:
@@ -145,8 +145,8 @@ class Request:
     return i if keep is None else int(keep[i])
 
   def take(self, head, room):
-    """Takes the next token from the Head of the logits, or from their row in numpy. room says whether the slot
-    has a position left to run this token. Returns whether the request is done."""
+    """Generate the next token from a Head or a NumPy row of logits. room indicates whether the cache
+    slot has space to process this token. Return True when the request has ended."""
     if self.gone: self.finish = "gone"; return True
     head = head if isinstance(head, Head) else Head.of(head, scale(self))
     token = self.pick(head)
@@ -247,11 +247,11 @@ class Engine:
 
   def column(self, ts): return Tensor.of(self.rt, [[x] for x in ts], "fp32")  # the 1/temperature of each row, as a column
 
-  def reach(self, held, ids):  # how much of prompt ids can go on from the state after held. Its last token always runs again
+  def reach(self, held, ids):  # length of the reusable prefix of ids in held; always process the prompt's last token again
     if self.linear: return len(held) if len(held) < len(ids) and list(ids[:len(held)]) == list(held) else 0
     return min(next((i for i, (a, b) in enumerate(zip(held, ids)) if a != b), min(len(held), len(ids))), len(ids) - 1)
 
-  def admit(self, r):  # into the free slot that holds most of its prompt, or one that takes the kept session that holds more
+  def admit(self, r):  # choose a free slot or saved session with the longest reusable prompt prefix
     if r.gone: return r.end()
     free = [u for u, b in enumerate(self.busy) if b is None]
     u = max(free, key=lambda u: (self.reach(self.held[u], r.ids), -self.used[u]))
@@ -260,7 +260,7 @@ class Engine:
     self.used[u], self.busy[u] = max(self.used) + 1, r
     n = self.reach(self.held[u], r.ids)
     if self.linear and n < len(self.held[u]): self.restore(u)  # zero its states and start over
-    elif not self.taken[u]:  # after a turned-down draft, a prompt goes on from the states after the token before it
+    elif not self.taken[u]:  # after a rejected draft, resume from the state before that draft
       for l, s in enumerate(self.slot[u]):
         if llama.linear(self.c, l): s[0].assign(s[2]), s[1].assign(s[3])
       self.taken[u] = 1.0
@@ -300,9 +300,8 @@ class Engine:
     self.held[u], self.taken[u] = list(key), 1.0
 
   def fill(self, u):
-    """Prefills the next chunk of the prompt in slot u. The last logits of the last chunk give the first new token.
-    When speculating, the multi-token prediction layer also runs over the positions of the chunk, and the last
-    position gives the first draft."""
+    """Prefill the next prompt chunk in slot u. The final chunk's last logits select the first new token.
+    With speculation, also run the prediction layer over the chunk; its last position gives the first draft."""
     r, at = self.busy[u], len(self.held[u])
     if r.gone: return self.take(u, None)
     ids = r.ids[at:at + self.chunk]
@@ -317,7 +316,7 @@ class Engine:
       drafts = gpt2.values(qwen.draft(after, places, h, self.t, self.c, self.slot[u], length=n, every=False))
       if r.made: self.drafts[u], self.taken[u] = self.guess(u, int(drafts[-1].argmax())), 1.0
 
-  def advance(self):  # a step of all the slots. The last token of each decoding slot goes in, and its next one comes out
+  def advance(self):  # decode one token for every occupied slot
     live = [r if r and r.made else None for r in self.busy]
     if not any(live): return
     if self.spec: return self.speculate(live)
@@ -359,8 +358,8 @@ class Engine:
   def guess(self, u, best): return best  # slot u's draft: the best token of the multi-token prediction layer. test_serve overrides it
 
   def speculate(self, live):
-    """A step of all the slots. It verifies the token and the draft of each slot, takes the draft where the pick of
-    the model agrees, then makes the next drafts."""
+    """Verify each slot's token and draft, accept drafts that match the model's sampled choices, then
+    compute drafts for the next step."""
     n, at = len(live), [len(h) for h in self.held]
     ids = [x for u, r in enumerate(live) for x in ([r.made[-1], self.drafts[u]] if r else [0, 0])]
     places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
@@ -402,8 +401,7 @@ FAMILIES = (("qwen", "<tool_call>\n<function="), ("harmony", "<|channel|>"), ("l
 def family(template): return next((name for name, mark in FAMILIES if mark in template), None)  # the family, by a mark that only it has
 
 def chat(template, messages, thinking=True, effort="medium", tools=None):
-  """Turns messages into the prompt format that the model was trained on. The family of template picks the format:
-  Qwen3.5 (qwen), gpt-oss (harmony), Llama 3, or ChatML."""
+  """Format messages using the model's chat template: Qwen3.5/3.6, gpt-oss (Harmony), Llama 3 or ChatML."""
   kind = family(template)
   if kind == "qwen": return qwen_chat(messages, thinking, tools)
   if tools: raise ValueError("tools only work with the chat template of Qwen3.5")
@@ -612,8 +610,8 @@ def formatted(form):
   return fits
 
 def answer(text):
-  """Splits the text of a thinking model into its reasoning and its answer, which is empty until it starts. Qwen3
-  splits at </think>. gpt-oss reasons in its analysis channel until <|end|>, and answers in its final channel."""
+  """Split generated text into reasoning and answer. The answer is empty until its start marker arrives.
+  Qwen3 separates them at </think>. gpt-oss uses analysis and final channels separated by <|end|>."""
   if text.startswith("<|channel|>"):
     if "<|message|>" not in text: return "", ""  # the name of the channel is still coming
     head, _, content = text.partition("<|channel|>final<|message|>")

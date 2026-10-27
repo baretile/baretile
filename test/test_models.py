@@ -1,5 +1,4 @@
-# Tests for layer 4, what runs on baretile: the models, the server, training, the frontends and the benchmarks.
-# conftest.py says how they run.
+# Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
 import json, math, os, pathlib, struct, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
@@ -11,18 +10,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "models"))  # for 
 import benchmark, cost, gpt2, llama, qwen, serve, train
 
 def test_train(chip):
-  # A 2-block GPT learns to count in fp32 with Adam, and its steps match PyTorch's on the same weights. It doesn't
-  # learn README and NOTES like train.py does, since those docs keep changing. Gradients may be off by 2e-3 of the
-  # largest, which is the matmul's 2^-11 compounded. The step's kernels don't fit in L1 together, so a replay sends
-  # them in parts.
+  # Train a two-block GPT on a fixed counting sequence so documentation edits don't change the test data.
+  # Compare fp32 Adam steps with PyTorch on the same weights, allowing accumulated matmul error in gradients.
+  # The kernels don't all fit in L1, so replay must reload them in batches.
   pytest.importorskip("torch")
   losses = train.train(Runtime(chip), 5, data=" ".join(map(str, range(3000))))
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
 def test_tinygrad_jit_unrecorded(chip):
-  # TinyJit records a function's second call and replays it after that. A second call that can't be recorded, here
-  # because an input isn't on the chip, runs as it is, and the next call that can be recorded is.
+  # If the second TinyJit call can't be recorded, a later eligible call must still record. Here the second
+  # call has a CPU input; subsequent calls put every input on BARETILE and should replay.
   if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
   pytest.importorskip("tinygrad")
   from adapters import tinygrad_baretile
@@ -210,7 +208,7 @@ def test_gpt2_layer(chip, n, dtype, size):
   change = np.abs(want - x).max()
   assert change > 1 and np.abs(got - want).max() < 0.03 * change, (np.abs(got - want).max(), change)
 
-@pytest.mark.skipif("GPT2" not in os.environ, reason="GPT2=/path/to/model.safetensors (Hugging Face openai-community/gpt2) runs it")
+@pytest.mark.skipif("GPT2" not in os.environ, reason="set GPT2 to model.safetensors from openai-community/gpt2")
 def test_gpt2_model(chip):
   # GPT-2 small with its pretrained weights, on a prompt and 3 decoded tokens, against numpy with the same bf16
   # weights. In fp32, numpy matches Hugging Face to 1e-4. The chip's pick has to be a token that numpy rates as good,
@@ -608,7 +606,7 @@ def test_delta_step(chip):
       if n == 1: continue
       assert np.array_equal(value(ts["S"])[vh:2 * vh], S[vh:2 * vh]) and np.array_equal(value(ts["conv"])[:, 1], conv[:, 1]), \
         "inactive sequence state must remain unchanged"
-      if chip.pci.counts:  # the same call again with no sequence dead, then with the second dead
+      if chip.pci.counts:  # repeat with both sequences active, then with the second inactive
         reads = []
         for alive in (np.ones_like(live), live):
           since = rt.launches
@@ -762,7 +760,15 @@ assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.a
 print("ok")
 """
 
-@pytest.mark.skipif("TTSIM2" not in os.environ, reason="TTSIM2=path/to/libttsim.so of ttsim's two-chip build (bh_x2) runs it")
+@pytest.mark.skipif("TTSIM" not in os.environ, reason="ramp.py opens the device itself, and a card can't be open in two processes")
+def test_ramp():
+  # Run separately because ramp.py opens its own device and ttsim allows one instance per process.
+  import subprocess
+  root = pathlib.Path(__file__).parent.parent
+  run = subprocess.run([sys.executable, str(root / "ramp.py")], capture_output=True, text=True, timeout=600, cwd=root)
+  assert run.returncode == 0 and run.stdout.strip().splitlines()[-1].startswith("the ramp ran"), run.stdout + run.stderr
+
+@pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to libttsim.so from ttsim's two-chip build (bh_x2)")
 def test_two_chips():
   # ttsim's two-chip build is a P300: two Blackholes joined by two Ethernet links. It runs in its own process, since a
   # process can load only one libttsim. Chip.links must pair the links, Chip.send and Tensor.to must move data across
@@ -772,7 +778,7 @@ def test_two_chips():
                        timeout=600, cwd=pathlib.Path(__file__).parent.parent)
   assert run.returncode == 0 and run.stdout.strip().endswith("ok"), run.stdout + run.stderr
 
-@pytest.mark.skipif("LLAMA8B" not in os.environ, reason="LLAMA8B=1 runs it: about four minutes on ttsim")
+@pytest.mark.skipif("LLAMA8B" not in os.environ, reason="set LLAMA8B=1 to test full block dimensions; this takes several minutes on ttsim")
 def test_llama_8b_shapes(chip):
   # One block in Llama-3.1-8B's shapes at TT's performance precision, so B2's matmuls, casts and attention run at
   # full size. Only the vocabulary is cut, to 2048. On ttsim the casts in llama.upload take minutes, and upload waits
@@ -943,8 +949,8 @@ def test_batched_decode(chip):
       s.append(int(want.argmax()))
 
 def test_serve_timeout(tmp_path):
-  # A request whose text doesn't come within `wait` seconds gets a 504 and gives up its slot, so a hung chip doesn't
-  # hold slots for requests nobody is waiting on. The stand-in engine takes requests and never answers.
+  # A non-streaming request that receives no text within wait seconds must get HTTP 504 and release its slot.
+  # The stand-in engine accepts requests without answering.
   import queue, urllib.error, urllib.request
   class Hung:
     tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(1)
@@ -1052,7 +1058,7 @@ def test_serve(chip, tmp_path):
   # again, they find their slots still holding their prompts, and each prefills one token. A free slot idles on a row
   # no sequence reaches, since any other row would spoil what the slot holds. A long prompt is prefilled a chunk
   # between steps, so the others keep getting tokens. Then the HTTP side. When no slot is free, a request gets an
-  # immediate 429. OpenRouter wants that, so it can try another provider.
+  # immediate 429 so the client can retry or use another provider.
   import urllib.request
   rt, rng = Runtime(chip), np.random.default_rng(23)
   c, w = smol(rng, 2)
@@ -1348,7 +1354,7 @@ def test_fetch(tmp_path, monkeypatch):
   hf.shutdown()
   assert serve.fetch("org/model", str(tmp_path / "cache")) == folder and serve.fetch(folder) == folder, "fetches once, and uses a folder as is"
 
-@pytest.mark.skipif("LLAMA" not in os.environ, reason="LLAMA=/path/to/SmolLM-135M (Hugging Face HuggingFaceTB/SmolLM-135M) runs it")
+@pytest.mark.skipif("LLAMA" not in os.environ, reason="set LLAMA to a local HuggingFaceTB/SmolLM-135M checkpoint folder")
 def test_llama_model(chip):
   # SmolLM-135M with its pretrained weights, on a prompt and the token decoded after it, against numpy. In fp32, numpy
   # matches Hugging Face to 2e-5. It takes about a minute on ttsim.

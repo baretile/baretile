@@ -1,5 +1,5 @@
-# Lazy tensors. Ops build a tree, and realizing it fuses as much as fits into one kernel (kernels.py). What a kernel
-# can't hold is realized first: a matmul's operands, a move, a cast below the root, or a reduction of another shape.
+# Build tensor expressions and compile them into kernels. Fuse operations where possible; compute inputs
+# separately when fusion would exceed a kernel's limits or require a different layout or dtype.
 import array, collections, functools, math
 from baretile import bh
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, tile_bytes
@@ -10,15 +10,16 @@ from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, cop
 FIDELITY = 4  # phases a bf16 matmul takes by default. 4 gives exact products, and tensix.matmul says what fewer drop
 
 class Tensor:
-  """A batch of matrices, batch x rows x cols, in bf16, fp32, int32, bfp8 or bfp4. Until it's realized, it's an op on
-  other tensors.
+  """Represent a batch of matrices with shape (batch, rows, cols). Supported storage formats are bf16,
+  fp32, int32, bfp8 and bfp4. An unrealized tensor holds an operation and its operands.
 
-  In DRAM it's 32x32 tiles, matrix after matrix, in row-major tile order, with tile i in bank i % 8. The last tile row
-  and column are padded with zeros, but a dimension of 1 fills its tile with copies, so broadcasting uses the tile as
-  it is. Kernels write their results this way, so a matmul can sum over a padded K.
+  Default DRAM storage uses 32 x 32 tiles in row order, with matrices stored consecutively. Tile i is
+  in bank i % 8. Partial tiles are padded with zeros. A dimension of size 1 repeats across its tile
+  for broadcasting. Kernels preserve this layout, including the padding needed by matmul.
 
-  x[b], tile-aligned slices, split and repeat_interleave are views into their owner's DRAM: tile (b, i, j) is tile
-  b // rep * bstride + i * stride + j + offset there. Any other movement is a copy by move_kernel."""
+  Batch indexing, tile-aligned slices, split and repeat_interleave can share an owner's storage.
+  Tile (b, i, j) of a view is at b // rep * bstride + i * stride + j + offset in that storage.
+  Movement that can't use a view is copied by move_kernel."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs, self.dtype = rt, rows, cols, batch, op, srcs, dtype
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
@@ -74,8 +75,9 @@ class Tensor:
     return t
 
   def tobytes(self):
-    """The values in row-major order, as frombytes takes them, with a block float as bf16. Waits for queued launches.
-    The chip writes the tiles into host memory, since loads from the BARs wait on PCIe round trips."""
+    """Return row-major bytes in the format accepted by frombytes. Convert block floats to bf16.
+    Queue a kernel to write tiles into host memory and wait for completion. This avoids a PCIe
+    round trip for each host load through the BARs."""
     self.realize()
     n, rows, cols, tc, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
     # readback_kernel sends sent bytes of each tile: v rows, with face f starting at faces[f]
@@ -142,9 +144,11 @@ class Tensor:
     return v
 
   def __getitem__(self, key):
-    """x[b], x[rows, cols] or x[batch, rows, cols], with any step. A tile-aligned slice is a view: rows and columns
-    start on a tile boundary, end on one or at the end, and step by 1, while the batch can step forward by any amount.
-    Anything else is a copy. An unrealized sum of realized tensors, like split-K parts, is sliced term by term."""
+    """Select a batch entry with x[b], or slice with x[rows, cols] or x[batch, rows, cols].
+    A slice shares storage when rows and columns start on tile boundaries, end on a boundary or at the
+    matrix edge, and step by 1. The batch may use any positive step. Slicing rows or columns down to
+    size 1 needs copies across the tile. Other slices also copy. An unrealized sum of realized
+    tensors, such as split-K results, is sliced term by term."""
     if self.rep > 1: return (self + 0)[key]  # slice a copy of a repeat: the copy stores its matrices one after another
     if isinstance(key, int): return self._view(self.rows, self.cols, 1, key * self.bstride)._track("index", (self,), key)
     assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
@@ -162,8 +166,9 @@ class Tensor:
 
   # Movement. Each op maps the result's elements to this tensor's, and one move_kernel launch copies them.
   def move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
-    """A tensor of shape (batch, rows, cols) whose element (b, r, c) is element offset + b * strides[0] +
-    r * strides[1] + c * strides[2] of this tensor, counted in row-major order. Outside lo..hi on any axis, it's 0."""
+    """Map elements into a new tensor of shape (batch, rows, cols). Output element (b, r, c) reads
+    input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order.
+    Output positions outside [lo, hi) on any axis are zero."""
     t = Tensor(self.rt, shape[1], shape[2], "move", (self,), shape[0], self.dtype)
     t.map = (offset, *strides, *lo, *(hi or shape))
     return t
@@ -234,9 +239,9 @@ class Tensor:
 
   @property
   def T(self):
-    """The transpose of each matrix. A matmul reads it as B from this tensor without a copy, transposing tiles as they
-    come in. Anything else realizes it with transpose_kernel, or a move for fp32 and int32, since the unpacker only
-    transposes on the way into SrcA."""
+    """Transpose each matrix. A matmul can read this as B without a copy, transposing tiles during unpack.
+    Other uses run transpose_kernel, or move_kernel for fp32 and int32 because the unpacker can only
+    transpose into SrcA."""
     if self.op == "T": return self.srcs[0]
     return Tensor(self.rt, self.cols, self.rows, "T", (self,), self.batch, self.dtype)
 
@@ -318,9 +323,9 @@ class Tensor:
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
                    -(-self.rows // 32) * tc, name="bfp4")
   def columns(self):
-    """Store B by columns so matmul can read several K tiles per request. Column j goes to bank j % 8, with
-    block-float exponents before values. The result supports readback and use as matmul's B, including
-    indexed selection and splits along K."""
+    """Store each tile column of B together so matmul can read several tiles along K per request.
+    Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
+    readback and use as matmul's B, including indexed selection and splits along K."""
     assert self.dtype in ("bf16", *BFP), "bf16 or a block float: a matmul's B"
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
@@ -510,8 +515,9 @@ class Tensor:
   # Autograd, like tinygrad's: a rule per op (_backward), made of the same lazy ops, so the backward fuses into kernels
   # too. It recomputes what the forward fused, since that wasn't stored.
   def gradient(self, *targets, gradient=None):
-    """d self / d target for each target, lazily, with None where self doesn't depend on it. self must be a single
-    value unless you pass gradient, d(something) / d self."""
+    """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that
+    self doesn't depend on. self must be scalar unless gradient supplies the derivative of the desired
+    output with respect to self."""
     assert gradient is not None or self.shape == (1, 1, 1), "self must be a single value, or pass gradient"
     order, seen = [], set()
     def visit(t):  # what self was made of, operands first
@@ -735,12 +741,12 @@ class Recording:
     self.rt.send(*self.block[:2])
 
 def jit(f):
-  """Run f normally on the first call, record the second, then replay its launches. Later calls copy inputs
-  into the recorded buffers.
+  """Run f normally on the first call, record the second call's launches, then replay them.
+  Later calls copy inputs into the recorded buffers and skip f's Python code.
 
-  Input shapes and dtypes must stay fixed. Other tensors read by f must not change, and f must not read back
-  to the host. The result and retained tensors, including .grad, reuse their buffers. The next call
-  overwrites them."""
+  Keep input shapes and dtypes fixed. Don't replace tensors captured by f or read tensors back to
+  the host inside f. Recorded assign operations can update captured tensors in place. Results and
+  retained tensors, including .grad, reuse their buffers; the next call overwrites their contents."""
   calls, inputs, out, rec = 0, (), None, None
   def run(*xs):
     nonlocal calls, inputs, out, rec
@@ -757,7 +763,7 @@ def jit(f):
     return out
   return run
 
-# compiled kernels by key. realize makes the keys of fused kernels, which hold (image, units, name), and others an image
+# Compiled kernels by key. Fused entries hold (image, units, name); other entries hold an image.
 kernels = {}
 def _cached(key, make):
   if key not in kernels: kernels[key] = make()

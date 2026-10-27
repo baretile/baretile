@@ -33,7 +33,7 @@ if __name__ == "__main__":
   if len(sys.argv) > 4: tensor.FIDELITY = int(sys.argv[4])
   weights = sys.argv[5] if len(sys.argv) > 5 else "bf16"
   seconds, tflops, gbs, reread, peak = bench(chip, m, k, n, weights)
-  speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (RISC-V work on the critical path, not silicon time)"
+  speed = (f"{seconds * bh.AICLK / 1e3:.1f}k ttsim cycles (simulator timing; use a card to measure performance)"
            if isinstance(chip.pci, pci.Sim) else
            f"{seconds * 1e3:.3f} ms, {tflops:.2f} TFLOPS of {peak:.0f} peak at {tensor.FIDELITY} fidelity phases, {gbs:.0f} GB/s")
   print(f"{m}x{k} @ {k}x{n} ({weights} B): {speed}" + (f"; DRAM reads {reread:.2f}x the inputs" if reread is not None else ""))

@@ -93,8 +93,8 @@ def uncast(v):
   return v
 
 def merge(view, groups):
-  """Merge the axes of each group, giving (size, stride, lo, hi) for each. Returns None if a group's strides don't
-  line up, or if its padding is on more than one axis, or on an axis next to another that's longer than 1."""
+  """Merge each group of axes into (size, stride, lo, hi). Return None if strides aren't contiguous,
+  or if padding spans several axes or sits beside another axis larger than 1."""
   out = []
   for g in groups:
     axes, size = [k for k in g if view.shape[k] > 1], math.prod(view.shape[k] for k in g)
@@ -270,7 +270,7 @@ def spread_to(v, shape):  # broadcast an operand of a binary op: a view on the c
 DEFER = object()  # a product that only sums read. the sum makes it a matmul, or forces it
 
 class Evaluator:
-  """Evaluates tinygrad's graph: each UOp becomes a chip Value, a number, or a tinygrad CPU tensor."""
+  """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
   def __init__(self, users): self.values, self.users = {}, users
 
   def summed(self, u):  # True if u's uses are sums, maybe through a permute, so u is a matmul's product
@@ -364,7 +364,7 @@ class Evaluator:
     return [(a, n - old - a) for a, n, old in zip(start, size, u.src[0].shape)]
 
   def on_host(self, u, srcs):
-    """Build u lazily on tinygrad's CPU device. Tinygrad fuses these operations and computes them when the chip
+    """Build u lazily on tinygrad's CPU device. tinygrad fuses these operations and computes them when the chip
     needs the result. Random-number generation uses this path because it sums a padded view that tinygrad
     doesn't materialize."""
     def there(s, v):  # a source for tinygrad: a chip value is downloaded (host work), a host value stays
@@ -401,7 +401,7 @@ class Evaluator:
     return self.on_host(u, x)
 
   def lay_out(self, u, x):
-    """Store a BARETILE buffer in the shape requested by its reshape. Tinygrad creates flat weight buffers;
+    """Store a BARETILE buffer in the shape requested by its reshape. tinygrad creates flat weight buffers;
     upload their host bytes in the requested shape, or move the existing tensor once. Return None when this
     layout can't be used."""
     h = u.src[0].buffer._buf

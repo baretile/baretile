@@ -224,7 +224,7 @@ class Weight:
   def values(self): return gpt2.bf16_floats(self.bits())
 
 def fuse(w, c):
-  """Rearranges each block's weights for fewer, wider matmuls.
+  """Rearrange each block's weights for fewer, wider matmuls.
 
   - q, k and v become one matrix, and so do gate and up. Qwen3.5's output gates go after v.
   - A mixture of experts gets its router transposed for x @ w, and its experts' gate_up and down as two batches.
@@ -311,19 +311,18 @@ def firsts(rt, n, slots, part):
   return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
 
 def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None):
-  """Returns the logits for the token after ids, which sit at places in the sequence. Their keys and values go into
-  caches, and each token sees the positions up to its own. ids and places are lists for numpy and int32 rows for
-  baretile. w is looked up a block at a time, so numpy's weights are made as they're needed (arrays).
+  """Return logits after processing ids at places, updating each block's cache. Each token sees positions
+  up to its own. NumPy takes lists for ids and places; baretile takes int32 rows. Weight lookups happen
+  one block at a time so NumPy doesn't need the whole model in memory.
 
-    slots   several sequences decoding together, a batch of users. They get the same number of tokens, in turn, and
-            their own parts of the blocks' caches (see kv_cache). Tokens read their own sequence's rows, and a free
-            slot sits on the last row of its part (see around). The logits then come back for all the tokens
-    every   return logits in fp32 for all the tokens. By default forward returns the last token's
-    accept  with slots, for the Gated DeltaNet states (qwen.deltanet)
-    hidden  also return the tokens' normed hidden states, which the multi-token prediction layer takes (qwen.draft)
-    length  attention reads the first length rows of each sequence, a multiple of 32 past the call's positions. A
-            call then costs what the sequences hold, however big their caches are. Tensor.attend reads only what
-            they hold, length or not"""
+  slots: decode several sequences together, with an equal number of consecutive tokens per sequence.
+  Each sequence has its own cache region. An inactive slot uses its region's reserved final row
+  (see around). With slots, return logits for every token.
+  every: return fp32 logits for every token even without slots; otherwise return only the last token's.
+  accept: select the DeltaNet state after an accepted or rejected draft (see qwen.deltanet).
+  hidden: also return normalized hidden states for qwen.draft.
+  length: limit ordinary attention to this many cache rows per sequence. Use a multiple of 32 beyond
+  the current positions. Tensor.attend uses positions to limit its reads regardless of length."""
   f = fns(w["norm"])
   x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # positions in an attention block's cache
   rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
@@ -402,7 +401,7 @@ def config(folder, places=4096):
                mtp=j.get("mtp_num_hidden_layers", 0), tied=j.get("tie_word_embeddings", False))
 
 def load(folder, places=4096):
-  """Returns the config and {name: Weight}, from model.safetensors or the files that model.safetensors.index.json lists.
+  """Return (config, {name: Weight}) from model.safetensors or the shards listed in model.safetensors.index.json.
 
   Names drop "model.". Linear weights are transposed for x @ w, and vectors become one-row matrices. The output layer
   is the embedding unless the model has its own lm_head. fuse joins the matrices and stacks a mixture's experts. RoPE's
@@ -452,10 +451,10 @@ def drafting(weights, prec):  # the weights, plus a copy of the output layer for
   return weights | {"embed.T draft": weights["embed.T"]} if prec and ("draft head", None) in prec and "mtp.fc" in weights else weights
 
 def upload(rt, weights, prec=None):
-  """Uploads the weights as baretile Tensors, one at a time. It casts a weight on the chip to its format and waits for
-  the cast, so the next weight's bf16 copy reuses the space. A model then takes the DRAM its formats need plus one bf16
-  matrix. Matrices that matmuls read as B, the blocks' and the output layer, are laid out by columns (Tensor.columns).
-  Then a token's row and the grid workers' shares read them in long requests."""
+  """Upload weights one at a time as baretile tensors. Convert each weight to its requested format on
+  the chip and wait before uploading the next, allowing its temporary bf16 storage to be reused.
+  Peak storage is the model in its chosen formats plus one bf16 matrix. Store matmul weights by tile
+  columns with Tensor.columns so workers can read several tiles per request."""
   t = {}
   for name, w in drafting(weights, prec).items():
     bits = w.bits()
@@ -469,13 +468,13 @@ def upload(rt, weights, prec=None):
     t[name] = x
   return t
 
-class Made(dict):  # maps a name to a function that makes its value. Lookups make it again and keep nothing
+class Made(dict):  # construct a value on each lookup without caching it
   def __getitem__(self, k): return super().__getitem__(k)()
 
 def arrays(weights, prec=None):
-  """The weights as numpy float32 arrays, with the values the chip holds in each weight's format (weight_format). Block
-  floats are rounded the way the chip rounds them, bit for bit (gpt2.bfp), 1024 rows at a time. Arrays are made when
-  they're looked up and aren't kept, so numpy holds only the block it's running, however big the model is."""
+  """Return lazily constructed NumPy float32 weights with the values held on the chip. weight_format
+  selects each storage format. gpt2.bfp rounds block floats in groups of 1024 rows, matching the chip.
+  Each lookup constructs a new array without caching it, so NumPy holds only the current model block."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
     if f in ("bf16", "fp32"): return v
@@ -490,11 +489,11 @@ def zeros(rt, dtype="bf16"):  # kv_cache's zeros on the chip in dtype, like bfp8
   return lambda shape, d=None: bf16(shape).cast({"float32": "fp32"}.get(d, dtype)).realize()
 
 def reference(path):
-  """Reads Tenstorrent's reference file for a model, tt_transformers' tests/reference_outputs/<model>.refpt, which its
-  tests/generate_reference_hf.py makes. It has the first 1,024 tokens of A Tale of Two Cities, and the Hugging Face
-  model's five likeliest next tokens at each position. Returns the prompt (the first half of the tokens), the tokens
-  after it, and the top five at each position from the prompt's last on. The i-th five are then for the token after
-  the input of step i."""
+  """Read a Tenstorrent .refpt file from tt_transformers/tests/reference_outputs. The file, produced by
+  tests/generate_reference_hf.py, contains 1,024 tokens from A Tale of Two Cities and the reference
+  model's five most likely next tokens at each position.
+  Return (prompt, following tokens, top five): the prompt is the first half, and top five starts at
+  the prompt's final position. Entry i therefore scores the prediction made at step i."""
   import torch
   data = torch.load(path)
   tokens = data["reference_tokens"][0].tolist()
@@ -502,15 +501,13 @@ def reference(path):
   return tokens[:half], tokens[half:], data["top5_tokens"][half - 1:].tolist()
 
 def accuracy(rt, t, c, prompt, after, top5, steps=500):
-  """Tenstorrent's token accuracy for the model on the chip, which TokenAccuracy in simple_text_demo.py measures. The
-  prompt is prefilled. Then each step is fed the reference's next token, no matter what the model predicted (teacher
-  forcing), and the steps are replayed (jit). Returns (top-1, top-5, the model's tokens): the share of steps whose
-  likeliest token is the reference model's likeliest, or among its top five.
+  """Measure top-1 and top-5 agreement with Tenstorrent's reference tokens. Prefill the prompt, then feed
+  the reference token at each step, regardless of the model's prediction. On the chip, jit records
+  and replays these steps. Return (top-1 fraction, top-5 fraction, predicted tokens).
 
-  With rt None, the model runs in numpy with t from arrays and exact products. That separates what the formats cost
-  from what the chip's arithmetic does. With teacher forcing the inputs are known up front, so numpy runs the prompt
-  and the steps as one prefill. It gets the same logits as decoding a step at a time, but reads each block's weights
-  once."""
+  With rt=None, use NumPy weights from arrays and full-precision products. This separates errors
+  from weight conversion from errors in chip arithmetic. Reference tokens are known in advance, so
+  NumPy processes the prompt and following tokens together, reading each block's weights once."""
   n, size = len(prompt), -(-(len(prompt) + steps) // 32) * 32
   if rt is None:
     ids = prompt + after[:steps - 1]
@@ -554,10 +551,10 @@ def python_regex(pat):
   return re.compile("".join(out))
 
 class Tokenizer:
-  """tokenizer.json's byte-level BPE, in Python with no tokenizer library. tiktoken works the same way. The regex splits
-  the text into pieces. A piece that isn't a token already gets merged a pair at a time, lowest rank first. Ids are in
-  merge order, so they're the ranks. Special tokens in the text are encoded as text unless you call encode with
-  special=True."""
+  """Encode and decode byte-level BPE using tokenizer.json, without a tokenizer library.
+  Split text with the tokenizer's regular expression. Keep a piece that's already in the vocabulary;
+  otherwise merge byte pairs in rank order. Token IDs supply the merge ranks. Special-token spellings
+  are ordinary text unless encode is called with special=True."""
   def __init__(self, folder):
     t = read_json(os.path.join(folder, "tokenizer.json"))
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters

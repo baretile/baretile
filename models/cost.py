@@ -26,15 +26,15 @@ LAUNCHES = {"attention": 20, "experts": 15, "deltanet": 5, "rest": 12, "attentio
 # tokens. outputs, in step, counts the outputs of the picked experts separately: the gate and up, their GLU and the
 # down, for the tile rows of their tokens.
 ACTIVATIONS = 4e6, 45e6
-# RISC-V work that a card waits on beyond DRAM, as (tokens in the step, cycles). It's the ttsim cycles that the launches
-# of a block, its experts included, or of the rest take beyond their reads at 265 bytes a cycle (358 GB/s at 1.35 GHz).
-# Counted at Qwen3.6's shapes with ttsim-chaos's read counter and no injected latency. past interpolates linearly
-# between the counts.
+# Estimate RISC-V overhead as (tokens per step, cycles). From each ttsim measurement, subtract the time its reads
+# would take at 265 bytes/cycle (358 GB/s at 1.35 GHz). Measure a block including its experts, and the remaining
+# operations separately. These counts use Qwen3.6 shapes and ttsim-chaos's read counter without injected latency.
+# past interpolates between them. This is a cost-model assumption, not a measured hardware overhead.
 CONTROL = {"attention": ((1, 39300), (8, 25400), (32, 41600)), "deltanet": ((1, 36200), (8, 12900), (32, 15100)),
            "rest": ((1, 154200), (8, 731000), (32, 1641800)), "attention verify": ((2, 47300), (16, 38400), (64, 65600)),
            "deltanet verify": ((2, 63600), (16, 27200), (64, 22900)), "rest verify": ((2, 412000), (16, 1479000), (64, 5148200)),
            "draft": ((2, 50400), (16, 41600), (64, 65700))}
-# A p150 has 120 Tensix cores, and one of them is the dispatcher. GRID is the worker grid as Runtime.grid has it.
+# Assume 120 Tensix tiles: 119 workers and one dispatcher. GRID matches Runtime.grid for that configuration.
 WORKERS, GRID = 119, (tuple(range(12)), tuple(range(9)))
 # A p150. The cost is the p150a's launch price plus a share of a host, over three years, and the power of the card and
 # its share of the host at $0.15 a kWh.
@@ -56,17 +56,17 @@ def probed(card, path):  # the card with the probe's numbers in place of the spe
                      launch=p["launch, 100 queued: chip each"] / bh.AICLK, pcie=min(p["upload over PCIe"], p["read back over PCIe"]) * 1e9)
 
 def shape(c, mode="bf16"):
-  """The sizes of a model's matrices in mode's formats (llama.precision), as a decode step sees them:
-    every         bytes that steps always read, which is everything but the experts and the embedding
-    expert        bytes of an expert
-    moe           how many blocks have experts
-    draft         bytes of the multi-token prediction layer, without its experts
-    draft_values  the values that the draft's call multiplies by
-    embed         bytes of the embedding, which is held, but a step reads only its tokens' rows
-    head          bytes of the output layer that a draft reads
-    bytes         everything held
-    values        the values that a token's matmuls take
-    held          the parameters"""
+  """Return matrix sizes and traffic estimates using the formats selected by llama.precision.
+
+  every: bytes read every step, excluding experts and the embedding.
+  expert: bytes per expert; moe: number of model blocks with experts.
+  draft: bytes in the prediction layer, excluding its experts.
+  draft_values: matrix values used by the prediction layer per token.
+  embed: bytes held for the embedding; a step reads only its token rows.
+  head: bytes in the output layer used for drafting.
+  bytes: total bytes held, including draft weights.
+  values: matrix values used per token, including selected experts.
+  held: total parameter count."""
   prec, d, hd, e, m, sh = llama.precision(c, mode), c.dim, llama.head(c), c.experts, c.moe, c.shared
   fmt = lambda op, l=None: BYTES[prec.get((op, l), ("bf16",))[0]]  # the routers, the conv's taps and mtp.fc stay bf16, as llama holds them
   mixture = lambda l: e and l not in c.dense  # the multi-token prediction block, c.layers, has experts if the model does
@@ -158,7 +158,7 @@ def step(c, s, use, card, users, speculative=False, cards=1):
 
 def prompt(c, s, use, card, chunk, cards=1):
   """Estimate seconds and tokens/s to prefill use's context in chunks, as serve.py does. Count non-expert
-  matrices, selected experts, visible cache rows and activations reread by regroups. Include token matmuls,
+  matrices, selected experts, visible cache rows and activations reread when columns are grouped. Include token matmuls,
   attention scores and the prediction layer, with the output layer only at the chunk's last token. Use the
   longer of DRAM and matmul time. Launch and control overhead are omitted."""
   hd, d, n = llama.head(c), c.dim, use["context"]
@@ -178,8 +178,8 @@ def prompt(c, s, use, card, chunk, cards=1):
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
 def report(folder, mode="bf16", **keys):
-  """The cost report for the model in folder, in mode's formats. It reads only config.json, and keys override CARD and
-  USE."""
+  """Estimate memory use, throughput and cost from folder's config.json. mode selects formats;
+  keyword arguments override CARD and USE settings."""
   card, use = dict(CARD), dict(USE)
   for k, v in keys.items():
     if k != "probe": (card if k in card else use)[k] = v if k == "kv" else float(v)

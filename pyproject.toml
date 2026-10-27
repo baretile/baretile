@@ -15,7 +15,7 @@ classifiers = ["Operating System :: POSIX :: Linux"]
 [project.urls]
 Source = "https://github.com/baretile/baretile"
 
-# baretile/ has no __init__.py, so name the package; the sdist leaves out models, tests and the website
+# Name the namespace package explicitly because baretile/ has no __init__.py. The sdist includes only this package.
 [tool.hatch.build.targets.wheel]
 packages = ["baretile"]
 

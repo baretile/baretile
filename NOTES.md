@@ -1,18 +1,21 @@
 # Working on baretile
 
-The [README](README.md) has the first example. Here we'll follow a tensor
-operation down to the chip, with the register maps near the end for reference.
-We develop on ttsim. The card code still needs testing.
+Start with the setup and tensor example in the [README](README.md), then run
+[ramp.py](ramp.py) for examples of the runtime, compiler and memory layout.
+These notes explain their implementation. The hardware reference follows the
+model and server sections. We develop on ttsim; the card code still needs testing.
 
 ## Running and debugging
 
-Run these from the checkout, with clang and ld.lld on `PATH`. Set `TTSIM` to a
-Blackhole `libttsim.so`. You'll need NumPy and pytest for the tests.
+Run these from the checkout with Python 3.12 or later, clang and ld.lld on
+`PATH`. Set `TTSIM` to a Blackhole `libttsim.so`. You'll need NumPy and pytest
+for the tests.
 
 ```sh
 export TTSIM=/absolute/path/to/libttsim.so
 python3 -m baretile.chip
 python3 -m baretile.hello
+python3 ramp.py
 python3 -m pytest -s test/test_device.py
 python3 -m pytest -s test/test_kernels.py
 python3 -m pytest -s test/test_models.py
@@ -24,7 +27,7 @@ tensor operations built from them. Models, the server and the adapters are in
 `test_models.py`.
 
 If pytest exits without explaining why, run it with `-s`. ttsim stops the
-process on errors such as an invalid address or taking an empty semaphore.
+process on errors such as an invalid address or decrementing an empty semaphore.
 pytest can otherwise hide that error message. The tests share a `Chip` because
 the simulator can only be initialized once per process.
 
@@ -79,10 +82,12 @@ see [bring-up](#bring-up-on-a-p150) for the chip reset command.
 
 ## From Python to a launch
 
-The imports follow the hardware upwards. `bh.py` holds the constants, `pci.py`
-opens the device, and `chip.py` reads and writes through the NoC. The runtime
-uses those to load and launch programs. Above it are the Tensix instructions,
-kernels and tensors. Models and adapters live outside `baretile/`.
+Each module in `baretile/` imports only the standard library and the layers
+below it. `bh.py` holds hardware constants, `pci.py` opens the device, and `chip.py`
+reads and writes through the network on chip (NoC). The runtime uses these
+modules to load and launch programs. The compiler builds kernels from Tensix
+instructions, and `Tensor` compiles expressions into those kernels. Models and
+adapters live outside `baretile/`.
 
 `Tensor` builds an expression when you add, multiply or reduce. `realize()` turns
 that expression into kernels and queues them. `tolist()` also waits and copies
@@ -90,9 +95,14 @@ the result back to Python. A matmul computes its input matrices first. It can
 combine operations on its output into the matmul kernel, as with the ReLU in
 the README.
 
-A kernel contains four RISC-V programs. BRISC moves data. TRISC0 feeds the
-unpacker, TRISC1 feeds the math unit, and TRISC2 feeds the packer. NCRISC stays in
-reset. The three TRISCs submit Tensix instructions to separate hardware queues.
+A Tensix tile has local memory and RISC-V cores that control data movement and
+computation. A kernel can supply a program for BRISC and each of the three
+TRISCs. In tensor kernels, BRISC moves data, TRISC0 feeds the unpacker, TRISC1
+feeds the math unit, and TRISC2 feeds the packer. NCRISC stays in reset.
+The three TRISCs submit Tensix instructions to separate hardware queues.
+
+We also use "tile" for a 32 by 32 block of tensor values. A worker is a Tensix
+tile running a kernel; a tensor tile is the data it processes.
 
 The runtime loads a kernel into L1, the local memory of each worker tile. It
 then puts a command in host memory and writes a doorbell on the dispatcher tile.
@@ -187,26 +197,33 @@ script under it:
 python3 -m baretile.viz models/llama.py /path/to/SmolLM-135M "The meaning of life is" 6
 ```
 
-The script runs as it would under `python3`. When it ends, or stops with an
-error or Ctrl-C, `viz.html` is written in the current directory with the
-finished launches of each runtime the script made. From Python, call
-`viz.save(path, rt, since=saved)` after a wait. It doesn't wait itself, so it
-also works after a hang.
+The script runs as it would under `python3`. If it creates a runtime, the wrapper
+writes `viz.html` in the current directory when the script returns or raises an
+exception, including Ctrl-C. The page includes each runtime's completed launches.
+From Python, call `viz.save(path, rt, since=saved)`. Call `rt.wait()` first to
+include all queued work. `save` doesn't wait, so you can also call it after a
+launch times out.
 
-The timeline shows each launch from `go` to its last report, one after
-another on the dispatcher's clock. Scroll to zoom and drag to pan. The table
-lists the kernels by total cycles, with a fused kernel's input shapes after
-its name, since many kernels share a name like `C matmul`. Pick one to see its
-launches and, for a fused kernel, the expression that `fused_kernel`
-compiled, drawn with the inputs at the top. Each distinct subexpression is one
-node, since the kernel computes it once. The graphs show where fusion
-recomputes a matmul in several kernels, and which values were realized into
-kernels of their own. A kernel made by `Tensor.run` shows its cache key, and
-one launched with `Runtime.launch` alone shows only its name.
+Open the generated file in a browser with JavaScript enabled. File previews
+that don't run scripts can't display the launch data. The source file
+`baretile/viz.html` is a template and contains no launch data.
 
-The page covers the last 1,024 launches, like `profile`. It doesn't connect
-kernels to each other: launch arguments are plain numbers, so the runtime
-can't tell which of them are the DRAM addresses a launch reads or writes.
+The timeline shows each launch from `go` to its last report, using the
+dispatcher's clock. Scroll to zoom, drag to pan, and double-click to show the
+whole timeline. The table sorts kernels by total cycles. Input shapes help
+distinguish fused kernels that share a name such as `C matmul`.
+
+Select a kernel to highlight its launches and see its details. For a fused
+kernel, the page draws the compiled expression with inputs at the top. Each
+distinct subexpression appears once in the graph. Reductions can still compute
+that subexpression on several passes. Comparing graphs can reveal repeated
+matmuls, but the page doesn't track shared tensors between kernels. A kernel
+made by `Tensor.run` shows its cache key. A kernel absent from the tensor cache,
+such as a custom C kernel, shows only its launch statistics.
+
+The runtime keeps the last 1,024 launch records. The page includes the completed
+launches still in that history. Launch arguments are plain numbers, so the
+runtime can't tell which are the DRAM addresses a launch reads or writes.
 
 ## Tensors and kernels
 
@@ -224,10 +241,11 @@ to tiles. A dimension of one is repeated across its tile for broadcasting.
 Other padding is zeroed.
 
 `Tensor.columns()` rearranges a matrix for use as the right operand of a
-matmul. Column `j` goes in bank `j % 8`, with consecutive tiles down K. A worker
-can then read several tiles in a single request. For block floats, exponents
-are stored together before the values. Use this layout for matmul's B. You can
-also read it back to the host, but other operations may reject it.
+matmul. Tile column `j` goes in bank `j % 8`, with consecutive tiles along the
+dimension K that the matmul sums over. A worker can then read several tiles in
+a single request. For block floats, exponents are stored together before the
+values. Use this layout for matmul's B. You can also read it back to the host,
+but other operations may reject it.
 
 | Format | Bytes per tile | Notes |
 | --- | ---: | --- |
@@ -327,11 +345,11 @@ out the lowest bit of A. One phase uses fewer bits of B too. The model's
 precision mode sets both the weight formats and the number of phases. ttsim
 takes the same time regardless of the phase count.
 
-Even at four phases, the sum is rounded. The matrix unit aligns groups of
-products before adding them, and a partial sum reloaded through SrcA loses
-bits in the conversion to TF32. For fp32 matmul, we split each operand into a
-bf16 high part and a bf16 low part. We compute `hi @ hi + hi @ lo + lo @ hi`
-and add those products in fp32.
+Four phases make bf16 products exact, but the sum is still rounded. The matrix
+unit aligns groups of products before adding them. A partial sum reloaded
+through SrcA loses bits in the conversion to TF32. For fp32 matmul, we split
+each operand into a bf16 high part and a bf16 low part. We compute
+`hi @ hi + hi @ lo + lo @ hi` and add those products in fp32.
 
 fp32 elementwise operations use the SFPU, a 32-lane vector unit working on Dst.
 It implements arithmetic and the polynomial approximations used for functions
@@ -381,7 +399,7 @@ settings. `experts` puts the MLP matrices in bfp4, the other matrices in bfp8,
 and the KV cache in bfp8. `llama.precision` has the settings for each operation.
 
 The loader fuses q, k and v projections, and gate and up projections, where
-appropriate. Matmul weights are uploaded in column order. The KV cache is
+appropriate. Matmul weights are stored by tile columns. The KV cache is
 allocated once, and each token writes its keys and values at its position.
 
 ### Experts and Gated DeltaNet
@@ -466,7 +484,7 @@ for 600 seconds gets HTTP 504. A stream that times out releases its slot.
 ### Reusing a conversation
 
 When a prompt arrives, the engine looks for a free slot that has already
-processed the start of it. It can also restore a saved session with its tokens,
+processed a prefix of it. It can also restore a saved session with its tokens,
 KV cache and recurrent state. DeltaNet must resume from the exact tokens that
 produced its state.
 
@@ -664,8 +682,8 @@ the overrides at `0xFFB12234`.
 
 The compiler targets `rv32im`. `.ttinsn` uses the encoding space that would
 normally hold compressed RISC-V instructions. Don't use `mhartid` to identify
-these cores, and don't use `fence.i` to reload a kernel. Firmware invalidates the instruction caches
-through Tensix configuration instead.
+these cores, and don't use `fence.i` to reload a kernel. Firmware invalidates
+the instruction caches through Tensix configuration instead.
 
 Unsupported instructions have undefined behavior instead of trapping. Use
 instructions from the subset in the existing device programs.

@@ -1,5 +1,5 @@
-# The runtime. Firmware stays loaded on the Tensix cores, and kernels launch without resetting anything. One core, the
-# dispatcher, pulls commands from a ring in host memory.
+# Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
+# A dispatcher reads commands from a ring in host memory and sends them to the workers.
 import atexit, collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time
 from baretile import bh, pci
 
@@ -161,16 +161,14 @@ def compile_kernel(*programs):
 def jumps(brisc, trisc0, trisc1, trisc2):
   return f'__attribute__((naked, section(".start"))) void _start(void) {{ asm("j {brisc}\\n j {trisc0}\\n j {trisc1}\\n j {trisc2}"); }}'
 
-# A launch on a worker. BRISC sees go in its mailbox, with the addresses of the kernel and its arguments, and n, the
-# number of workers it's for. Workers n and up sit it out. The arguments start with a number of units to share, which
-# BRISC turns into this worker's [first unit, how many]. Then BRISC zeroes the SYNC counters and drops the cached
-# instructions of all four cores, since the kernel may sit where another one was. It tells the TRISCs to go. The cores
-# run their programs from the kernel's header, and a TRISC then waits for its Tensix thread to finish what it pushed.
-# Once all four cores are done, BRISC reports. It notes the launch in its own mailbox, for the host to read if a
-# launch hangs. Then it adds 1 to the dispatcher's count with a posted NoC atomic increment: nothing comes back, and no
-# counter moves at either end. Where the NIU counts read data (COUNTED: a card or ttsim-chaos), BRISC first adds the
-# 64-byte flits that the launch's reads brought in to the dispatcher's sum, the same way. Both go on the same static
-# VC, so the sum is complete once the count is.
+# BRISC receives go, the kernel and argument addresses, and the worker count n in its mailbox. Workers with index
+# n or higher skip the launch. BRISC divides the work into [first unit, unit count], clears SYNC, and invalidates
+# all four instruction caches because a different kernel may have occupied the same addresses. It then starts
+# the programs named in the kernel header. Each TRISC waits for its Tensix thread to finish before returning.
+# Once all four cores finish, BRISC records completion in its mailbox and increments the dispatcher's report
+# count with a posted NoC atomic. This sends no response and changes no request counter. With COUNTED enabled,
+# BRISC first adds the launch's read-data count, in 64-byte flits, to the dispatcher's sum. Both atomics use the
+# same static VC, so the byte count arrives before the completion report.
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
@@ -229,21 +227,19 @@ void trisc_loop(unsigned i) {{
 }}
 """
 
-# A command is a 16-byte header [length, kernel address, argument bytes, workers], then the arguments, padded to a
-# multiple of 64 bytes. Length 0 means the rest of the ring is unused. The kernel is already in the workers' L1
-# (Runtime.load).
-# A read of host memory waits on PCIe, so the dispatcher reads everything new in the ring with one noc_read, up to the
-# ring's end and at most STAGE bytes. It runs the commands from its L1. The arguments and the go each reach all the
-# workers in a multicast, even when the launch uses fewer of them. The workers report done by adding to a shared word,
-# DONE. A multicast gets an acknowledgement from each worker, so the dispatcher waits on the acknowledgement counter.
-# The request counter goes up once and down once per worker, so it's cleared after.
-# One launch runs at a time, but the next one's arguments go into the other buffer while it runs, so it starts the
-# moment the last worker reports. When a launch is done, the dispatcher writes its [go, last report] times on its wall
-# clock and the 64-byte flits its workers read into a ring of TIMES entries in host memory, after the commands. The
-# flits are how much the sum grew, read before the next launch goes. The host gets a profile of the launches, timed
-# by the chip's clock. Then the dispatcher writes [read pointer, launches done] into the status. Both are posted
-# writes on the same static VC, so they arrive in that order. The dispatcher doesn't wait for PCIe, only for their
-# bytes to leave its outbox.
+# Commands contain a 16-byte header [length, kernel address, argument bytes, workers], followed by arguments and
+# padding to a multiple of 64 bytes. Length 0 marks the unused tail of the ring. Runtime.load has already put
+# the kernel in worker L1.
+# To reduce PCIe reads, the dispatcher fetches new commands in one request, limited by STAGE and the ring's end.
+# It multicasts arguments and go to every worker, including those outside this launch's worker count. Multicast
+# completion uses acknowledgements: the request counter increments once but decrements for each recipient, so
+# the dispatcher clears that counter afterwards. Workers report completion by incrementing DONE.
+# Only one launch runs at a time. The dispatcher prepares the next launch's arguments in the alternate buffer
+# while the current launch runs. After completion, it captures the timing and read-data counts, then starts
+# the next launch before reporting to the host. Timing records use a TIMES-entry ring in host memory.
+# Each record holds [go, last report, flits read]; flits are the increase in the shared read-data count.
+# The dispatcher posts the record before [read pointer, launches done] on the same static VC, preserving their
+# arrival order. It waits only for the data to leave its outbox, without waiting for a PCIe acknowledgement.
 TIMES = 1024
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
@@ -504,8 +500,8 @@ class Runtime:
   def read_status(self, i): return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 
   def until(self, cond, what, timeout=60):
-    """Wait until cond(), as long as launches keep finishing. If none finishes in timeout seconds, the chip has hung. A
-    launch can take seconds on the simulator."""
+    """Poll until cond() is true. Raise TimeoutError if no launch completes within timeout seconds.
+    Each completed launch restarts the timeout, allowing long queues to make progress on the simulator."""
     while not cond():
       done = self.read_status(1)
       self.chip.wait(lambda: cond() or self.read_status(1) != done, what, timeout)

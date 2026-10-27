@@ -12,23 +12,24 @@ from baretile.tensor import Tensor
 import gpt2, llama
 
 def deltanet(h, p, c, state, phases, live=None, accept=None):
-  """Gated DeltaNet, the linear attention of Qwen3.5, over the tokens of this call.
+  """Apply Qwen3.5/3.6's Gated DeltaNet to this call's tokens and update recurrent state in place.
+  Tokens belong to one sequence, or form equal-length groups for several sequences. live marks active
+  tokens; inactive tokens leave state unchanged. After the projections, computation uses fp32.
+  Decode and verification run the convolution, gates and recurrence in one kernel. Prompts use
+  64-token chunks.
 
-  The tokens are the next ones of a sequence, or the same number from each of several sequences in a decode step.
-  Then live is a column with 1 or 0 for each token. A token with 0 belongs to no sequence and leaves the state as it
-  was. Everything from the projections on is fp32, as in transformers. A decode step, or a verify step's token and
-  its draft, runs the recurrent rule, conv and gates included, in one kernel (f.delta). A prompt runs in pieces of 64
-  (chunk).
+  state contains [conv, S]:
+  - conv holds the previous c.conv - 1 convolution inputs, with one matrix per history position and
+    one row per sequence.
+  - S holds a c.kd x c.vd matrix per value head, with c.vh batch entries per sequence. Each token
+    updates it as S = e^g S + beta k (v - e^g S^T k)^T, then reads the result with its query.
 
-  state is [conv, S], updated in place:
-  - conv: the last c.conv - 1 inputs of the conv, a matrix for each position with a row for each sequence
-  - S: the memory of each value head, c.kd x c.vd, with c.vh batch entries for each sequence. A token decays S by
-    e^g, corrects it toward its value by beta, S = e^g S + beta k (v - e^g S^T k)^T, and reads it with its query.
-  A speculative step also keeps copies of both as they were after its first token, in state[2:]. The accept row of
-  the next step has 1 or 0 for each sequence. 1 goes on from the state after both tokens. 0, for a draft that was
-  turned down, goes on from the copies.
+  Speculative verification processes a token and its draft. state[2:] keeps copies after the first
+  token. On the next call, accept=1 resumes from the state after both tokens; accept=0 resumes from
+  the copies before the rejected draft.
 
-  p has qkv_proj (q, k, v, z, b and a side by side), conv (its taps), decay (-exp(A_log)), dt_bias, norm and o_proj."""
+  p contains qkv_proj (q, k, v, z, b and a concatenated), conv taps, decay (-exp(A_log)), dt_bias,
+  norm and o_proj."""
   f, (past, S) = llama.fns(h), state[:2]
   past = past.get() if isinstance(past, Row) else past  # the conv state of one sequence out of several
   n, seqs, qk, vw, r = h.shape[-2], past.shape[1], c.kh * c.kd, c.vh * c.vd, c.vh // c.kh
@@ -74,8 +75,7 @@ class Row:
   def tobytes(self): return self.get().tobytes()
 
 def numpy_delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2=None):
-  """delta in numpy, for llama.fns. It takes the same arguments, writes the same conv inputs and states in place, and
-  returns the same outputs."""
+  """Run delta with NumPy for llama.fns, using the same arguments, outputs and in-place state updates."""
   n, width = conv.shape[1], conv.shape[-1]
   (vh, kd, vd), m = (S.shape[0] // n, *S.shape[1:]), x.shape[-2] // n
   qk, vw, x = (width - vh * vd) // 2, vh * vd, np.asarray(x).reshape(n, m, -1)
@@ -109,16 +109,18 @@ def step(q, k, v, beta, g, S):
   return (q * S).sum(-2, keepdims=True), S
 
 def chunk(q, k, v, beta, g, S, size=64):
-  """The gated delta rule over the tokens of a prompt, in pieces of 64, like torch_chunk_gated_delta_rule in
-  transformers (the UT transform from the DeltaNet paper). It takes the state before (S), the query, key and value of
-  each token, and beta and g as columns. Returns the output of each token and the state after the last token.
+  """Apply the gated delta rule to a prompt in 64-token chunks, following transformers'
+  torch_chunk_gated_delta_rule. Take initial state S, queries q, keys k, values v, and columns beta
+  and g. Return each token's output and the final state.
 
-  The work that doesn't touch the state is batched, with a batch entry for each piece. The last piece is padded with
-  tokens that have no key, value or decay, so they change nothing. Then the state goes through the pieces in turn,
-  four matmuls each, and each piece writes its output into its rows.
-  Within a piece the corrections solve (I + L) u = beta v. L is strictly lower triangular: it says how much the
-  correction of each token moves the later ones. L^64 = 0, so with P = -L, (I + L)^-1 = (I + P)(I + P^2)(I + P^4)...
-  Each factor costs a matmul or two, with no loop over tokens."""
+  Batch the work independent of S across chunks. Pad the last chunk with tokens whose key, value
+  and decay are zero, so they don't change state. Then process chunks in order, using four matmuls
+  per chunk to update state and write outputs.
+
+  Within a chunk, corrections solve (I + L) u = beta v. L is strictly lower triangular and describes
+  how each token's correction affects later tokens. Since L^64 = 0, setting P = -L gives
+  (I + L)^-1 = (I + P)(I + P^2)(I + P^4)... . Each factor takes one or two matmuls, avoiding a loop
+  over individual tokens."""
   f, (h, m, dv) = llama.fns(q), v.shape
   n, s = -(-m // size), min(m, size)  # the number of pieces, and the tokens in each
   if n > 1:  # copy each, since it may be a repeat or a view, and pad to a multiple of 64. piece i of head j is batch entry j n + i
@@ -647,13 +649,14 @@ void kmain(volatile unsigned *a) {{
 }}""")
 
 def touched(ids, n, weights):
-  """Lists the distinct experts that rows pick with a nonzero weight, so that the few tokens of a decode step go
-  through each picked expert once. ids are the int32 choices (rows x k, values below n), and weights are their bf16
-  weights. touched_kernel does it on BRISC, with a unit for each entry. Returns:
-  - experts: a column of min(rows k, n), the picked experts in increasing order, then n (none)
-  - weights: (that many, rows, 1) in bf16, the weight that each row gives each entry, 0 for a row that didn't pick it
-  In a matmul by index=experts, the tokens are then rows of each entry, and an entry of n gives zeros and reads
-  nothing. The results are weighted and summed over the entries."""
+  """List distinct experts selected with nonzero weight. ids is an int32 (rows, k) matrix with values
+  below n; weights holds the corresponding bf16 routing weights. touched_kernel runs this on BRISC.
+  Return:
+  - experts: a column of min(rows * k, n) entries, sorted by expert ID and padded with n.
+  - weights: bf16 (entries, rows, 1), with zero where a token didn't select that expert.
+
+  Indexed matmul then runs each selected expert over the token rows. Padding entries select no
+  matrix and return zeros. Weight the results and sum across experts."""
   assert ids.dtype == "int32" and weights.dtype == "bf16" and ids.shape == weights.shape and ids.batch == 1 and ids.cols <= 32
   x, w, rows, k = ids.realize(), weights.realize(), ids.rows, ids.cols  # matrices, so there are no repeats to copy
   slots = min(rows * k, n)
@@ -663,7 +666,7 @@ def touched(ids, n, weights):
   return experts, out
 
 def mxfp4(blocks, scales):
-  """Turns the MXFP4 experts of gpt-oss into bf16 bits. It's exact, since a value has at most 2 significant bits.
+  """Convert gpt-oss MXFP4 expert weights to bf16 bits exactly; each value has at most two significant bits.
 
   The values are 4 bits (sign, 2 bits of exponent, 1 of mantissa), two to a byte with the low nibble first. Blocks of 32
   share a power of 2, stored as a byte with 127 for 1. They come as a batch of (out x in) matrices, which are

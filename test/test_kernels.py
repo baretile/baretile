@@ -88,9 +88,9 @@ def test_bytes(chip):
     assert [r[3] for r in rt.profile(since)] == [want]
 
 def test_viz(chip, tmp_path):
-  # viz.save writes a page with each finished launch and what made its kernel. A fused kernel's expression is a graph
-  # with one node for each distinct subexpression, so the softmax has one x - max, though its expression holds it twice.
-  # A matmul's B is a node that says how B is read. A kernel launched with Runtime.launch alone has only its name.
+  # viz.save records completed launches and compiler details. A shared subexpression gets one graph node,
+  # even when a reduction recomputes it on several passes. Matmul's B node describes its read mode.
+  # A custom kernel absent from tensor.kernels has launch statistics but no expression graph.
   rt = Runtime(chip)
   x = Tensor.of(rt, [[float(c % 5) for c in range(64)] for _ in range(32)])
   since = rt.launches
@@ -111,7 +111,7 @@ def test_viz(chip, tmp_path):
 
 @pytest.mark.skipif("TTSIM" not in os.environ, reason="the script opens the device again, and a card can't be open in two processes")
 def test_viz_script(tmp_path):
-  # python3 -m baretile.viz runs a script as python3 would, then writes viz.html for each runtime the script made
+  # The command runs the script and writes one viz.html containing its runtimes.
   (tmp_path / "script.py").write_text("from baretile import pci\nfrom baretile.chip import Chip\nfrom baretile.runtime import Runtime\n"
                                       "from baretile.tensor import Tensor\nrt = Runtime(Chip(pci.open_device()))\n"
                                       "print((Tensor.of(rt, [[1.0, 2.0]]) * 3).tolist())\n")
@@ -309,7 +309,7 @@ def test_matmul_parts(chip):
   # A grid matmul whose K is too long for A's rows and B's buffers below slot 256 takes K in parts, in one kernel (see
   # kernels.grid_parts). Workers sum their result tiles over the parts in fp32 accumulators in L1, and the last part
   # starts from that sum. When the accumulators don't fit, a worker does its block a group of columns at a time and
-  # reads A again for each group. Each input tile is read from DRAM once, A once per group.
+  # reads A again for each group. B is read once; A is read once per group.
   # The cases split K into these parts, in tiles: 22, 22, 20. Then 64, 64 with a bfp8 B in regions past the slots, 22
   # with B transposed, and 32 four times, so A's buffers go round. Then 22 with the last workers of the grid taking 2
   # of their 3 columns. Last is a grid of one row, with blocks of 32 tile rows in two groups of 4 columns, where the
@@ -382,8 +382,8 @@ def test_matmul_bank_local(chip):
       assert np.all(np.abs(value(y)[0] - (a @ v + r)) <= 2**-8 * (np.abs(a) @ np.abs(v) + np.abs(r))), how
 
 def test_matmul_by_columns(chip):
-  # A matmul's B laid out by columns (Tensor.columns) gives the same bits as B as it lies, in the paths a matmul takes.
-  # Column j is one run down K in bank j % 8, and a block float puts the exponents of the run before its values.
+  # Tensor.columns must preserve matmul results across all read paths. Tile column j forms one run along K
+  # in bank j % 8. Block floats store the run's exponents before its values.
   # The cases cover a token's row: bank-local, with K too long for the slots, and with K cut into a batch. They cover a
   # grid's blocks with K in one part and in several, passes over a row as in a softmax, blocks on one worker, A
   # streamed beside B, and the experts that tokens pick with index=. B by columns reads back as it was, and any other
@@ -432,12 +432,9 @@ def test_matmul_chunks(chip):
     assert reads() - before == want and np.array_equal(value(y), value(x @ w)), (m, k, n, how, reads() - before, want)
 
 def test_accumulate_parts(chip):
-  # A matmul sums parts of K in fp32 in L1 between them. This test builds the kernel by hand: a result tile, K of 6
-  # tiles in 3 parts, on one worker, with the input tiles written into L1 by the host. Each part but the last is packed
-  # onto the tile's accumulator (tensix.accumulating), the first part writing it and the second to last posting
-  # SEM_L1. The last part takes SEM_L1 and loads the accumulator into Dst in TF32, through SrcA and an add of zeros
-  # (tensix.reload). Then it multiplies its tiles onto it and is packed in fp32 past the accumulator. The reference is
-  # the same matmul over all of K in Dst, and the result is within TF32's 2^-10 on the sum of the first parts.
+  # Build a one-worker matmul with six K tiles split into three parts. The first two parts accumulate in fp32
+  # in L1. The last waits on SEM_L1, reloads the sum through SrcA as TF32, then adds its products in Dst.
+  # Compare with accumulating all six tiles in Dst. The allowed difference is TF32's 2^-10 on the reloaded sum.
   c, rt, rng = tensix, Runtime(chip, end=chip.tensix[1]), np.random.default_rng(37)
   parts, kp = 3, 2  # parts of K, and tiles in each part
   kt, acc, slots, cfg = parts * kp, tensix.B8, tensix.allocate({"mm"}), tensix.kernel_config() | tensix.config(Pack_L1_Acc=0)
