@@ -99,6 +99,7 @@ def test_viz(chip, tmp_path):
   rt.wait()
   viz.save(tmp_path / "viz.html", rt, since=since)
   [run] = page_data(tmp_path / "viz.html")
+  assert (tmp_path / "viz.html").read_text().count('"title"') == 1, "the page holds its data once"
   assert [(n, run["kernels"][k]["name"]) for k, n, *_ in run["launches"]] == \
     [(since + 1, "max2 sub exp sum2 recip mul"), (since + 2, "T matmul"), (since + 3, "empty")]
   assert all(cycles > 0 and workers > 0 for *_, cycles, _, workers in run["launches"])

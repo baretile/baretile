@@ -1,14 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>baretile viz</title>
-<!-- viz.py fills in {data} and writes this out as one file. The page needs no server and loads nothing else. -->
+<!-- viz.py puts the launches into the data script below and writes this out as one file. It needs no server and loads
+nothing else. -->
 <style>
-  :root { --bg: #101010; --line: #2a2a2a; --text: #d8d8d8; --dim: #8a8a8a; --pick: #1e2a38; }
+  :root { color-scheme: dark; scrollbar-color: #3a3a3a #101010; --bg: #101010; --line: #2a2a2a; --text: #d8d8d8; --dim: #8a8a8a; --pick: #1e2a38; }
   * { box-sizing: border-box; }
   body { margin: 0; height: 100vh; display: grid; grid-template-rows: auto 128px 1fr; background: var(--bg); color: var(--text);
          font: 12px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
   header { display: flex; gap: 18px; align-items: baseline; padding: 8px 14px; border-bottom: 1px solid var(--line); }
   header b { font-size: 13px; }
+  header b, #tabs { flex: none; }  /* only the summary wraps */
   header button { background: none; color: var(--dim); border: 1px solid var(--line); border-radius: 3px; font: inherit; cursor: pointer; }
   header button.on { color: var(--text); border-color: var(--dim); }
   .dim { color: var(--dim); }
@@ -33,11 +35,13 @@
 </style>
 <header><b>baretile viz</b><span id="tabs"></span><span id="summary"></span></header>
 <canvas id="timeline"></canvas>
-<main><div id="kernels"></div><div id="kernel"></div></main>
+<main><div id="kernels"></div><div id="kernel"><p class="dim">This page draws itself with JavaScript. If this message stays, open the
+file in a browser: previews often don't run scripts.</p></div></main>
 <div id="tip"></div>
 <script id="data" type="application/json">{data}</script>
 <script>
-const runs = JSON.parse(document.getElementById("data").textContent), $ = id => document.getElementById(id);
+const data = document.getElementById("data").textContent;  // a list from viz.py, or the placeholder in the template itself
+const runs = data.startsWith("[") ? JSON.parse(data) : [], $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
 const num = n => n >= 1e9 ? (n / 1e9).toFixed(2) + "G" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
 const color = (k, a = 1) => `hsla(${k * 137.5 % 360}, 50%, 60%, ${a})`;  // golden-angle hues, so kernels next to each other differ
@@ -170,7 +174,7 @@ onmousemove = e => {
     drag.moved ||= Math.abs(e.clientX - drag.x) > 2;
     if (drag.moved) { view = drag.view.map(v => v - dt); draw(); }
   }
-  const l = e.target == canvas && under(e.offsetX);
+  const l = run && e.target == canvas && under(e.offsetX);
   if (!l) { tip.style.display = "none"; return; }
   tip.innerHTML = `launch ${l[1]}: ${esc(run.kernels[l[0]].name || "(no name)")}<br><span class="dim">${num(l[3])} cycles on ${l[5]} worker${l[5] > 1 ? "s" : ""}` +
     `${l[4] != null ? `, ${num(l[4])} bytes read` : ""}</span>`;
@@ -178,7 +182,9 @@ onmousemove = e => {
   Object.assign(tip.style, { left: Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 4) + "px", top: e.clientY + 14 + "px" });
 };
 const whole = () => { const l = run.launches.at(-1); view = [0, Math.max(1, l ? l[2] + l[3] : 1)]; };
-canvas.ondblclick = () => { whole(); draw(); };
-onresize = draw;
-show(0);
+canvas.ondblclick = () => { if (run) whole(), draw(); };
+onresize = () => run && draw();  // keeps the zoom
+if (runs.length) show(0);
+else $("kernel").innerHTML = "<p>There are no launches in this page. viz.py fills in this template: run a script with " +
+  "<code>python3 -m baretile.viz script.py</code> and open the viz.html that it writes.</p>";
 </script>
