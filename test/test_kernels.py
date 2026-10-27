@@ -1,17 +1,20 @@
 # Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
-import math, os, random, pytest
+import json, math, os, pathlib, random, re, subprocess, sys, pytest
 import numpy as np
-from baretile import bh, tensix, tensor
+from baretile import bh, tensix, tensor, viz
 from baretile.kernels import grid_parts
 from baretile.tensor import Tensor
 from baretile.runtime import TIMES, Runtime, compile_kernel
 from conftest import bf16, value
 
 def kernels(rt, since):  # counts launches after launch `since`, leaving out readbacks such as tobytes
-  return sum(rt.names[n % TIMES] != "readback" for n in range(since + 1, rt.launches + 1))
+  return sum(rt.sent[n % TIMES][0] != "readback" for n in range(since + 1, rt.launches + 1))
 
 def row_end(chip):  # where a Runtime ends so that its grid is one row of 12, however the chip is harvested
   return chip.tensix[len(chip.tensix) // len(bh.TENSIX_Y) + 11]
+
+def page_data(path):  # what viz.save put in a page
+  return json.loads(re.search(r'<script id="data" type="application/json">(.*?)</script>', path.read_text(), re.S)[1])
 
 def close(t, want, tol):  # checks t against numpy's answer, with tol as both the relative and absolute tolerance
   got = np.array(t.tolist())
@@ -83,6 +86,39 @@ def test_bytes(chip):
     since = rt.launches
     run()
     assert [r[3] for r in rt.profile(since)] == [want]
+
+def test_viz(chip, tmp_path):
+  # viz.save writes a page with each finished launch and what made its kernel. A fused kernel's expression is a graph
+  # with one node for each distinct subexpression, so the softmax has one x - max, though its expression holds it twice.
+  # A matmul's B is a node that says how B is read. A kernel launched with Runtime.launch alone has only its name.
+  rt = Runtime(chip)
+  x = Tensor.of(rt, [[float(c % 5) for c in range(64)] for _ in range(32)])
+  since = rt.launches
+  x.softmax().realize(), (x @ x.T).realize()
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) {}"), name="empty")
+  rt.wait()
+  viz.save(tmp_path / "viz.html", rt, since=since)
+  [run] = page_data(tmp_path / "viz.html")
+  assert [(n, run["kernels"][k]["name"]) for k, n, *_ in run["launches"]] == \
+    [(since + 1, "max2 sub exp sum2 recip mul"), (since + 2, "T matmul"), (since + 3, "empty")]
+  assert all(cycles > 0 and workers > 0 for *_, cycles, _, workers in run["launches"])
+  softmax, matmul, empty = run["kernels"]
+  assert softmax["graph"] == [["in 0", "1x32x64", []], ["max2", "", [0]], ["sub", "", [0, 1]], ["exp", "", [2]], ["sum2", "", [3]],
+                              ["recip", "", [4]], ["mul", "", [3, 5]]]
+  assert matmul["graph"] == [["in 0", "1x32x64", []], ["read B", "transposed", [0]], ["matmul", "", [0, 1]]]
+  assert "graph" not in empty and "text" not in empty and empty["launches"] == 1
+
+@pytest.mark.skipif("TTSIM" not in os.environ, reason="the script opens the device again, and a card can't be open in two processes")
+def test_viz_script(tmp_path):
+  # python3 -m baretile.viz runs a script as python3 would, then writes viz.html for each runtime the script made
+  (tmp_path / "script.py").write_text("from baretile import pci\nfrom baretile.chip import Chip\nfrom baretile.runtime import Runtime\n"
+                                      "from baretile.tensor import Tensor\nrt = Runtime(Chip(pci.open_device()))\n"
+                                      "print((Tensor.of(rt, [[1.0, 2.0]]) * 3).tolist())\n")
+  out = subprocess.run([sys.executable, "-m", "baretile.viz", "script.py"], cwd=tmp_path, capture_output=True, text=True, timeout=300,
+                       env=os.environ | {"PYTHONPATH": str(pathlib.Path(__file__).parent.parent)})
+  assert out.returncode == 0 and out.stdout.startswith("[[3.0, 6.0]]"), out.stdout + out.stderr
+  [run] = page_data(tmp_path / "viz.html")
+  assert [k["name"] for k in run["kernels"]] == ["mul", "readback"] and run["kernels"][0]["graph"][-1][0] == "mul"
 
 def test_jit(chip, monkeypatch):
   # tensor.jit records the second call of a function and replays its launches after that. Later calls copy their inputs
