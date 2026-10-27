@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "baretile"
+version = "0.0.1"
+description = "A compiler and runtime for Tenstorrent Blackhole, written in Python"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "alkinun" }]
+classifiers = ["Operating System :: POSIX :: Linux"]
+
+[project.urls]
+Source = "https://github.com/baretile/baretile"
+
+# baretile/ has no __init__.py, so name the package; the sdist leaves out models, tests and the website
+[tool.hatch.build.targets.wheel]
+packages = ["baretile"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["baretile"]
