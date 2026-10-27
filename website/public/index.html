@@ -39,7 +39,8 @@ We use Tenstorrent's board firmware for ARC and Ethernet, with no dependency on 
 We haven't tested baretile on a card yet. Simulator timings don't predict card performance.</p>
 
 <p><a href="https://github.com/baretile/baretile">Source</a> ·
-<a href="https://github.com/baretile/baretile/blob/main/NOTES.md">Documentation</a></p>
+<a href="https://github.com/baretile/baretile/blob/main/docs/README.md">Documentation</a> ·
+<a href="https://pypi.org/project/baretile/">PyPI</a></p>
 
 <h2>Using it</h2>
 
@@ -66,19 +67,32 @@ We check the models against NumPy and the training example against PyTorch.</p>
 <h2 id="getting-started">Getting started</h2>
 
 <p>You can run the examples on the simulator.
-You'll need Python 3.12 or later, clang with a RISC-V target, lld, and a Blackhole build of <a href="https://github.com/tenstorrent/ttsim">ttsim</a>.</p>
+You'll need Python 3.12 or later, clang with a RISC-V target, lld, and the Blackhole library from <a href="https://github.com/tenstorrent/ttsim">ttsim</a>.
+ttsim's <a href="https://github.com/tenstorrent/ttsim/releases">releases</a> include it as <code>libttsim_bh.so</code>, or you can <a href="https://github.com/baretile/baretile#try-it">build it</a>.</p>
 
-<p>Follow the <a href="https://github.com/baretile/baretile#try-it">setup instructions</a>, then run this from the baretile checkout:</p>
+<p>Then clone baretile and run this from the checkout:</p>
 
-<pre><code><span class="k">export</span> TTSIM=/absolute/path/to/ttsim/src/_out/release_bh/libttsim.so
+<pre><code>git clone https://github.com/baretile/baretile
+<span class="k">cd</span> baretile
+<span class="k">export</span> TTSIM=/absolute/path/to/libttsim.so
 python3 -m baretile.hello</code></pre>
 
 <p>This runs a Fibonacci program on the simulated workers and reads back their answers.
 Keep <code>TTSIM</code> set for the tensor example too.
 Without <code>TTSIM</code>, baretile tries to open a real card.</p>
 
-<p>Run <code>python3 ramp.py</code> for more examples of tensor operations, gradients, custom kernels and DRAM access.
-<a href="https://github.com/baretile/baretile/blob/main/ramp.py">ramp.py</a> explains each example and checks its results.</p>
+<p><code>pip install baretile</code> installs the package alone, which is enough for this command and the tensor example.</p>
+
+<h2>Learning it</h2>
+
+<p>The <a href="https://github.com/baretile/baretile/tree/main/ramps">ramps</a> teach baretile from the top down.
+Each one is a script that explains its steps and checks their results:</p>
+
+<pre><code>python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span>
+python3 ramps/2_runtime.py   <span class="c"># C kernels on the workers, DRAM and the NoC</span>
+python3 ramps/3_tensix.py    <span class="c"># unpack, math and pack programs written by hand</span></code></pre>
+
+<p>The <a href="https://github.com/baretile/baretile/blob/main/docs/README.md">documentation</a> explains the runtime, the compiler, the models and the hardware.</p>
 
 </main>
 
