@@ -180,6 +180,34 @@ counted in 64-byte units and include everything the workers read through the
 NoC. That includes other tiles' L1 and local copies. You can't use the byte
 count as a DRAM measurement unless you know where the kernel reads from.
 
+`baretile.viz` shows the same records as a page you open in a browser. Run any
+script under it:
+
+```sh
+python3 -m baretile.viz models/llama.py /path/to/SmolLM-135M "The meaning of life is" 6
+```
+
+The script runs as it would under `python3`. When it ends, or stops with an
+error or Ctrl-C, `viz.html` is written in the current directory with the
+finished launches of each runtime the script made. From Python, call
+`viz.save(path, rt, since=saved)` after a wait. It doesn't wait itself, so it
+also works after a hang.
+
+The timeline shows each launch from `go` to its last report, one after
+another on the dispatcher's clock. Scroll to zoom and drag to pan. The table
+lists the kernels by total cycles, with a fused kernel's input shapes after
+its name, since many kernels share a name like `C matmul`. Pick one to see its
+launches and, for a fused kernel, the expression that `fused_kernel`
+compiled, drawn with the inputs at the top. Each distinct subexpression is one
+node, since the kernel computes it once. The graphs show where fusion
+recomputes a matmul in several kernels, and which values were realized into
+kernels of their own. A kernel made by `Tensor.run` shows its cache key, and
+one launched with `Runtime.launch` alone shows only its name.
+
+The page covers the last 1,024 launches, like `profile`. It doesn't connect
+kernels to each other: launch arguments are plain numbers, so the runtime
+can't tell which of them are the DRAM addresses a launch reads or writes.
+
 ## Tensors and kernels
 
 ### Tiles and storage

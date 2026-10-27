@@ -9,7 +9,7 @@ def test_layers():
   # helpers in conftest, import nothing above that layer. Outside the tests, no file uses the private names of another
   # file, whether it imports them or uses them as attributes that only the other file defines.
   root = pathlib.Path(__file__).parent.parent
-  order = ["bh", "pci", "chip", "runtime", "hello", "tensix", "kernels", "tensor", "bench", "probe"]  # layers 0-1, then 2-3, each with its commands
+  order = ["bh", "pci", "chip", "runtime", "hello", "tensix", "kernels", "tensor", "bench", "probe", "viz"]  # layers 0-1, then 2-3, each with its commands
   trees = {p: ast.parse(p.read_text()) for d in ("baretile", "models", "adapters") for p in sorted((root / d).glob("*.py"))}
   assert sorted(order) == sorted(p.stem for p in trees if p.parent.name == "baretile"), "every module in baretile/ needs a layer"
   def imports(name, tree, below, also=()):  # each import is from the standard library, from also, or a baretile module in below
@@ -20,7 +20,7 @@ def test_layers():
         assert sub.split(".")[0] in below if top == "baretile" else top in sys.stdlib_module_names or top in also, f"{name} imports {m}"
   for p, tree in trees.items():
     if p.parent.name == "baretile": imports(p.name, tree, order[:order.index(p.stem)])
-  for name, top in (("conftest", "hello"), ("test_device", "hello"), ("test_kernels", "probe")):
+  for name, top in (("conftest", "hello"), ("test_device", "hello"), ("test_kernels", "viz")):
     imports(name, ast.parse((root / "test" / f"{name}.py").read_text()), order[:order.index(top) + 1], ("numpy", "pytest", "conftest"))
   ours, private = {p.stem for p in trees} | {"baretile"}, lambda name: name.startswith("_") and not name.endswith("__")
   defined, used = {p: set() for p in trees}, {p: set() for p in trees}

@@ -63,6 +63,10 @@ Tensors support broadcasting, reductions, views and autograd. Storage formats ar
 bf16, fp32, int32, bfp8 and bfp4. [NOTES.md](NOTES.md#tensors-and-kernels) explains
 the layout and precision limits.
 
+To see the kernels a script launched and what each one computes, run it with
+`python3 -m baretile.viz script.py` and open the `viz.html` it writes.
+[Profiling](NOTES.md#profiling) describes the page.
+
 ## Models
 
 Install NumPy for the model code and pytest for the tests:

@@ -370,7 +370,7 @@ class Runtime:
     back = 64 + ring + 16 * TIMES
     assert back + 4096 <= 1 << 21, "the ring leaves no room in the hugepage to read a tile back"
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
-    self.names = [""] * TIMES  # the names of the last TIMES launches, for profile
+    self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (value, dtype) -> a tensor holding that number, uploaded once for tensor.py's constants
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
     self.log, self.pinned = None, set()
@@ -418,14 +418,14 @@ class Runtime:
     self.send(*self.block([(kernel, args, units, name)]))
 
   def block(self, launches):
-    """Convert [(kernel, args, units, name)] to commands for send, plus (name, worker count) per launch. Load
+    """Convert [(kernel, args, units, name)] to commands for send, plus (name, worker count, kernel) per launch. Load
     the kernels first, since commands contain their L1 addresses. Commands can be replayed until a kernel is
     evicted. If loading requires eviction, send the commands built so far before waiting for space."""
     cmds, sent = [], []
     for kernel, args, units, name in launches:
       if cmds and self.evicts(kernel): self.send(b"".join(cmds), sent); cmds, sent = [], []
       cmd, n = self.command(kernel, args, units)
-      cmds.append(cmd); sent.append((name, n))
+      cmds.append(cmd); sent.append((name, n, kernel))
     return b"".join(cmds), sent
 
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
@@ -437,7 +437,7 @@ class Runtime:
 
   def send(self, cmds, launches):
     """Write commands back to back into the ring, then ring the doorbell. The doorbell is the host's one PCIe write,
-    however many commands there are. launches has (name, workers) for each."""
+    however many commands there are. launches has (name, workers, kernel) for each."""
     size, at, length = len(self.ring), self.wptr % len(self.ring), len(cmds)
     skip = size - at if at + length > size else 0  # commands don't wrap, so mark the tail unused and start over
     assert length + skip <= size, f"{length} bytes of commands don't fit in a ring of {size}"
@@ -447,10 +447,10 @@ class Runtime:
       self.wptr, at = self.wptr + skip, 0
     self.ring[at:at + length] = cmds
     self.wptr += length
-    for name, n in launches:
+    for launch in launches:
       self.launches += 1
-      self.names[self.launches % TIMES] = name
-      self.queued.append((self.launches, n))
+      self.sent[self.launches % TIMES] = launch
+      self.queued.append((self.launches, launch[1]))
     self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
@@ -463,7 +463,7 @@ class Runtime:
     totals = collections.defaultdict(lambda: [0, 0, 0])
     for n in range(since + 1, self.launches + 1):
       go, done, flits = struct.unpack_from("<3I", self.times, n % TIMES * 16)
-      for i, v in enumerate((1, (done - go) % 2**32, 64 * flits)): totals[self.names[n % TIMES]][i] += v
+      for i, v in enumerate((1, (done - go) % 2**32, 64 * flits)): totals[self.sent[n % TIMES][0]][i] += v
     return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()), key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are on each of its workers. some kernels write results there
