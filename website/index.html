@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>baretile</title>
+<meta name="description" content="baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.">
+<link rel="icon" type="image/svg+xml" href="baretile.svg">
+<style>
+  body { background: #d9d9d9; color: #1e1e1e; font: 15px/1.6 ui-monospace, Menlo, Consolas, monospace; max-width: 720px; margin: 0 auto; padding: 16px; }
+  img { display: block; width: 100%; height: auto; }
+  a { color: inherit; text-underline-offset: 3px; }
+  h1 { margin: 0; }
+  h2 { font-size: 1em; margin: 2.5em 0 0.5em; }
+  pre, code { font-family: inherit; }
+  pre { background: #1e1e1e; color: #d9d9d9; padding: 14px 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
+  p code { background: #cbcbcb; padding: 1px 4px; }
+  .k { color: #d9a066; }
+  .n { color: #8fb8c9; }
+  .c { color: #8a8a8a; }
+  footer { margin: 3em 0 1em; }
+</style>
+</head>
+<body>
+<main>
+
+<h1><img src="baretile_banner.svg" alt="baretile"></h1>
+
+<p>baretile is a compiler and runtime for Tenstorrent Blackhole.
+It's written in Python, including the driver that talks to the chip over PCIe.</p>
+
+<p>We want to make these cards run faster while keeping the software small enough for one person to understand and change.
+We write our own firmware for the workers, and the core Python code uses only the standard library.
+The compiler generates Tensix instructions directly.
+There's no dependency on tt-metal, tt-umd or LLK.
+We still use Tenstorrent's board firmware for ARC and Ethernet.</p>
+
+<p>For now, we are developing on the ttsim simulator.
+We haven't run baretile on a card yet, so we don't know exactly how fast it is.</p>
+
+<p><a href="https://github.com/baretile/baretile">Source</a> ·
+<a href="https://github.com/baretile/baretile/blob/main/NOTES.md">Documentation</a></p>
+
+<h2>Using it</h2>
+
+<p>You can write tensor operations in Python:</p>
+
+<pre><code><span class="k">from</span> baretile <span class="k">import</span> pci
+<span class="k">from</span> baretile.chip <span class="k">import</span> Chip
+<span class="k">from</span> baretile.runtime <span class="k">import</span> Runtime
+<span class="k">from</span> baretile.tensor <span class="k">import</span> Tensor
+
+rt = Runtime(Chip(pci.open_device()))
+x = Tensor.of(rt, [[<span class="n">1.0</span>, <span class="n">2.0</span>], [<span class="n">3.0</span>, <span class="n">4.0</span>]])
+w = Tensor.of(rt, [[<span class="n">2.0</span>, <span class="n">0.0</span>], [<span class="n">0.0</span>, <span class="n">3.0</span>]])
+
+print((x @ w).relu().tolist())
+<span class="c"># [[2.0, 6.0], [6.0, 12.0]]</span></code></pre>
+
+<p>Here, the compiler puts the matrix multiply and ReLU in one kernel.
+Calling <code>tolist()</code> runs the computation and copies the answer back to Python.</p>
+
+<p>There are also examples that generate text with GPT-2 and Llama, a small GPT that you can train, and an HTTP server that accepts OpenAI-compatible requests.
+We check the models against NumPy and the training example against PyTorch.</p>
+
+<h2>Getting started</h2>
+
+<p>You don't even need a card.
+You'll need Python 3, clang with a RISC-V target, lld, and a Blackhole build of <a href="https://github.com/tenstorrent/ttsim">ttsim</a>.</p>
+
+<p>Follow the <a href="https://github.com/baretile/baretile#try-it">setup instructions</a>, then run this from the baretile checkout:</p>
+
+<pre><code><span class="k">export</span> TTSIM=/absolute/path/to/ttsim/src/_out/release_bh/libttsim.so
+python3 -m baretile.hello</code></pre>
+
+<p>This runs a Fibonacci program on the simulated workers and reads back their answers.
+Keep <code>TTSIM</code> set for the tensor example too.
+Without <code>TTSIM</code>, baretile tries to open a real card.</p>
+
+</main>
+
+<footer>baretile is free software, licensed under <a href="https://github.com/baretile/baretile/blob/main/LICENSE">Apache-2.0</a>.</footer>
+
+</body>
+</html>
