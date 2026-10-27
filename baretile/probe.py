@@ -1,5 +1,5 @@
 # Measure launch cost, DRAM and NoC latency, bandwidth, Tensix throughput, BRISC topk and PCIe
-# transfers on a card. See NOTES.md, "Bring-up on a p150". Use these measurements to choose
+# transfers on a card. See docs/bring-up.md. Use these measurements to choose
 # buffer depths, request sizes, bank assignments and matmul fidelity.
 # The probes use small kernels built with tensix.py and timed by the tile's wall clock.
 # ttsim can check that they run, but its timings don't predict card performance.

@@ -1,5 +1,5 @@
 # Blackhole addresses, sizes, limits and instruction encodings. Modifier values stay in the
-# compiler beside the instructions that use them. NOTES.md lists the sources.
+# compiler beside the instructions that use them. docs/hardware.md lists the sources.
 
 VENDOR, DEVICE = 0x1E52, 0xB140
 # Writing these (offset, value) pairs to config space, in order, resets the chip. They set the target of the PCIe
@@ -13,8 +13,8 @@ TLB_CONFIG = 0x1FC00000  # BAR0 offset of the TLB config registers, 3 dwords per
 # After those comes a strided multicast word for each of TLBs 0-31. With 0, the multicast skips no tiles of the
 # rectangle (ISA HostToDeviceTLBs.md).
 TLB_STRIDED = 0x1FC009D8
-# The config of a 2 MiB TLB is a 96-bit little-endian value. This maps field -> (first bit, width). NOTES.md has the
-# other fields.
+# The config of a 2 MiB TLB is a 96-bit little-endian value. This maps field -> (first bit, width). docs/hardware.md
+# has the other fields.
 TLB_FIELDS = {"addr": (0, 43), "x_end": (43, 6), "y_end": (49, 6), "x_start": (55, 6), "y_start": (61, 6),
               "mcast": (69, 1), "ordering": (70, 2), "static_vc": (73, 1), "vc_class": (76, 2)}
 STRICT = 1  # ordering: each write is acknowledged before the next one starts
@@ -61,7 +61,7 @@ TAG_FIRMWARE = 28  # firmware bundle version, a byte each for major, minor, patc
 
 # There are 14 Ethernet tiles on NoC0's row y=1, and each drives a 400 GbE link. A QSFP-DD port is two links.
 # Tenstorrent's Ethernet firmware runs on the first core of each tile and keeps the link up. See ISA EthernetTile/,
-# tt-metal's eth_fw_api.h and dev_mem_map.h, and "Ethernet links" in NOTES.
+# tt-metal's eth_fw_api.h and dev_mem_map.h, and "Ethernet links" in docs/hardware.md.
 ETH = [(1, 1), (16, 1), (2, 1), (15, 1), (3, 1), (14, 1), (4, 1), (13, 1), (5, 1), (12, 1), (6, 1), (11, 1), (7, 1), (10, 1)]  # channel n's tile
 TAG_ETH_ENABLED = 35  # telemetry: a bit for each channel that isn't harvested, numbered as in tt-umd and ETH
 ETH_FIRMWARE = 0x70000  # the firmware owns a tile's L1 from here up

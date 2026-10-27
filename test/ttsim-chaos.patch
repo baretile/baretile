@@ -76,7 +76,7 @@ index 37259db..ab61815 100644
  void ttsim_init();
  void ttsim_exit();
  void ttsim_select_chip(uint32_t chip_id);
-+// ttsim-chaos, in tile.cpp. It's off unless TTSIM_CHAOS_* is set (see "ttsim-chaos" in baretile's NOTES.md)
++// ttsim-chaos, in tile.cpp. It's off unless TTSIM_CHAOS_* is set (see "ttsim-chaos" in baretile's docs/testing.md)
 +void chaos_init();
 +void chaos_tick();
 +bool chaos_skip_tensix();
@@ -103,7 +103,7 @@ index 4d19315..8b42125 100644
  
 -static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
 +
-+// ---- ttsim-chaos: timing noise that ttsim leaves out, off unless TTSIM_CHAOS_* is set (see baretile's NOTES.md) ----
++// ---- ttsim-chaos: timing noise that ttsim leaves out, off unless TTSIM_CHAOS_* is set (see baretile's docs/testing.md) ----
 +// With TTSIM_CHAOS_NOC=lo,hi, a Tensix tile's NoC request runs a random lo to hi clocks after it's issued. Until then a
 +// read or an acknowledged write counts in NIU_MST_REQS_OUTSTANDING_ID, and a write counts in
 +// NIU_MST_WRITE_REQS_OUTGOING_ID. When it runs, the source is read, the data lands, and acks and read responses are
