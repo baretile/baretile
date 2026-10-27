@@ -13,18 +13,23 @@ tt-metal, tt-umd or LLK.
 
 ## Try it
 
-You'll need Python 3.12 or later, clang with a RISC-V target, lld, and a Blackhole
-build of [ttsim](https://github.com/tenstorrent/ttsim). In a ttsim checkout, build
-the library:
+You'll need Python 3.12 or later, clang with a RISC-V target, lld, and the
+Blackhole library from [ttsim](https://github.com/tenstorrent/ttsim). ttsim's
+[releases](https://github.com/tenstorrent/ttsim/releases) include it as
+`libttsim_bh.so`. You can also build it in a ttsim checkout:
 
 ```sh
 ./make.py src/_out/release_bh/libttsim.so
 ```
 
-Then, from the baretile checkout:
+We test with ttsim v1.11.5, built from source.
+
+Clone baretile and run its first two commands:
 
 ```sh
-export TTSIM=/absolute/path/to/ttsim/src/_out/release_bh/libttsim.so
+git clone https://github.com/baretile/baretile
+cd baretile
+export TTSIM=/absolute/path/to/libttsim.so
 python3 -m baretile.chip
 python3 -m baretile.hello
 ```
@@ -37,11 +42,16 @@ With 120 Tensix tiles, `baretile.hello` prints:
 
 Keep `TTSIM` set for the examples below. Without it, baretile tries to open a
 Blackhole on the PCI bus. That needs root and takes the card away from its kernel
-driver. See [card bring-up](NOTES.md#bring-up-on-a-p150) before running on a card.
+driver. See [bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
+before running on a card.
+
+`pip install baretile` installs the `baretile` package from PyPI. That's enough
+for the commands above and the tensor example below. The ramps, models and
+tests are in the repository.
 
 ## Tensors
 
-Run this in Python from the checkout:
+Run this in Python:
 
 ```python
 from baretile import pci
@@ -60,17 +70,33 @@ The matmul and ReLU run when you call `tolist()`. Until then, they're an
 expression waiting to be compiled. They run in one kernel here, with the matmul's
 result kept in local memory for the ReLU.
 
-Run `python3 ramp.py` for more examples, from tensor operations and gradients to
-compiling a C kernel and reading DRAM. [ramp.py](ramp.py) explains each example
-and checks the results with assertions.
-
 Tensors support broadcasting, reductions, views and autograd. Storage formats are
-bf16, fp32, int32, bfp8 and bfp4. [NOTES.md](NOTES.md#tensors-and-kernels) explains
-the layout and precision limits.
+bf16, fp32, int32, bfp8 and bfp4. The
+[compiler docs](https://github.com/baretile/baretile/blob/main/docs/compiler.md)
+explain the layout and precision limits.
 
 To see the kernels a script launched and what each one computes, run it with
 `python3 -m baretile.viz script.py` and open the `viz.html` it writes.
-[Profiling](NOTES.md#profiling) describes the page.
+
+## Learn baretile
+
+The [ramps](https://github.com/baretile/baretile/tree/main/ramps) teach baretile
+from the top down. Each one is a script that explains its steps and checks
+their results:
+
+```sh
+python3 ramps/1_tensors.py
+python3 ramps/2_runtime.py
+python3 ramps/3_tensix.py
+```
+
+The first covers tensor operations, fusion, formats, gradients and `jit`. The
+second runs C kernels on the workers and moves data over the NoC. The third
+programs the unpack, math and pack threads of a Tensix tile by hand.
+
+The [documentation](https://github.com/baretile/baretile/blob/main/docs/README.md)
+explains the runtime, the compiler, the models and the hardware, and includes a
+map of the code.
 
 ## Models
 
@@ -98,7 +124,9 @@ different tokens, then continues with NumPy's choice.
 
 The loader also handles Llama, Mistral, Qwen2, Qwen3, Mixtral, gpt-oss and the
 Qwen3.5/3.6 text models. Most tests use small models. Full checkpoints need
-separate checks. [Models and tests](NOTES.md#models-and-tests) has the commands.
+separate checks, which
+[testing](https://github.com/baretile/baretile/blob/main/docs/testing.md#optional-checks)
+lists.
 
 To serve a model through an OpenAI-compatible HTTP API:
 
@@ -108,24 +136,18 @@ python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000
 
 This downloads the model if you don't already have it. You can also pass a local
 folder. Requests decode together, and the server can reuse a cached prompt when
-you send the next turn of a conversation. See [Serving](NOTES.md#serving) for an
-example request.
+you send the next turn of a conversation.
+[Serving](https://github.com/baretile/baretile/blob/main/docs/models.md#serving)
+has an example request.
 
-## Reading the code
+tinygrad scripts run on baretile through
+[adapters/tinygrad_baretile.py](https://github.com/baretile/baretile/blob/main/adapters/tinygrad_baretile.py),
+and PyTorch runs through tinygrad's torch frontend.
 
-Start with the examples in [ramp.py](ramp.py). [hello.py](baretile/hello.py) is a
-short example of compiling a kernel, launching it and reading the result.
-[pci.py](baretile/pci.py) opens the device and [chip.py](baretile/chip.py) reads and
-writes its memory. [runtime.py](baretile/runtime.py) loads programs, allocates
-memory and queues work.
+## Contributing
 
-[tensix.py](baretile/tensix.py) emits instructions.
-[kernels.py](baretile/kernels.py) uses those instructions to build kernels, and
-[tensor.py](baretile/tensor.py) compiles tensor expressions into launches.
-Addresses and instruction fields live in [bh.py](baretile/bh.py).
+[CONTRIBUTING.md](https://github.com/baretile/baretile/blob/main/CONTRIBUTING.md)
+explains how to run the checks, what the code should look like and how to
+report a bug.
 
-[models/](models/) contains the model code and HTTP server.
-[adapters/](adapters/) connects tinygrad to baretile. PyTorch uses tinygrad's torch
-frontend. There are more details in [NOTES.md](NOTES.md).
-
-Licensed under [Apache-2.0](LICENSE).
+Licensed under [Apache-2.0](https://github.com/baretile/baretile/blob/main/LICENSE).
