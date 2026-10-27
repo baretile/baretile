@@ -1,10 +1,12 @@
-# Run these examples to see how tensor operations compile and how kernels access the chip's memory.
-#   TTSIM=/path/to/libttsim.so python3 ramp.py
-# See README.md for setup and NOTES.md for the implementation details.
-import array
-from baretile import bh, pci, tensor
+# Use tensors on the chip: operations, fusion, shapes, formats, views, weight storage, gradients and jit. Ramp 2 goes
+# below the tensors to the kernels that run them.
+#   TTSIM=/path/to/libttsim.so python3 ramps/1_tensors.py
+# See README.md for setup and docs/README.md for the other ramps and the documentation.
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from baretile import pci, tensor
 from baretile.chip import Chip
-from baretile.runtime import Runtime, compile_kernel
+from baretile.runtime import Runtime
 from baretile.tensor import Tensor, jit
 
 # 1. Open the device and create a runtime. A Tensix tile contains RISC-V cores and local memory.
@@ -25,7 +27,7 @@ print("2. (x @ x).relu() ran as one kernel")
 
 # 3. Softmax combines subtraction, exponentiation and reductions in one kernel. realize() queues it without
 # reading the result. The expression is part of its key in tensor.kernels; 0 refers to the input x.
-# To see the expression as a graph, run python3 -m baretile.viz ramp.py and open viz.html.
+# To see the expression as a graph, run python3 -m baretile.viz ramps/1_tensors.py and open viz.html.
 since = rt.launches
 x.softmax().realize()
 e = list(tensor.kernels)[-1][0]  # expression from the last kernel added to the cache
@@ -107,25 +109,5 @@ step(xs, ys)
 assert abs(w.tolist()[0][0] - 3) < 0.01 and abs(b.tolist()[0][0] - 1) < 0.01 and loss.tolist()[0][0] < 1e-4
 print(f"9. after 81 steps: w = {w.tolist()[0][0]:.4f}, b = {b.tolist()[0][0]:.4f}; {rt.launches - since} launches for the last step and readbacks")
 
-# 10. compile_kernel uses clang to build programs for a worker's RISC-V cores: BRISC and three TRISCs.
-# You can omit programs for unused cores. This kernel uses only BRISC.
-# Each worker receives [first unit, unit count, *args]. With one unit per worker, a[0] is the worker's index.
-# Passing (100, 0) puts 100 in a[2] and reserves a[3] for the answer. Wait for completion before reading it.
-SQUARE = "void kmain(volatile unsigned *a) { a[3] = a[0] * a[0] + a[2]; }"
-rt.launch(compile_kernel(SQUARE), (100, 0), name="square")
-rt.wait()
-assert [chip.read32(cx, cy, rt.args() + 12) for cx, cy in rt.cores] == [i * i + 100 for i in range(len(rt.cores))]
-print(f"10. {len(rt.cores)} workers each computed their index squared plus 100")
-
-# 11. Read tensor storage directly. In the default layout, tile i is in DRAM bank i % 8, at offset i // 8 tiles
-# from the tensor's base address. Each 32 x 32 tile holds four 16 x 16 faces: top left, top right, bottom left,
-# bottom right. Values within each face are stored row by row. An int32 tile occupies 4096 bytes.
-m = Tensor.of(rt, [[r * 64 + c for c in range(64)] for r in range(32)], "int32")
-for i in range(2):  # tile i holds columns 32i to 32i + 31
-  tile = array.array("i", chip.read(*bh.DRAM[i], m.addr, 4096))
-  assert all(tile[(r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16] == r * 64 + 32 * i + c for r in range(32) for c in range(32))
-print(f"11. read both tiles of m from banks 0 and 1 at {m.addr:#x}")
-
-# See models/llama.py for a model built with Tensor, or models/serve.py for the HTTP server.
-# NOTES.md explains the runtime and compiler and includes the hardware reference.
+# See ramps/2_runtime.py for the kernels under these tensors, and models/gpt2.py for a model built with Tensor.
 print(f"the ramp ran {rt.launches} launches")

@@ -760,12 +760,13 @@ assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.a
 print("ok")
 """
 
-@pytest.mark.skipif("TTSIM" not in os.environ, reason="ramp.py opens the device itself, and a card can't be open in two processes")
-def test_ramp():
-  # Run separately because ramp.py opens its own device and ttsim allows one instance per process.
+@pytest.mark.skipif("TTSIM" not in os.environ, reason="a ramp opens the device itself, and a card can't be open in two processes")
+@pytest.mark.parametrize("ramp", sorted(p.name for p in (pathlib.Path(__file__).parent.parent / "ramps").glob("*.py")))
+def test_ramp(ramp):
+  # Run separately because each ramp opens its own device and ttsim allows one instance per process.
   import subprocess
   root = pathlib.Path(__file__).parent.parent
-  run = subprocess.run([sys.executable, str(root / "ramp.py")], capture_output=True, text=True, timeout=600, cwd=root)
+  run = subprocess.run([sys.executable, str(root / "ramps" / ramp)], capture_output=True, text=True, timeout=600, cwd=root)
   assert run.returncode == 0 and run.stdout.strip().splitlines()[-1].startswith("the ramp ran"), run.stdout + run.stderr
 
 @pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to libttsim.so from ttsim's two-chip build (bh_x2)")
