@@ -1,5 +1,7 @@
 # baretile
 
+[![test](https://github.com/baretile/baretile/actions/workflows/test.yml/badge.svg)](https://github.com/baretile/baretile/actions/workflows/test.yml)
+
 baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.
 You write tensor operations, and it compiles them into Tensix instructions. It
 also handles the PCIe access needed to load and run those programs on the chip.
