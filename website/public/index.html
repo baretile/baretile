@@ -7,10 +7,11 @@
 <meta name="description" content="baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.">
 <link rel="icon" type="image/svg+xml" href="baretile.svg">
 <style>
+  @font-face { font-family: Lilex; src: url("fonts/lilex-bold.woff2") format("woff2"); font-style: normal; font-weight: 700; font-display: swap; }
   body { background: #d9d9d9; color: #1e1e1e; font: 15px/1.6 ui-monospace, Menlo, Consolas, monospace; max-width: 720px; margin: 0 auto; padding: 16px; }
-  img { display: block; width: 100%; height: auto; }
   a { color: inherit; text-underline-offset: 3px; }
-  h1 { margin: 0; }
+  h1, h2 { font-family: Lilex, ui-monospace, Menlo, Consolas, monospace; font-weight: 700; }
+  h1 { font-size: clamp(48px, 10vw, 80px); line-height: 1.1; margin: 24px 0; }
   h2 { font-size: 1em; margin: 2.5em 0 0.5em; }
   pre, code { font-family: inherit; }
   pre { background: #1e1e1e; color: #d9d9d9; padding: 14px 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
@@ -24,7 +25,7 @@
 <body>
 <main>
 
-<h1><img src="baretile_banner.svg" alt="baretile"></h1>
+<h1>baretile</h1>
 
 <p>baretile is a compiler and runtime for Tenstorrent Blackhole.
 It's written in Python, including the driver that talks to the chip over PCIe.</p>
