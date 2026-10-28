@@ -5,22 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>baretile</title>
 <meta name="description" content="baretile is a compiler and runtime for Tenstorrent Blackhole, written in Python.">
-<link rel="icon" type="image/svg+xml" href="baretile.svg">
-<style>
-  @font-face { font-family: Lilex; src: url("fonts/lilex-bold.woff2") format("woff2"); font-style: normal; font-weight: 700; font-display: swap; }
-  body { background: #d9d9d9; color: #1e1e1e; font: 15px/1.6 ui-monospace, Menlo, Consolas, monospace; max-width: 720px; margin: 0 auto; padding: 16px; }
-  a { color: inherit; text-underline-offset: 3px; }
-  h1, h2 { font-family: Lilex, ui-monospace, Menlo, Consolas, monospace; font-weight: 700; }
-  h1 { font-size: clamp(48px, 10vw, 80px); line-height: 1.1; margin: 24px 0; }
-  h2 { font-size: 1em; margin: 2.5em 0 0.5em; }
-  pre, code { font-family: inherit; }
-  pre { background: #1e1e1e; color: #d9d9d9; padding: 14px 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
-  p code { background: #cbcbcb; padding: 1px 4px; }
-  .k { color: #d9a066; }
-  .n { color: #8fb8c9; }
-  .c { color: #8a8a8a; }
-  footer { margin: 3em 0 1em; }
-</style>
+<link rel="icon" type="image/svg+xml" href="/baretile.svg">
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <main>
@@ -38,15 +24,16 @@ We use Tenstorrent's board firmware for ARC and Ethernet, with no dependency on 
 <p>We develop on Tenstorrent's ttsim simulator.
 We haven't tested baretile on a card yet. Simulator timings don't predict card performance.</p>
 
-<p><a href="https://github.com/baretile/baretile">Source</a> ·
-<a href="https://github.com/baretile/baretile/blob/main/docs/README.md">Documentation</a> ·
+<p><a href="https://github.com/baretile/baretile">Source</a> |
+<a href="https://github.com/baretile/baretile/blob/main/docs/README.md">Documentation</a> |
+<a href="/blog/">Blog</a> |
 <a href="https://pypi.org/project/baretile/">PyPI</a></p>
 
 <h2>Using it</h2>
 
 <p>After <a href="#getting-started">setting up ttsim</a>, run this in Python from the checkout:</p>
 
-<pre><code><span class="k">from</span> baretile <span class="k">import</span> pci
+<pre tabindex="0" aria-label="Python example"><code><span class="k">from</span> baretile <span class="k">import</span> pci
 <span class="k">from</span> baretile.chip <span class="k">import</span> Chip
 <span class="k">from</span> baretile.runtime <span class="k">import</span> Runtime
 <span class="k">from</span> baretile.tensor <span class="k">import</span> Tensor
@@ -72,7 +59,7 @@ ttsim's <a href="https://github.com/tenstorrent/ttsim/releases">releases</a> inc
 
 <p>Then clone baretile and run this from the checkout:</p>
 
-<pre><code>git clone https://github.com/baretile/baretile
+<pre tabindex="0" aria-label="Shell commands"><code>git clone https://github.com/baretile/baretile
 <span class="k">cd</span> baretile
 <span class="k">export</span> TTSIM=/absolute/path/to/libttsim.so
 python3 -m baretile.hello</code></pre>
@@ -88,11 +75,16 @@ Without <code>TTSIM</code>, baretile tries to open a real card.</p>
 <p>The <a href="https://github.com/baretile/baretile/tree/main/ramps">ramps</a> teach baretile from the top down.
 Each one is a script that explains its steps and checks their results:</p>
 
-<pre><code>python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span>
+<pre tabindex="0" aria-label="Tutorial commands"><code>python3 ramps/1_tensors.py   <span class="c"># tensor operations, fusion, formats, gradients and jit</span>
 python3 ramps/2_runtime.py   <span class="c"># C kernels on the workers, DRAM and the NoC</span>
 python3 ramps/3_tensix.py    <span class="c"># unpack, math and pack programs written by hand</span></code></pre>
 
 <p>The <a href="https://github.com/baretile/baretile/blob/main/docs/README.md">documentation</a> explains the runtime, the compiler, the models and the hardware.</p>
+
+<h2>From the blog</h2>
+
+<p><a href="/blog/programming-a-tensix-tile-from-python/">Programming a Tensix tile from Python</a><br>
+Follow an addition through local memory, instruction encoding, and three cooperating programs. You can run it on the simulator.</p>
 
 </main>
 
