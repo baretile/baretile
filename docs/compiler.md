@@ -191,6 +191,15 @@ exponentials and weighted values. Values are read on the second sweep. Keys
 stay in L1 between sweeps when they fit. Scores stay local instead of being
 written as a full attention matrix in DRAM.
 
+Each unit handles at most 64 query rows, keeping their maxima in fp32 Dst.
+The SFPU subtracts those maxima after the full scores have accumulated. This
+avoids overflow from rounding a large maximum or subtracting it too early.
+Longer prompts use more units and reread K/V for each group of 64 query rows;
+the cost estimator counts those reads. This trades more prefill traffic for
+stable scores. Heads whose frames do not fit in L1 raise `ValueError` before
+allocation or launch. A supported frame with no space to retain keys streams
+them again for the second sweep.
+
 Decoding often has too few heads to occupy the workers. The implementation
 splits the keys into up to eight parts and combines their maxima, sums and
 weighted outputs afterwards. This adds launches. The Llama model code uses

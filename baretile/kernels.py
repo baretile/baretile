@@ -5,12 +5,13 @@
 import collections
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
-from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CHUNKS, COMBINE, DEPTH, DST_FREE, DST_HALF, FILLED, FLAGS_B, FOLDS,
-                            FP32_OPS, FRAMES, INT32_OPS, ITEMSIZE, MATH_END, MAX_OPS, OUTS, PAIR, REPORT, ROWS, SEM_DST, SEM_L1, SEM_PACKED, SFPU,
-                            SFPU_START, TAKE_L1, UNPACKABLE, WALK, ZERO_SLOT, Loop, accumulating, across_rows, aim, allocate, bfp_b, brisc_program,
-                            chunk_tiles, config, elementwise, ext, fill, haloize, ins, kernel_config, mask_columns, mask_rows_at, math_begin,
-                            math_program, matmul, pack, pack_program, reconfigure, reduce_finish, reduce_step, reload, repack, runs, setadc, sfpu,
-                            slot_base, step_unpack, table, take, tile_bytes, tile_of, to_bf16, tt, unpack, unpack_program, walk)
+from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_OFF, CC_ON, CHUNKS, COMBINE, DEPTH, DST_FREE, DST_HALF, FILLED,
+                            FLAGS_B, FOLDS, FP32_OPS, FRAMES, INT32_OPS, ITEMSIZE, MATH_END, MAX_OPS, ONE, OUTS, PAIR, REPORT, ROWS, SEM_L1,
+                            SEM_PACKED, SFPU, SFPU_START, UNPACKABLE, WALK, ZERO_SLOT, Loop, accumulating, across_rows, aim, allocate, bfp_b,
+                            brisc_program, chunk_tiles, config, elementwise, ext, field, fill, haloize, ins, kernel_config, mad, mask_columns,
+                            mask_rows_at, math_program, matmul, pack, pack_program, reconfigure, reduce_finish, reduce_step, reload, repack, runs,
+                            setadc, sfpu, math_begin, sfp_bits, sfp_load, sfp_store, slot_base, step_unpack, table, take, tile_bytes, tile_of, tt,
+                            unpack, unpack_program, walk)
 
 def grid_parts(rt, w, kt, grid, base, more=0):
   """Choose L1 buffers for a grid matmul (mc) producing rt x w tiles with kt tiles along K. Slots below base
@@ -634,20 +635,24 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
 def attention_l1(ht, rows, wt, parts):
   """Lay out attention_kernel's L1 for a unit.
 
-  - R is the unit's tile rows of queries, at most 8.
+  - R is the unit's tile rows of queries, at most 2 so row maxima stay in fp32 Dst.
   - fs is the slots in a frame: the masks, then the keys and values if they're bf16.
   - T is the output tiles for each row: p v, the sums, and with parts the largest scores.
-  - Slot 1 holds a tile of ones and slot 2 a tile of -1e9. The two frames come next, then the slots of each row's p,
-    its largest score and its queries. used is the first free slot after them.
+  - Slot 1 holds a tile of ones and slot 2 a tile of -inf. The two frames come next, then each row's p and
+    its queries. used is the first free slot after them.
   - From the top of L1 down: the output tiles at oacc, which are each row's p v and then its sums, in fp32. Then the
     unit's places, and at ranges the key ranges of two units. A key range is the first and last key tile, the first
     and end of the unmasked ones, and whether the part has none."""
-  R = min(8, -(-rows // 32))
+  if ht < 2 or rows < 1 or parts < 1: raise ValueError("attention needs heads of at least 64 columns, positive rows and positive parts")
+  R = min(2, -(-rows // 32))
   fs, T = R + (0 if wt else 2 * ht), ht + 1 + (parts > 1)
   p_slot = 3 + 2 * fs
   oacc = bh.L1_SIZE - R * T * tile_bytes("fp32")
   places = oacc - R * tile_bytes("int32")
-  return R, fs, T, (p_slot, p_slot + R, p_slot + 2 * R), oacc, places, p_slot + 2 * R + R * ht, places - 64
+  used, ranges = p_slot + R + R * ht, places - 64
+  if used > UNPACKABLE or ranges < B8 + 4 * ht * tile_bytes(wt or "bf16") or wt and 2 * ht > B8_SLOTS:
+    raise ValueError(f"attention head width {32 * ht} with {rows} query rows does not fit in L1")
+  return R, fs, T, (p_slot, p_slot + R), oacc, places, used, ranges
 
 def attention_store(ht, rows, wt, parts):
   """Reserve L1 space to retain keys between the two attention sweeps. Return the storage location and the
@@ -670,31 +675,34 @@ def attention_parts(ht, rows, wt, kt, units, workers):
   Keep units with more than two tile rows of queries together. For one or two tile rows, use up to 8 parts
   with at least 8 key tiles per part, limited by the available workers. Combining parts costs additional
   launches. If the keys still exceed attention_store's capacity, increase the number of parts, up to 8."""
-  if -(-rows // 32) > 2: return 1
   room = lambda P: attention_store(ht, rows, wt, P)[1]
+  single = room(1)
+  if -(-rows // 32) > 2 or not single: return 1  # no retained keys: stream instead of dividing by zero
+  try: split_room = room(2)
+  except ValueError: return 1  # the extra maximum output may not fit even though an unsplit unit does
   P = max(1, min(8, kt // 8, workers // units))
-  return max(P, min(8, -(-kt // room(2)))) if -(-kt // P) > room(P) else P
+  capacity = single if P == 1 else split_room
+  return max(P, min(8, -(-kt // split_room))) if capacity and split_room and -(-kt // P) > capacity else P
 
 def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=False):
   """Compute weighted sums and normalizers for softmax(q k^T + mask) v, keeping scores on the chip.
 
   q is (E, rows, 32 ht). k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV cache, and each of
   their matrices serves rep heads of q. places is (E or 1, rows, 1) int32 and holds the last key that each row sees.
-  With a window, the first key it sees is window - 1 before that. The mask hides all other keys with -1e9.
+  With a window, the first key it sees is window - 1 before that. The mask hides all other keys with -inf.
 
   The kernel's arguments:
   - a[0] and a[1]: the first unit and the number of units.
   - a[2] to a[21]: the DRAM address, tile strides for batch and row, and tile offset of the result, q, k, v and places.
   - a[22] and a[23]: kt, the number of key tiles, and the rows of q.
 
-  A unit is up to 8 tile rows of a head's queries, and the rows share the key and value tiles they read. BRISC reads
+  A unit is up to 2 tile rows of a head's queries, and the rows share the key and value tiles they read. BRISC reads
   the places of its rows first. From them it works out which key tiles the rows reach, and builds mask tiles for the
   key tiles that some row sees part of. The kernel then sweeps those key tiles twice, a frame at a time. A sweep makes
   each tile of scores in Dst, starting from the mask or 0 and adding the queries times the key tiles, which are read
   transposed.
-  - The first sweep folds the scores into each row's largest so far, then folds across the tile. Units of one or two
-    tile rows keep the largest in Dst. Bigger ones keep it in L1 as bf16 and bring it back into Dst for each tile.
-  - The second sweep starts from the mask minus that largest, so exp gives p. It packs p into L1, then multiplies it
+  - The first sweep folds the scores into each row's largest so far, then folds across the tile. Maxima stay in fp32 Dst.
+  - The second sweep computes scores first and subtracts the maxima with the SFPU, so exp gives p. It packs p into L1, then multiplies it
     by the values and by a tile of ones, which gives each row's sum of p. The packer adds each product onto its output
     tile in L1, in fp32.
 
@@ -705,24 +713,22 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   parts splits each unit's key tiles between that many workers, for a decode step's few units over a long cache. The
   result is then (E parts, rows, 32 ht + 33): each part's p v and sums, then a tile of its rows' largest scores, for
   the caller to combine. A part with no key tiles takes the unit's first key tile and hides all its keys with a mask
-  tile of -1e9. The largest is held at -1e4 or more, so a row that sees no key in a part gets p of 0 and a weight of
-  0. The largest is also rounded to bf16 in Dst, so p is made against the same value that the caller weighs it by.
+  tile of -inf. For a row with no visible keys, subtracting its -inf maximum instead produces -inf, so p is zero.
+  The caller receives maxima in fp32, without rounding them through bf16.
 
   With keep, retain as many initial key rows as attention_store can hold between sweeps, so those rows
   are read from DRAM once per unit."""
   assert ht >= 2, "a head needs at least 64 columns"
   ra = -(-rows // 32)
-  R, fs, T, (p_slot, m_slot, q_row), oacc, places, used, ranges = attention_l1(ht, rows, wt, parts)
+  R, fs, T, (p_slot, q_row), oacc, places, _, ranges = attention_l1(ht, rows, wt, parts)
   per = -(-ra // R)  # units per head
-  ones, none, fr0 = 1, 2, 3  # tiles of ones and of -1e9, made by the SFPU once a launch, then the frames
-  if not (parts == 1 or R <= 2): raise ValueError("splitting attention keys requires units of at most two tile rows")
+  ones, none, fr0 = 1, 2, 3  # tiles of ones and of -inf, made by the SFPU once a launch, then the frames
   # The slot of frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j. A block
   # float's are in the frame's region at B8. into() is where BRISC puts a tile: getb's region and slot.
   mask = lambda r: f"{fr0} + fr * {fs} + {r}"
   key = lambda m: f"{m}" if wt else f"{fr0} + fr * {fs} + {R} + {m}"
   val = lambda j: f"{ht} + {j}" if wt else f"{fr0} + fr * {fs} + {R + ht} + {j}"
   into = lambda z: f"fr * {2 * ht} + {z}" if wt else z
-  if not (ranges >= B8 + 2 * 2 * ht * tile_bytes(wt or "bf16") and used <= UNPACKABLE): raise ValueError("a unit's tiles don't fit in L1")
   # keep: a unit's first key rows stay in L1, the rows n = kt - k0 below room. A block float's row n is in region
   # n / rows_a, from slot n % rows_a * ht on. A bf16 row n starts at slot store + n * ht.
   if keep:
@@ -731,8 +737,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   kept = f"(kt - k0 < {room})" if keep else "0"  # the key row is in the store
   cfg = kernel_config() | config(Pack_L1_Acc=0)
   first, onto = accumulating(oacc, False), accumulating(oacc, True)  # pack the output tiles in fp32, then add onto them
-  slots = allocate({"mmT", "mm", "max2", "exp", "one"} | ({"none", "floor", "ftob"} if parts > 1 else set()))
-  held = R <= 2  # each row's largest stays in Dst (ACCS's two accumulators), else in L1 between key tiles
+  slots = allocate({"mmT", "mm", "max2", "exp", "one"} | ({"none"} if parts > 1 else set()))
   acc, group = ACCS[0]  # row r's largest is at acc + 64 r, a later tile's scores 128 rows on. A sweep takes them
   each = lambda body: f"for (unsigned r = 0; r < nr; r++) {{ {body} }}"
   rng = f"(volatile unsigned *){ranges:#x} + (u & 1) * 8"
@@ -789,45 +794,36 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   # row r's queries and a tile row of keys, in pairs: a key tile into SrcA, a query tile into SrcB
   walk_k = f"{on_k} {tt([setadc(bh.UNPACK1, f'{q_row} + r * {ht}'), setadc(bh.UNPACK0, first_key)])} {tt([Loop(ht, PAIR)])} {off_k}"
   the_mask = f"empty ? {none} : {partial} ? {mask('r')} : {ZERO_SLOT}"
-  largest = f"{m_slot} + r"
-  drain_upto = f"for (; drained < upto; drained++) {{ {tt(TAKE_L1)} }}"  # until the last tile's largests are packed
   unpacker = units(f"fetched(); {read} {tt(REPORT)}",
-                   "fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}" if held else
-                   "fetched(); unsigned upto = posted; " +
-                   each(f"if (kt > k0) {{ {drain_upto} {tt(unpack(largest, ZERO_SLOT))} }} "
-                        f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + f" {tt(REPORT)}",
-                   # between the sweeps: each row's largest, across its tile
-                   "posted += nr;" if held else "drain(); " + each(f"{tt(unpack(largest, ZERO_SLOT))} posted++;"),
-                   "fetched(); drain(); " + each(f"{tt(unpack(the_mask, largest))} {walk_k} posted++;") + " drain(); "  # until each p is packed
+                   "fetched(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k}") + f" {tt(REPORT)}", "",
+                   "fetched(); drain(); " + each(f"{tt(unpack(the_mask, ZERO_SLOT))} {walk_k} posted++;") + " drain(); "
                    f"{on_v} " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(unpack(val('j'), f'{p_slot} + r'))} }}") + f" {off_v} " +
-                   each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")  # then the products for the sums, the ones in bf16
+                   each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")
   told = "fetched(); " + read + " needed += 2 * (k1 - k0 + 1);"  # skip the unit's frames, since math and pack needn't wait for them
   scores = lambda op, row: (f"{tt(aim(row) + elementwise(op, slots) + walk(True))} "
                             f"for (unsigned m = 0; m < {ht}; m++) {{ {tt(matmul(slots, phases, True))} }} {tt(walk(False))}")
-  fold_h = tt(SFPU_START + aim("h") + runs(slots, "max2", 32))  # fold the tile 128 rows past h into it
   begin = tt(math_begin(False))
   product = f"{tt(math_begin(True))} {tt(matmul(slots, phases))} {tt(MATH_END)} h ^= {DST_HALF};"  # p times a value tile, or times the ones
-  free = tt([DST_FREE])  # wait until a Dst half is free for a result
+  free = tt([DST_FREE])
   take_acc, fold_acc = tt(take(group)), tt(SFPU_START + aim(f"{acc} + 64 * r") + runs(slots, "max2", 32))
+  # Subtract only after the full score is accumulated, using the original fp32 maximum in Dst. An all-masked
+  # row has maximum -inf: send it to exp as -inf rather than the NaN from -inf - -inf.
+  subtract = tt(SFPU_START + [Loop(32, [sfp_load(), field(sfp_load(1), f"{acc} + 64 * r - h"), mad(0, 1, ONE, 0, neg=1),
+                                     *sfp_bits(2, 0xFF800000), ins("SFPXOR", vd=2, vc=1), CC_ON, ins("SFPSETCC", vc=2, mod1=6),
+                                     *sfp_bits(0, 0xFF800000), CC_OFF, sfp_store(0)])])
   math = units(told,
                f"if (kt == k0) {{ {take_acc} }} " + each(f"if (kt == k0) {{ {scores('add', f'{acc} + 64 * r')} }} "
-                                                        f"else {{ {scores('add', f'{acc + 128} + 64 * r')} {fold_acc} }}") if held else
-               each(f"{begin} if (kt > k0) {{ {tt(elementwise('add', slots))} {scores('add', 'h + 128')} {fold_h} }} "
-                    f"else {{ {scores('add', 'h')} }} {tt(MATH_END)} h ^= {DST_HALF};"),
-               each(f"{free} {tt(aim(f'{acc} + 64 * r') + across_rows('max2') + sfpu(['floor', 'ftob'] * (parts > 1), slots) + MATH_END)}" +
-                    (f" {free} {tt([ins('SEMPOST', sem_sel=SEM_DST)])}" if parts > 1 else "")) if held else  # the largest is packed twice
-               each(f"{begin} {tt(elementwise('add', slots) + across_rows('max2') + MATH_END)} h ^= {DST_HALF};"),
-               each(f"{begin} {scores('sub', 'h')} {tt(sfpu(['exp'], slots))} {tt(MATH_END)} h ^= {DST_HALF};") + " " +
+                                                        f"else {{ {scores('add', f'{acc + 128} + 64 * r')} {fold_acc} }}"),
+               each((free if parts > 1 else "") + tt(aim(f"{acc} + 64 * r") + across_rows("max2") + (MATH_END if parts > 1 else []))),
+               each(f"{begin} {scores('add', 'h')} {subtract} {tt(sfpu(['exp'], slots))} {tt(MATH_END)} h ^= {DST_HALF};") + " " +
                each(f"for (unsigned j = 0; j < {ht}; j++) {{ {product} }}") + " " + each(product),
-               "")
+               tt([ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_SFPU), ins("SEMPOST", sem_sel=group)]) if parts == 1 else "")
   out = lambda j: f"r * {T} + {j}"  # row r's output tile j. Its sums are at j = ht and its largest at ht + 1
-  largest_out = (f" while (peek(SENT) < outputs) relay(); {tt(repack(cfg, first) + pack(f'{acc} + 64 * r', out(ht + 1)) + repack(first, cfg))}"
-                 if parts > 1 else "")  # write each part's maximum alongside p v
+  largest_out = (each("while (peek(SENT) < outputs) relay(); " +
+                      tt(repack(cfg, first) + pack(f"{acc} + 64 * r", out(ht + 1)) + repack(first, cfg))) + tt([ins("SEMPOST", sem_sel=group)])
+                 if parts > 1 else "")
   packed = lambda slot: tt(pack("h", slot, SEM_L1)) + f" h ^= {DST_HALF};"
-  packer = units(f"needed++; while (peek(FETCHED) < needed) relay(); {read} needed += 2 * (k1 - k0 + 1);",
-                 "" if held else each(packed(largest)),
-                 (each(tt(pack(f"{acc} + 64 * r", largest, SEM_L1)) + largest_out) + f" {tt([ins('SEMPOST', sem_sel=group)])}" if held else
-                  each(packed(largest))),
+  packer = units(f"needed++; while (peek(FETCHED) < needed) relay(); {read} needed += 2 * (k1 - k0 + 1);", "", largest_out,
                  each(packed(f"{p_slot} + r")) +
                  f" if (kt == k0) {{ while (peek(SENT) < outputs) relay(); {tt(repack(cfg, first))} }} else {{ {tt(repack(cfg, onto))} }} " +
                  each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(pack('h', out('j')))} h ^= {DST_HALF}; }}") + " " +
@@ -836,13 +832,13 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
                  each(f"for (unsigned j = 0; j < {T}; j++) {{ while (peek(SENT) + 4 <= outputs) relay(); "  # write all output tiles
                       f"SYNC[RING + outputs % 4 * 2] = {out('j')}; SYNC[RING + outputs % 4 * 2 + 1] = {tile_of(2, ob, 'i0 + r', 'j')}; outputs++; "
                       f"{tt([ins('SEMPOST', sem_sel=SEM_PACKED)])} }}"))
-  # The SFPU makes two tiles once a launch: ones for the sums, and -1e9 for the mask of an empty part.
+  # The SFPU makes two tiles once a launch: ones for the sums, and -inf for the mask of an empty part.
   made = [("one", ones)] + [("none", none)] * (parts > 1)
   math = "".join(f"{tt(math_begin(False) + sfpu([p], slots) + MATH_END)} h ^= {DST_HALF};" for p, _ in made) + math
   packer = "".join(f"{tt(pack('h', z, SEM_L1))} h ^= {DST_HALF};" for _, z in made) + packer
-  hide = to_bf16(-1e9)
+  hide = 0xFF80  # bf16 -inf
   decls = "static unsigned expect;" + (table("store", store) if keep and wt else "") + f"""
-// The mask of tile row r for key tile kt, from its places: -1e9 where a row doesn't see the key, else 0.
+// The mask of tile row r for key tile kt, from its places: -inf where a row doesn't see the key, else 0.
 // Two keys go in a word.
 static void masked(unsigned slot, unsigned r, unsigned kt) {{
   volatile unsigned *places = (volatile unsigned *)({places:#x} + r * 4096), *m = (volatile unsigned *)SLOT(slot);
@@ -855,7 +851,7 @@ static void masked(unsigned slot, unsigned r, unsigned kt) {{
   }}
 }}"""
   return compile_kernel(brisc_program("expect", brisc, "bf16", "fp32", decls, b8=2 * ht if wt else 0, wt=wt or "bfp8", outs=oacc),
-                        unpack_program(f"posted += {len(made)};" + unpacker, cfg), math_program(slots, math),
+                        unpack_program(f"posted += {len(made)}; drain();" + unpacker, cfg), math_program(slots, math),
                         pack_program("static unsigned needed;" + packer))
 
 def gather_kernel(dtype):
