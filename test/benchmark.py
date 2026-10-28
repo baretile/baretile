@@ -12,7 +12,7 @@
 #   B3, long prefill: time to first token for B2's model with prompts of 4,096 and 32,768 tokens, after a warm-up.
 #   B4, serving: B2's model behind serve.py, with 32 concurrent agents over HTTP. Each agent runs four turns. They
 #     start from a shared system prompt, and each turn adds the last answer and a tool result. It reports tokens/s per
-#     user and for the card, time to first token, and the share of prompt tokens the server had cached. B4 has no
+#     user and for the card (including first-token latency), time to first text, and the share of prompt tokens the server had cached. B4 has no
 #     TT-NN side, since TT-NN serves through vLLM, but `load` can drive any OpenAI-compatible server.
 # `table` compares both stacks. It reports the speed ratio (baretile / TT-NN; above 1 means baretile is faster)
 # and the fraction of the card's theoretical limit. That limit is the peak matmul rate at the benchmark's
@@ -32,7 +32,8 @@
 # enough to test the script.
 # TT-NN's B2 and B3 don't run on ttsim, because Tenstorrent's script warms up prefill with an SFPU mode that ttsim
 # lacks.
-import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
+import bz2, glob, http.client, json, math, os, platform, re, shutil, signal, socket, statistics, subprocess, sys, tempfile, threading, time
+from urllib.parse import urlsplit
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -46,16 +47,16 @@ SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500
                                turns=SimpleNamespace(system=24, task=6, tool=6, out=8, n=2))}
 
 def git(folder):  # a checkout's commit, and whether it has changes
-  run = lambda *a: subprocess.run(["git", "-C", folder, *a], capture_output=True, text=True).stdout.strip()
+  run = lambda *a: subprocess.run(["git", "-C", folder, *a], capture_output=True, text=True, timeout=60).stdout.strip()
   return run("rev-parse", "--short", "HEAD") + (" with changes" if run("status", "--porcelain", "--untracked-files=no") else "")
 
 def lines(folder, keep):  # lines of code that cloc counts in the git-tracked files that keep accepts, submodules included
   if not shutil.which("cloc"): return "not counted: cloc is not installed"
-  files = subprocess.run(["git", "-C", folder, "ls-files", "--recurse-submodules"], capture_output=True, text=True).stdout.splitlines()
+  files = subprocess.run(["git", "-C", folder, "ls-files", "--recurse-submodules"], capture_output=True, text=True, timeout=60).stdout.splitlines()
   with tempfile.NamedTemporaryFile("w") as f:
     f.write("\n".join(os.path.join(folder, p) for p in files if keep(p)))
     f.flush()
-    out = subprocess.run(["cloc", "--json", "--quiet", f"--list-file={f.name}"], capture_output=True, text=True).stdout
+    out = subprocess.run(["cloc", "--json", "--quiet", f"--list-file={f.name}"], capture_output=True, text=True, timeout=60).stdout
   try: return json.loads(out)["SUM"]["code"]
   except (ValueError, KeyError): return f"not counted: cloc found no code in {folder}"
 
@@ -89,42 +90,118 @@ def timed(run, wait, clock, runs):
     times.append((clock() - start) / runs[2])
   return statistics.median(times)
 
-def load(url, agents, turns, text):
-  """B4: runs agents in parallel against the OpenAI-compatible server at url, with streamed greedy /v1/completions.
+def load(url, agents, turns, text, timeout=3600):
+  """Run streamed greedy completions, with one deadline for the whole workload.
 
-  Each agent runs turns.n turns of turns.out tokens. Its first prompt is a shared system prompt, the first
-  turns.system words of text, plus a task of turns.task words from the agent's part of text. Each later turn adds the
-  answer and a tool result of turns.tool more words. Reports the median tokens/s per user, counted after each
-  turn's first token, tokens/s for all agents over the wall time, the median and 90th percentile time to first token,
-  and the share of prompt tokens the server had cached."""
-  words, done, failed = text.split(), [], []
+  Each agent extends its shared system prompt with a task, then each answer and tool result. Rates use reported
+  token counts and complete request durations, including the first token. SSE text chunks are not token timestamps;
+  the first-text latency is all the wire measures. Missing usage or cache counts produce None. On failure or timeout,
+  completed turns remain in the report, with failures and the total elapsed time (including unfinished requests)."""
+  if not isinstance(agents, int) or agents < 1 or not isinstance(turns.n, int) or turns.n < 1:
+    raise ValueError("benchmark agents and turns must be positive integers")
+  if not math.isfinite(timeout) or timeout <= 0: raise ValueError("benchmark timeout must be positive and finite")
+  endpoint = urlsplit(url)
+  if endpoint.scheme not in ("http", "https") or not endpoint.hostname: raise ValueError("benchmark URL must use HTTP or HTTPS")
+  path = endpoint.path.rstrip("/") + "/v1/completions" + ("?" + endpoint.query if endpoint.query else "")
+  words, done, failed, sockets = text.split(), [], {}, {}
+  lock, stopped = threading.Lock(), threading.Event()
+  beginning = time.perf_counter()
+  deadline = beginning + timeout
   piece = lambda at, n: " " + " ".join(words[at:at + n])
+  def remaining():
+    left = deadline - time.perf_counter()
+    if stopped.is_set() or left <= 0: raise TimeoutError("benchmark workload deadline exceeded")
+    return left
   def agent(a):
-    at = turns.system + a * (turns.task + turns.n * turns.tool)  # where its part of the text starts
+    at = turns.system + a * (turns.task + turns.n * turns.tool)
     prompt = piece(0, turns.system) + piece(at, turns.task)
     try:
       for k in range(turns.n):
-        body = json.dumps({"prompt": prompt, "max_tokens": turns.out, "temperature": 0, "stream": True}).encode()
-        start, stamps, answer, usage = time.perf_counter(), [], "", None
-        with urllib.request.urlopen(urllib.request.Request(url + "/v1/completions", body, {"Content-Type": "application/json"}), timeout=3600) as r:
-          for line in r:
-            if not line.startswith(b"data: {"): continue
-            chunk = json.loads(line[6:])
-            usage = chunk.get("usage") or usage
-            if chunk["choices"] and chunk["choices"][0]["text"]: stamps.append(time.perf_counter()); answer += chunk["choices"][0]["text"]
-        done.append((start, stamps, usage))
+        body = json.dumps({"prompt": prompt, "max_tokens": turns.out, "temperature": 0, "stream": True,
+                           "stream_options": {"include_usage": True}}).encode()
+        start, first, answer, usage = time.perf_counter(), None, "", None
+        cls = http.client.HTTPSConnection if endpoint.scheme == "https" else http.client.HTTPConnection
+        conn = cls(endpoint.hostname, endpoint.port, timeout=remaining())
+        try:
+          conn.connect()
+          with lock:
+            remaining()
+            sockets[a] = conn.sock  # keep the socket even when getresponse gives its ownership to the response
+          conn.request("POST", path, body, {"Content-Type": "application/json"})
+          with conn.getresponse() as response:
+            if response.status != 200: raise RuntimeError(f"HTTP {response.status}: {response.reason}")
+            while True:
+              remaining()
+              line = response.readline(1 << 20)
+              if not line: break
+              if len(line) == 1 << 20: raise ValueError("benchmark SSE line exceeds 1 MiB")
+              if not line.startswith(b"data:"): continue
+              data = line[5:].strip()
+              if data == b"[DONE]": break
+              chunk = json.loads(data)
+              if "error" in chunk: raise RuntimeError(str(chunk["error"]))
+              usage = chunk.get("usage") or usage
+              choices = chunk.get("choices") or []
+              if choices and (part := choices[0].get("text")):
+                if first is None: first = time.perf_counter()
+                answer += part
+          end = time.perf_counter()
+          with lock:
+            remaining()
+            done.append((start, first, end, usage))
+        finally:
+          with lock: sockets.pop(a, None)
+          conn.close()
         prompt += answer + piece(at + turns.task + k * turns.tool, turns.tool)
-    except Exception as e: failed.append(f"agent {a}: {type(e).__name__}: {e}")
-  threads = [threading.Thread(target=agent, args=(a,)) for a in range(agents)]
+    except Exception as e:
+      with lock: failed.setdefault(a, f"agent {a}: {type(e).__name__}: {e}")
+  threads = [threading.Thread(target=agent, args=(a,), daemon=True) for a in range(agents)]
   for t in threads: t.start()
-  for t in threads: t.join()
-  assert not failed, failed
-  first = sorted(stamps[0] - start for start, stamps, _ in done if stamps)  # a turn can end before its first text
-  each = statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if len(s) > 1 and s[-1] > s[0])
-  made, span = sum(u["completion_tokens"] for *_, u in done), max(s[-1] for _, s, _ in done if s) - min(start for start, *_ in done)
-  cached = sum(u["prompt_tokens_details"]["cached_tokens"] for *_, u in done) / sum(u["prompt_tokens"] for *_, u in done)
-  return {"agents": agents, "turns": len(done), "tokens/s a user": each, "tokens/s": made / span, "seconds to first token": statistics.median(first),
-          "seconds to first token, 90th percentile": first[int(0.9 * (len(first) - 1))], "prompt tokens cached": cached}
+  for t in threads: t.join(max(0, deadline - time.perf_counter()))
+  with lock:
+    stopped.set()
+    for a, t in enumerate(threads):
+      if t.is_alive(): failed.setdefault(a, f"agent {a}: TimeoutError: benchmark workload deadline exceeded")
+    for sock in sockets.values():
+      try: sock.shutdown(socket.SHUT_RDWR)
+      except OSError: pass
+    completed, errors = list(done), list(failed.values())
+  # Socket shutdown interrupts header and body reads, including streams that keep sending a byte at a time.
+  cleanup = time.perf_counter() + 1
+  for t in threads: t.join(max(0, cleanup - time.perf_counter()))
+  elapsed = time.perf_counter() - beginning
+  first = sorted(first - start for start, first, _, _ in completed if first is not None)
+  count = lambda u, key: u.get(key) if isinstance(u, dict) and type(u.get(key)) is int and u[key] >= 0 else None
+  totals = [count(u, "completion_tokens") for *_, u in completed]
+  prompts = [count(u, "prompt_tokens") for *_, u in completed]
+  cached = [count(u.get("prompt_tokens_details"), "cached_tokens") if isinstance(u, dict) else None for *_, u in completed]
+  known = bool(completed) and all(n is not None for n in totals)
+  each = [n / (end - start) for (start, _, end, _), n in zip(completed, totals) if n is not None and end > start]
+  cache = sum(cached) / sum(prompts) if completed and all(n is not None for n in prompts + cached) and sum(prompts) else None
+  return {"agents": agents, "turns": len(completed), "seconds": elapsed, "failures": errors,
+          "tokens/s a user": statistics.median(each) if known and each else None, "tokens/s": sum(totals) / elapsed if known else None,
+          "seconds to first text": statistics.median(first) if first else None,
+          "seconds to first text, 90th percentile": first[int(0.9 * (len(first) - 1))] if first else None, "prompt tokens cached": cache}
+
+def logged(args, path, timeout=3600, **kwargs):
+  """Run a benchmark subprocess to a log, stopping its process group at the deadline and keeping partial output."""
+  if not math.isfinite(timeout) or timeout <= 0: raise ValueError("benchmark timeout must be positive and finite")
+  with open(path, "w") as log:
+    process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, **kwargs)
+    try: return process.wait(timeout), False
+    except subprocess.TimeoutExpired:
+      try: os.killpg(process.pid, signal.SIGTERM)
+      except ProcessLookupError: pass
+      try: process.wait(min(5, timeout))
+      except subprocess.TimeoutExpired:
+        pass
+      finally:
+        # A subprocess can exit before its children. Stop the whole group even when its leader has already exited.
+        try: os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.wait(5)
+      log.write(f"\nBenchmark deadline exceeded after {timeout:g} seconds.\n")
+      return process.returncode, True
 
 def weights(c):  # rows, columns and format of each weight as llama.upload makes it, from the model's sizes alone
   hd = llama.head(c)
@@ -276,12 +353,13 @@ def ttnn(folder, prompt, after, top5, book, s):
     with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
       if text is not None: json.dump([{"prompt": text}], f); f.flush(); flags += ("--input_prompts", f.name, "--instruct", "0")
       if s.blocks: flags += ("--num_layers", str(s.blocks))
-      p = subprocess.run([sys.executable, "-m", "pytest", DEMO, "-k", f"performance and {run}", "-s", "-p", "no:cacheprovider", *flags],
-                         cwd=tt, env=os.environ | {"HF_MODEL": folder}, capture_output=True, text=True)
-    log = p.stdout + p.stderr
-    open(f"benchmark-ttnn-{label}.log", "w").write(log)
+      path = f"benchmark-ttnn-{label}.log"
+      code, expired = logged([sys.executable, "-m", "pytest", DEMO, "-k", f"performance and {run}", "-s", "-p", "no:cacheprovider", *flags],
+                             path, timeout=3600, cwd=tt, env=os.environ | {"HF_MODEL": folder})
+    log = open(path).read()
     got = {k: float(m[-1]) * LOGGED[k][1] for k in want + ("prompt tokens",) if (m := re.findall(LOGGED[k][0], log))}
-    if p.returncode or set(want) - set(got):
+    if expired: got["did not pass"] = ["benchmark deadline exceeded after 3600 seconds; partial output is in " + path]
+    elif code or set(want) - set(got):
       got["did not pass"] = [l for l in log.splitlines() if l.startswith(("E ", "FAILED", "SKIPPED")) or "ERROR:" in l][-3:] or log.splitlines()[-1:]
     return got
 
@@ -330,7 +408,7 @@ def main():
   if sys.argv[1] == "load":
     path = os.environ.get("BOOK") or "tale-of-two-cities.txt.bz2"
     book = bz2.open(path, "rt", encoding="utf-8").read()
-    return print(load(sys.argv[2].rstrip("/"), int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, book))
+    return print(json.dumps(load(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, book), indent=1))
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
   assert stack in ("baretile", "ttnn"), "the stack must be baretile or ttnn"
   prompt, after, top5 = llama.reference(refpt)

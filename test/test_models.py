@@ -933,7 +933,88 @@ def test_benchmark_load(chip, tmp_path):
   got = benchmark.load(f"http://localhost:{httpd.server_address[1]}", 2, SimpleNamespace(system=6, task=2, tool=2, out=4, n=2),
                        " ".join(f"w{i}" for i in range(40)))
   httpd.shutdown()
-  assert got["turns"] == 4 and got["tokens/s"] > 0 and got["seconds to first token"] > 0 and got["prompt tokens cached"] > 0.3, got
+  assert got["turns"] == 4 and got["tokens/s"] > 0 and got["seconds to first text"] > 0 and got["prompt tokens cached"] > 0.3, got
+
+def test_benchmark_streams():
+  # External servers may omit usage/cache details or emit all text in one event. None of these imply token timing.
+  from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+  cases = [({"choices": [{"text": "abc"}]}, {"choices": []}),
+           ({"choices": [{"text": "abc"}]}, {"choices": [], "usage": {"completion_tokens": 3, "prompt_tokens": 2}}),
+           ({"choices": [], "usage": {"completion_tokens": 0, "prompt_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}},)]
+  bodies = []
+  class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_POST(self):
+      bodies.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+      self.send_response(200)
+      self.end_headers()
+      for chunk in cases.pop(0): self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+      self.wfile.write(b"data: [DONE]\n\n")
+  server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+  worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+  worker.start()
+  try:
+    call = lambda: benchmark.load(f"http://127.0.0.1:{server.server_port}", 1, SimpleNamespace(system=1, task=1, tool=1, out=3, n=1), "a b c")
+    missing, combined, empty = call(), call(), call()
+    assert missing["turns"] == 1 and missing["tokens/s"] is None and missing["tokens/s a user"] is None
+    assert missing["seconds to first text"] > 0 and missing["prompt tokens cached"] is None
+    assert combined["tokens/s"] > 0 and combined["tokens/s a user"] > 0 and combined["prompt tokens cached"] is None
+    assert empty["tokens/s"] == empty["tokens/s a user"] == 0 and empty["seconds to first text"] is None
+    assert empty["prompt tokens cached"] is None and not any(r["failures"] for r in (missing, combined, empty))
+    assert all(b["stream_options"] == {"include_usage": True} for b in bodies)
+  finally:
+    server.shutdown()
+    server.server_close()
+    worker.join(1)
+
+@pytest.mark.parametrize("headers", [False, True])
+def test_benchmark_deadline(headers):
+  # Keep sending bytes so no individual socket read times out. The workload must still finish and keep turn one.
+  from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+  requests = []
+  class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_POST(self):
+      self.rfile.read(int(self.headers["Content-Length"]))
+      requests.append(1)
+      if len(requests) == 1:
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'data: {"choices":[{"text":"abc"}],"usage":{"completion_tokens":3,"prompt_tokens":1}}\n\ndata: [DONE]\n\n')
+        return
+      try:
+        if headers: self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+        else:
+          self.send_response(200)
+          self.end_headers()
+          self.wfile.write(b": ")
+        for _ in range(100):
+          self.wfile.write(b"x")
+          self.wfile.flush()
+          time.sleep(0.01)
+      except OSError: pass
+  server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+  worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+  worker.start()
+  start = time.monotonic()
+  try:
+    got = benchmark.load(f"http://127.0.0.1:{server.server_port}", 1,
+                         SimpleNamespace(system=1, task=1, tool=1, out=3, n=2), "a b c d", timeout=0.2)
+    assert time.monotonic() - start < 1.5 and got["turns"] == 1 and got["tokens/s"] > 0, got
+    assert len(got["failures"]) == 1 and "deadline" in got["failures"][0], got
+  finally:
+    server.shutdown()
+    server.server_close()
+    worker.join(1)
+
+def test_benchmark_subprocess_deadline(tmp_path):
+  # The child ignores termination. Its partial output survives the deadline and the forced process-group exit.
+  log = tmp_path / "benchmark.log"
+  start = time.monotonic()
+  code, expired = benchmark.logged([sys.executable, "-u", "-c",
+    "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('partial result',flush=True); time.sleep(30)"], log, timeout=0.2)
+  assert expired and code < 0 and time.monotonic() - start < 1.5
+  assert "partial result" in log.read_text() and "deadline exceeded" in log.read_text()
 
 def test_chunked_prefill(chip):
   # llama.prefill runs a long prompt a chunk at a time, so attention's scores are a chunk by the cache instead of the
