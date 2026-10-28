@@ -1317,6 +1317,37 @@ def test_int32(chip):
       assert value(got).tolist() == np.asarray(want, np.float64).reshape(got.shape).tolist(), (got.shape, got.dtype)
     assert (ts * 0.5).dtype == "fp32" and (ts > 0).dtype == "int32" and value(ts * 0.5).tolist() == (s * 0.5).reshape(1, 45, 70).tolist()
 
+def test_trig_range(chip):
+  rt, rng = Runtime(chip), np.random.default_rng(22)
+  # Cover both signs, all supported binades, and the old reduction's large-argument failures.
+  x = np.concatenate([rng.uniform(-1, 1, 64).astype(np.float32) * np.float32(2**e) for e in range(25)])
+  turns = (np.array([1, 2, 4095, 4096, 4097, 2**20, 2**22, 5340353]) * (math.pi / 2)).astype(np.float32)
+  near = np.concatenate((np.nextafter(turns, -np.inf), turns, np.nextafter(turns, np.inf)))
+  x = np.concatenate((x, near, -near, np.array([1e7, -1e7, 16777215, -16777215, 0, -0.0], np.float32))).reshape(1, -1)
+  t = Tensor.frombytes(rt, *x.shape, x.tobytes(), dtype="fp32")
+  for got, want in ((t.sin(), np.sin(x.astype(np.float64))), (t.cos(), np.cos(x.astype(np.float64)))):
+    error = np.abs(value(got)[0] - want)
+    assert np.max(error) < 5e-7, (x.ravel()[error.argmax()], error.max())
+  edge = np.array([[2**24, -2**24, np.finfo(np.float32).max, np.inf, -np.inf, np.nan]], np.float32)
+  t = Tensor.frombytes(rt, *edge.shape, edge.tobytes(), dtype="fp32")
+  assert np.isnan(value(t.sin())).all() and np.isnan(value(t.cos())).all()
+  zeros = Tensor.frombytes(rt, 1, 2, np.array([0.0, -0.0], np.float32).tobytes(), dtype="fp32")
+  assert zeros.sin().tobytes() == zeros.tobytes()
+
+def test_sqrt_range(chip):
+  rt = Runtime(chip)
+  # Every normal exponent, with exact powers of two and values near each binade's upper edge.
+  bits = (np.arange(1, 255, dtype=np.uint32)[:, None] << 23) | np.array([0, 1, 0x123456, 0x400000, 0x7FFFFE, 0x7FFFFF], np.uint32)
+  x = bits.view(np.float32)
+  t = Tensor.frombytes(rt, *x.shape, x.tobytes(), dtype="fp32")
+  got, want = value(t.sqrt())[0], np.sqrt(x.astype(np.float64))
+  assert np.all(got > 0) and np.max(np.abs(got / want - 1)) < 3e-7
+  edge = np.array([[0.0, -0.0, np.inf, -np.inf, np.nan, -1.0]], np.float32)
+  got = np.frombuffer(Tensor.frombytes(rt, 1, edge.size, edge.tobytes(), dtype="fp32").sqrt().tobytes(), np.float32)
+  with np.errstate(invalid="ignore"): want = np.sqrt(edge[0])
+  assert np.array_equal(got, want, equal_nan=True)
+  assert np.array_equal(np.signbit(got[:2]), np.signbit(want[:2]))
+
 def test_integer_boundaries(chip):
   rt = Runtime(chip)
   edge = np.array([-2**31, -2**31 + 1, -2**24 - 1, -1, 0, 1, 2**24 + 1, 2**31 - 1], np.int32)

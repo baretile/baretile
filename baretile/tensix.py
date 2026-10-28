@@ -315,23 +315,33 @@ def log(scale):
            ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), CC_ALL, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), CC_OFF, sfp_store(3)])
 
 def sin(phase):
-  """sin(x + pi phase) for phase 0 or 0.5, so 0.5 gives cos.
+  """sin(x + pi phase), with phase 0 or 0.5 for cosine, for finite |x| < 2^24.
 
-  k = round(x / pi + phase) and r = x - k pi + pi phase, which is in [-pi/2, pi/2]. Both k pi and pi phase go in two
-  parts (Cody-Waite), so there's no cancellation near a zero. k times 3.140625 is exact, and so is x minus that, since
-  the two are within a factor of 2 of each other. Then sin(r) = r p(r^2) with p a polynomial, and the low bit of k,
-  moved to the sign bit, flips the sign.
-
-  For finite |x| >= 2^24, this range reduction fails and the function returns 0. inf and NaN give NaN."""
-  hi = 1.5707964  # pi/2 in fp32. math.pi / 2 - hi is what it leaves out
+  Split the integer k = round(|x| / pi + phase) at bit 12, and pi into four parts. The first three parts
+  have at most 12 significant bits, so their products with each part of k are exact. Subtract them largest
+  first. Correct a possible off-by-one k after reduction, then use sin(r) = r p(r^2) on [-pi/2, pi/2].
+  Outside the supported range, including infinity, return NaN instead of an inaccurate finite value."""
+  pi = (3.140625, 0.0009675025939941406, 1.5099067240953445e-7, 5.126565838509123e-12)
+  half, whole = float.fromhex("0x1.921fb6p+0"), float.fromhex("0x1.921fb6p+1")
+  correct = []
+  for sign in (1, -1):
+    correct += [CC_ALL, *sfp_const(2, sign * half), ins("SFPMOV", vd=7, vc=6 if sign == 1 else 2),
+                ins("SFPGT", vd=7, vc=2 if sign == 1 else 6, mod1=1)]
+    correct += [*sfp_const(4, sign * whole), mad(6, 6, ONE, 4, neg=2),
+                *sfp_const(4, sign * (math.pi - whole)), mad(6, 6, ONE, 4, neg=2), ins("SFPXOR", vd=3, vc=5)]
   return (sfp_const(1, 1 / math.pi),
-          [sfp_load(), sfp_bf16(7, phase), mad(4, 0, 1, 7), sfp_bf16(5, 1.5 * 2**23), mad(6, 4, ONE, 5), mad(4, 6, ONE, 5, neg=2),  # LReg 4: k
-           ins("SFPIADD", vd=5, vc=6, mod1=6), sfp_bf16(2, 3.140625), mad(6, 4, 2, 0, neg=1),  # LReg 5: k as an integer, 6: x - 3.140625 k
-           *(sfp_const(3, hi) + [mad(6, 6, ONE, 3)] if phase else []), *sfp_const(3, math.pi - 3.140625), mad(6, 4, 3, 6, neg=1),
-           *(sfp_const(3, math.pi / 2 - hi) + [mad(6, 6, ONE, 3)] if phase else []),  # LReg 6: r
-           ins("SFPSHFT", vd=5, mod1=1, imm12=31), ins("SFPEXEXP", vd=0, vc=0, mod1=1), mul(7, 6, 6), *poly(4, 7, SIN_P, 3), mul(4, 4, 6),
-           ins("SFPXOR", vd=4, vc=5), CC_ON, at_least(0, 127 + 24, 5), ins("SFPMOV", vd=4, vc=ZERO), CC_ALL, at_least(0, 255, 5),
-           *sfp_bits(4, NAN), CC_OFF, sfp_store(4)])
+          [sfp_load(), ins("SFPABS", vd=0, vc=0, mod1=1), sfp_bf16(7, phase + 0.5), mad(6, 0, 1, 7),
+           ins("SFPEXEXP", vd=2, vc=6), ins("SFPEXMAN", vd=3, vc=6), ins("SFPIADD", vd=2, vc=2, mod1=5, imm12=-23 & 0xFFF),
+           ins("SFPSHFT", vd=3, vc=2), ins("SFPMOV", vd=4, vc=3), ins("SFPLOADI", vd=2, mod0=2, imm16=4095),
+           ins("SFPAND", vd=4, vc=2), ins("SFPSHFT", vd=5, vc=3, mod1=5, imm12=-12 & 0xFFF), ins("SFPSHFT", vd=5, mod1=1, imm12=12),
+           ins("SFPCAST", vd=4, vc=4), ins("SFPCAST", vd=5, vc=5), ins("SFPSHFT", vd=3, mod1=1, imm12=31), ins("SFPMOV", vd=6, vc=0),
+           *[w for p in pi for w in (*sfp_const(2, p), mad(6, 5, 2, 6, neg=1), mad(6, 4, 2, 6, neg=1))],
+           *([*sfp_const(2, half), mad(6, 6, ONE, 2), *sfp_const(2, math.pi / 2 - half), mad(6, 6, ONE, 2)] if phase else []),
+           *sfp_bits(5, 0x80000000), CC_ON, *correct, CC_OFF,
+           mul(7, 6, 6), *poly(4, 7, SIN_P, 2), mul(4, 4, 6), ins("SFPXOR", vd=4, vc=3),
+           sfp_load(), ins("SFPEXEXP", vd=2, vc=0, mod1=1),
+           *([ins("SFPAND", vd=0, vc=5), ins("SFPXOR", vd=4, vc=0)] if not phase else []),
+           CC_ON, at_least(2, 127 + 24, 5), *sfp_bits(4, NAN), CC_OFF, sfp_store(4)])
 
 SFPU = {
   # max(x, 0). SFPSWAP's min/max mode leaves the smaller value in vd and the larger in vc. It only picks a value, so the
@@ -339,16 +349,19 @@ SFPU = {
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, mod0=RAW)]),
   "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
   "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True),
-  # sqrt(x) = x / sqrt(x), so we find 1/sqrt(x) and multiply by x. 1/sqrt(x) starts from the bit trick, 0x5F3759DF -
-  # bits / 2, which is within 3.5%. Three Newton steps y *= 1.5 - x/2 y^2 follow. Two would leave 5e-6, or 80 ulps.
-  # x + 0 first turns -0 into 0, and the product is within 3 ulps. 0, inf and NaN come back unchanged, and a negative
-  # number gives NaN.
+  # Write x = m * 2^(2q), with m in [1, 4). Three inverse-sqrt Newton steps on m avoid intermediate underflow
+  # and overflow throughout the normal fp32 range. Multiply m / sqrt(m) by 2^q. Preserve signed zero and inf;
+  # negative normal values give NaN. Subnormal inputs flush to zero, like the other SFPU arithmetic.
   "sqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
-           [sfp_load(), mad(0, 0, ONE, ZERO), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF),  # LReg 1 = bits of x >> 1
-            ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +  # LReg 1 = magic - LReg 1 as integers, LReg 5 = x/2
+           [sfp_load(), ins("SFPEXEXP", vd=7, vc=0), ins("SFPMOV", vd=6, vc=7), ins("SFPLOADI", vd=1, mod0=2, imm16=1),
+            ins("SFPAND", vd=6, vc=1), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=127), ins("SFPSETEXP", vd=6, vc=0),
+            ins("SFPMOV", vd=0, vc=6), ins("SFPSHFT", vd=7, mod1=3, imm12=-1 & 0xFFF),
+            ins("SFPIADD", vd=7, vc=7, mod1=5, imm12=127), ins("SFPSHFT", vd=7, mod1=1, imm12=23),
+            ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF), ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +
            [w for _ in range(3) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
-           [mul(1, 1, 0), ins("SFPEXEXP", vd=6, vc=0, mod1=1), CC_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL,
-            below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN), CC_OFF, sfp_store(1)]),
+           [mul(1, 1, 0), mul(1, 1, 7), sfp_load(), ins("SFPEXEXP", vd=6, vc=0, mod1=1),
+            CC_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN),
+            CC_ALL, below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), CC_OFF, sfp_store(1)]),
 }
 # Binary ops on the SFPU. x and y reach Dst by being added to zero, x at the op's Dst half and y 128 rows further on.
 # They load into LRegs 0 and 1, and the result is stored over x. Comparisons give 1.0 or 0: the all ones or 0 from
