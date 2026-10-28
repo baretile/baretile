@@ -229,7 +229,7 @@ def prefill_flops(c, n, phases=False):
   s = cost.shape(c, "tt")
   values, head = (s.work, s.head_work) if phases else (s.values, c.vocab * c.dim)
   attention = c.layers * 4 * c.heads * llama.head(c) * n * (n + 1) // 2
-  return 2 * n * (values - head) + 2 * head + attention * (s.prefill_phases if phases else 1)
+  return 2 * n * (values - head) + 2 * head + attention * ((s.prefill_phases if n > 1 else s.decode_phases) if phases else 1)
 
 def model(folder, s, places):  # the model's config at TT's performance precision, and its weights, read lazily
   c, w = llama.load(folder, places)

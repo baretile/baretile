@@ -190,7 +190,8 @@ def prompt(c, s, use, card, chunk, cards=1):
     reads = s.every + s.moe * touched(c, m) * s.expert + blocks * attention(c, c.heads, m, rows, use["kv"]) + regroups(c, m)
     attention_flops = blocks * 4 * m * c.heads * hd * rows
     flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + attention_flops
-    work = 2 * m * (s.work - s.head_work) + 2 * s.head_work + attention_flops * s.prefill_phases
+    phases = s.prefill_phases if m > 1 else s.decode_phases  # forward and draft use decode attention for one token
+    work = 2 * m * (s.work - s.head_work) + 2 * s.head_work + attention_flops * phases
     if c.mtp:
       reads += s.draft + c.mtp * touched(c, m) * s.expert + s.head
       flops += 2 * m * s.draft_values + 2 * c.vocab * d
