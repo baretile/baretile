@@ -56,8 +56,10 @@ then adds up the exponentials, then divides by that sum. A kernel can reduce
 along one axis. If the expression also reduces along another axis, that part
 is computed first. Inputs can stay in L1 across passes when there is room.
 
-Some slices and reshapes change only the view of a tensor: its batch, strides
-and offset. When data has to move, `move_kernel` copies it to the new layout.
+Batch indexing, tile-aligned slices, `split` and `repeat_interleave` can share
+storage through a view's batch, strides and offset. A shape-changing `reshape`
+copies through `move_kernel`; an identical-shape reshape returns its input.
+Other movement also copies when it cannot use a view.
 `gather` reads rows by index, and `put` writes them. The models use these for
 embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
 Casting block floats to bf16 decodes them on the chip into ordinary tiles;

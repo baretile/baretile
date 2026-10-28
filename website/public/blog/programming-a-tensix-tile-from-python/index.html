@@ -189,7 +189,8 @@ and named fields describe the remaining bits. An instruction encoder can therefo
     word = opcode &lt;&lt; <span class="n">24</span>
     <span class="k">for</span> name, value <span class="k">in</span> fields.items():
         first, width = layout[name]
-        <span class="k">assert</span> <span class="n">0</span> &lt;= value &lt; <span class="n">1</span> &lt;&lt; width
+        <span class="k">if not</span> isinstance(value, int) <span class="k">or not</span> <span class="n">0</span> &lt;= value &lt; <span class="n">1</span> &lt;&lt; width:
+            <span class="k">raise</span> ValueError(<span class="s">f"{name} must fit in {width} bits"</span>)
         word |= value &lt;&lt; first
     <span class="k">return</span> word
 
@@ -303,7 +304,7 @@ got = from_l1(<span class="n">3</span>)
 expected = [[a[r][c] + b[r][c] <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>)]
             <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>)]
 
-<span class="k">assert</span> got == expected
+<span class="k">if</span> got != expected: <span class="k">raise</span> RuntimeError(<span class="s">"the handwritten kernel returned incorrect sums"</span>)
 print(<span class="s">"all 1024 sums match"</span>)</code></pre>
 
 <p>The comparison checks every element, including the boundaries between faces.
@@ -318,7 +319,8 @@ We can ask it to perform the addition and compare its answer with our handwritte
 
 A = Tensor.of(rt, a)
 B = Tensor.of(rt, b)
-<span class="k">assert</span> (A + B).tolist() == got
+result = (A + B).tolist()
+<span class="k">if</span> result != got: <span class="k">raise</span> RuntimeError(<span class="s">"Tensor and the handwritten kernel disagree"</span>)
 print(<span class="s">"Tensor result matches the handwritten kernel"</span>)</code></pre>
 
 <p>In this version, the tensor inputs live in device DRAM. The generated kernel also includes the BRISC program

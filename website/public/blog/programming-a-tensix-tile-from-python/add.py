@@ -40,7 +40,8 @@ def ins(name, **fields):
     word = opcode << 24
     for name, value in fields.items():
         first, width = layout[name]
-        assert 0 <= value < 1 << width
+        if not isinstance(value, int) or not 0 <= value < 1 << width:
+            raise ValueError(f"{name} must fit in {width} bits")
         word |= value << first
     return word
 
@@ -81,12 +82,13 @@ got = from_l1(3)
 expected = [[a[r][c] + b[r][c] for c in range(32)]
             for r in range(32)]
 
-assert got == expected
+if got != expected: raise RuntimeError("the handwritten kernel returned incorrect sums")
 print("all 1024 sums match")
 
 from baretile.tensor import Tensor
 
 A = Tensor.of(rt, a)
 B = Tensor.of(rt, b)
-assert (A + B).tolist() == got
+result = (A + B).tolist()
+if result != got: raise RuntimeError("Tensor and the handwritten kernel disagree")
 print("Tensor result matches the handwritten kernel")
