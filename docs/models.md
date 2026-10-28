@@ -133,13 +133,24 @@ sampling requests do too, so they can read much more data back to the host.
 
 Chat templates are written in Python, so a model with a new template may need
 code in `serve.py`. Qwen tool calls are returned in `tool_calls`, and reasoning
-goes in `reasoning_content`. `tool_choice` and JSON response formats constrain
+goes in `reasoning_content`. Streams buffer partial reasoning markers so delimiter
+characters do not leak into either field. `tool_choice` and JSON response formats constrain
 which tokens can be sampled. `test_chat_tools` and `test_serve` have example
 requests to start from when adding a model or client.
 JSON schemas support types, properties, required fields, additional properties,
 arrays, enums, constants, alternatives and nonrecursive local references.
-`serve.formatted` documents the supported subset; string patterns, formats and
-numeric bounds are not enforced.
+Sibling constraints intersect, including fields beside `$ref`, following the
+[JSON Schema 2020-12 reference rules](https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.3.1).
+Enums and constants match decoded JSON values; strings accept literal Unicode
+and JSON escapes. A token may contain only part of a UTF-8 character. Generation
+keeps those bytes pending and reports an error if no token can complete the
+constraint. It does not label an incomplete constrained answer as a successful
+stop.
+
+`serve.formatted` documents the supported subset. String patterns, formats and
+numeric bounds are not enforced. Generation allows at most one whitespace
+character between tokens and 32 characters per number; integer schemas use
+spellings without fractions or exponents.
 
 ## tinygrad and PyTorch
 
