@@ -154,6 +154,13 @@ nearest. fp32 comparisons treat NaN as unordered: `<`, `<=`, `>`,
 `>=` and `==` are false, and `!=` is true. fp32 `where` preserves the selected
 value's bits, including the sign of zero.
 
+Square root covers every positive normal fp32 input, including the smallest
+normal value and the largest finite value. Intermediate values are rescaled
+to avoid underflow and overflow. Subnormal arithmetic flushes to zero.
+Sine and cosine support finite inputs with absolute value below `2**24`;
+inputs outside that range return NaN. Their range reduction splits both the
+integer turn count and pi to keep large-argument subtraction accurate.
+
 ## Attention
 
 `Tensor.attend` computes the scores and weighted values in an attention kernel,
