@@ -4,6 +4,8 @@ import array, ctypes, gc, mmap, os, pathlib, time
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
+HUGEPAGES = "/sys/kernel/mm/hugepages/hugepages-2048kB"  # the kernel's pool of 2 MiB pages; tests replace it too
+DRIVER = "tenstorrent"  # tt-kmd's PCI driver, which Card unbinds and release binds again
 
 class Sim:
   """A Blackhole in libttsim.so. bdf selects the PCI device in builds with several chips. Sim instances share
@@ -148,6 +150,40 @@ def find_cards():
   ids = lambda bdf: [int(pathlib.Path(SYS, "devices", bdf, f).read_text(), 16) for f in ("vendor", "device")]
   if cards := [bdf for bdf in sorted(os.listdir(f"{SYS}/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]: return cards
   raise RuntimeError("no Blackhole on the PCI bus. Set TTSIM=/path/to/libttsim.so to use the simulator")
+
+def preflight(bdf):
+  """Check what Card needs, from sysfs, without touching the card. Return [(level, message)], where level is "ok",
+  "warn" or "fail". Card can't run after a fail."""
+  dev, found = pathlib.Path(SYS, "devices", bdf), []
+  read = lambda path: path.read_text().strip() if path.exists() else None
+  found.append(("ok", "running as root") if os.geteuid() == 0 else
+               ("fail", "Card needs root for config space, the BARs and physical addresses for DMA"))
+  kind = read(dev / "iommu_group/type")
+  found.append(("ok", "the IOMMU passes DMA addresses through" if kind else "no IOMMU group") if kind in (None, "identity") else
+               ("fail", f"the IOMMU translates DMA addresses ({kind}), but Card gives the card physical ones. Boot with iommu=pt"))
+  free = int(read(pathlib.Path(HUGEPAGES, "free_hugepages")) or 0)
+  found.append(("ok", f"{free} free 2 MiB hugepages; a Runtime takes one") if free else
+               ("fail", "no free 2 MiB hugepage for DMA memory. Try: echo 4 > /proc/sys/vm/nr_hugepages"))
+  link = [read(dev / f) for f in ("current_link_speed", "current_link_width", "max_link_speed", "max_link_width")]
+  if None in link: found.append(("warn", "sysfs doesn't say how fast the PCIe link is"))
+  else: found.append(("ok", f"PCIe link at {link[0]} x{link[1]}") if link[:2] == link[2:] else
+                     ("warn", f"the PCIe link runs at {link[0]} x{link[1]}, below the card's {link[2]} x{link[3]}. Check the slot"))
+  if (dev / "driver").exists():
+    name, fw = pathlib.Path(os.path.realpath(dev / "driver")).name, next(dev.glob("tenstorrent/*/tt_fw_bundle_ver"), None)
+    found.append(("ok", f"{name} drives the card now. Card unbinds it, and `python3 -m baretile.chip release` binds {DRIVER} again"))
+    if fw: found.append(("ok", f"firmware bundle {read(fw)}, as tt-kmd reads it"))
+  else: found.append(("ok", "no driver has the card"))
+  return found
+
+def release(bdf, driver=DRIVER):
+  """Bind the card to its kernel driver again, tt-kmd's by default, so TT-NN and tt-smi can use it after Card
+  unbound it. Run it once no process has the card open through baretile. A card that a driver has is left alone.
+  Return the name of the driver that has the card."""
+  if os.geteuid() != 0: raise PermissionError("release needs root to bind a driver through sysfs")
+  if os.path.exists(at := f"{SYS}/devices/{bdf}/driver"): return pathlib.Path(os.path.realpath(at)).name
+  if not os.path.exists(f"{SYS}/drivers/{driver}"): raise RuntimeError(f"no {driver} driver is loaded. Load tt-kmd: modprobe {driver}")
+  _write(f"{SYS}/drivers/{driver}/bind", bdf)
+  return driver
 
 def open_device(n=0):
   """Open chip n. With TTSIM=/path/to/libttsim.so that's chip n of the simulator, which has several in a multi-chip

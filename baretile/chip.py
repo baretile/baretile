@@ -147,12 +147,23 @@ class Chip:
     for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
 
 # Report firmware, clock, Tensix tiles, DRAM banks and ARC telemetry. Run this before loading kernels on a new
-# card, or set TTSIM to inspect the simulator. The optional reset argument calls pci.reset before opening the card.
+# card, or set TTSIM to inspect the simulator. For a card, check runs pci.preflight without opening it, release gives
+# it back to tt-kmd (pci.release), and reset calls pci.reset before opening it.
 if __name__ == "__main__":
   import os, sys
   from baretile import pci
-  if reset := sys.argv[1:] == ["reset"]:
-    assert "TTSIM" not in os.environ, "ttsim has no reset. A new process starts it fresh"
+  command = sys.argv[1] if len(sys.argv) > 1 else None
+  if command not in (None, "check", "release", "reset"): sys.exit("usage: python3 -m baretile.chip [check | release | reset]")
+  if command and "TTSIM" in os.environ: sys.exit(f"{command} is for a card. ttsim has no driver, and a new process starts it fresh")
+  if command == "check":
+    found = pci.preflight(pci.find_cards()[0])
+    for level, message in found: print(f"{level:5s}{message}")
+    sys.exit(any(level == "fail" for level, _ in found))
+  if command == "release":
+    bdf = pci.find_cards()[0]
+    print(f"{bdf}: {pci.release(bdf)} has the card")
+    sys.exit()
+  if reset := command == "reset":
     pci.reset(bdf := pci.find_cards()[0])
     dev = pci.Card(bdf)
   else: dev = pci.open_device()

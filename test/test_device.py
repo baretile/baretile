@@ -137,6 +137,7 @@ def test_card_wants_root():
   if os.geteuid() == 0: pytest.skip("as root, Card would go on to open the device")
   with pytest.raises(PermissionError, match="root"): pci.Card("0000:00:00.0")
   with pytest.raises(PermissionError, match="root"): pci.reset("0000:00:00.0")
+  with pytest.raises(PermissionError, match="root"): pci.release("0000:00:00.0")
 
 def test_capability_chain():
   card = object.__new__(pci.Card)
@@ -185,6 +186,48 @@ def test_card_sysfs(tmp_path, monkeypatch):
   cfg = (dev / "config").read_bytes()
   assert [int.from_bytes(cfg[off:off + 4], "little") for off, _ in bh.RESET_TIMER] == [v for _, v in bh.RESET_TIMER]
   assert (dev / "remove").read_text() == "1" and (tmp_path / "rescan").read_text() == "1"
+
+def test_preflight(tmp_path, monkeypatch):
+  # preflight reads what Card needs from a fake sysfs: root, an IOMMU that passes addresses through, a free hugepage,
+  # the PCIe link at the card's best, and who drives the card, with tt-kmd's firmware version. Each problem shows.
+  bdf = "0000:01:00.0"
+  dev, kmd, pages = tmp_path / "devices" / bdf, tmp_path / "drivers" / pci.DRIVER, tmp_path / "hugepages"
+  for d in (dev / "iommu_group", dev / "tenstorrent" / "tenstorrent!0", kmd, pages): d.mkdir(parents=True)
+  (dev / "driver").symlink_to(kmd)
+  for name, text in (("iommu_group/type", "identity\n"), ("current_link_speed", "32.0 GT/s PCIe\n"), ("current_link_width", "16\n"),
+                     ("max_link_speed", "32.0 GT/s PCIe\n"), ("max_link_width", "16\n"),
+                     ("tenstorrent/tenstorrent!0/tt_fw_bundle_ver", "18.12.0.0\n")):
+    (dev / name).write_text(text)
+  (pages / "free_hugepages").write_text("4\n")
+  monkeypatch.setattr(pci, "SYS", str(tmp_path))
+  monkeypatch.setattr(pci, "HUGEPAGES", str(pages))
+  monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
+  found = pci.preflight(bdf)
+  assert {level for level, _ in found} == {"ok"}, found
+  text = " ".join(message for _, message in found)
+  assert all(s in text for s in ("4 free", "32.0 GT/s PCIe x16", "tenstorrent drives", "18.12.0.0")), text
+  (dev / "current_link_width").write_text("8\n")
+  (dev / "iommu_group/type").write_text("DMA\n")
+  (pages / "free_hugepages").write_text("0\n")
+  monkeypatch.setattr(pci.os, "geteuid", lambda: 1000)
+  levels = collections.Counter(level for level, _ in pci.preflight(bdf))
+  assert levels == {"fail": 3, "warn": 1, "ok": 2}, levels
+
+def test_release(tmp_path, monkeypatch):
+  # release binds tt-kmd to a card that no driver has, through a fake sysfs. It leaves a driven card alone, and asks
+  # for tt-kmd when its driver isn't loaded.
+  bdf = "0000:01:00.0"
+  dev, kmd = tmp_path / "devices" / bdf, tmp_path / "drivers" / pci.DRIVER
+  dev.mkdir(parents=True)
+  monkeypatch.setattr(pci, "SYS", str(tmp_path))
+  monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
+  with pytest.raises(RuntimeError, match="modprobe"): pci.release(bdf)
+  kmd.mkdir(parents=True)
+  (kmd / "bind").write_text("")
+  assert pci.release(bdf) == pci.DRIVER and (kmd / "bind").read_text() == bdf
+  (kmd / "bind").write_text("")
+  (dev / "driver").symlink_to(kmd)
+  assert pci.release(bdf) == pci.DRIVER and (kmd / "bind").read_text() == ""
 
 def test_hello(chip):
   assert set(hello(chip, chip.tensix[0], chip.tensix[-1], 30).values()) == {832040}
