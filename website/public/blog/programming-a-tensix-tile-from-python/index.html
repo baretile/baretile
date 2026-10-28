@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Programming a Tensix tile from Python - baretile</title>
+<meta name="description" content="Build an addition kernel for Tenstorrent Blackhole with Python. Follow the data through unpack, math and pack, and run it on the simulator.">
+<link rel="canonical" href="https://baretile.com/blog/programming-a-tensix-tile-from-python/">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Programming a Tensix tile from Python">
+<meta property="og:description" content="Build an addition kernel for Tenstorrent Blackhole with Python, and run it on the simulator.">
+<meta property="og:url" content="https://baretile.com/blog/programming-a-tensix-tile-from-python/">
+<meta property="article:published_time" content="2026-10-28">
+<link rel="icon" type="image/svg+xml" href="/baretile.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="/">baretile</a>
+  <nav aria-label="Main navigation">
+    <a href="/blog/">Blog</a>
+    <a href="https://github.com/baretile/baretile">Source</a>
+  </nav>
+</header>
+
+<main id="main">
+<article>
+<header class="article-header">
+  <p class="meta"><time datetime="2026-10-28">28 October 2026</time></p>
+  <h1 class="page-title">Programming a Tensix tile from Python</h1>
+</header>
+
+<p>Adding two arrays is a small enough operation to follow all the way through an accelerator.</p>
+
+<p>We'll put two 32x32 arrays in a Tensix tile's local memory, build the programs that unpack, add, and pack their values,
+then read the answer back into Python. We'll see how Python constructs hardware instructions and how three
+programs coordinate to produce one result.</p>
+
+<p>We'll use <a href="https://github.com/baretile/baretile">Baretile</a>
+and Tenstorrent's ttsim simulator. You can run the example without a card. Baretile hasn't been tested on hardware yet,
+and simulator timings don't predict card performance.</p>
+
+<p>Python runs on the host. It builds instruction words and generates small C programs for the chip's RISC-V cores.
+Clang compiles those programs, and Baretile loads and launches them.</p>
+
+<h2 id="one-worker">One worker, three programs</h2>
+
+<p>A Tensix tile contains local memory, small RISC-V cores, and a coprocessor with units for moving and computing on data.
+For this example, we need the local memory, called L1, and three parts of the coprocessor: the unpackers, matrix unit,
+and packers. The matrix unit supports elementwise addition as well as matrix multiplication.
+<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/README.md">Tenstorrent's architecture reference</a>
+describes the full tile.</p>
+
+<p>Our data follows this path:</p>
+
+<figure class="diagram">
+  <div class="dataflow" role="img" aria-label="Unpack the L1 inputs into SrcA and SrcB, add them into Dst, then pack the result back into L1.">
+    <span class="stage" aria-hidden="true">L1 inputs</span>
+    <span class="operation" aria-hidden="true"><span>unpack</span></span>
+    <span class="stage" aria-hidden="true">SrcA<br>SrcB</span>
+    <span class="operation" aria-hidden="true"><span>add</span></span>
+    <span class="stage" aria-hidden="true">Dst</span>
+    <span class="operation" aria-hidden="true"><span>pack</span></span>
+    <span class="stage" aria-hidden="true">L1 result</span>
+  </div>
+  <figcaption>The path through our addition kernel.</figcaption>
+</figure>
+
+<p><code>SrcA</code> and <code>SrcB</code> hold the operands where the matrix unit can read them.
+<code>Dst</code> holds the result before it is packed back into L1.</p>
+
+<p>Baretile assigns three RISC-V cores to direct these operations:</p>
+
+<table>
+  <thead><tr><th scope="col">Core</th><th scope="col">Program</th></tr></thead>
+  <tbody>
+    <tr><td>TRISC0</td><td>Unpack the inputs into SrcA and SrcB</td></tr>
+    <tr><td>TRISC1</td><td>Add the operands and write Dst</td></tr>
+    <tr><td>TRISC2</td><td>Pack Dst back into L1</td></tr>
+  </tbody>
+</table>
+
+<p>These programs run concurrently. Their instructions must wait for the data and storage they need.</p>
+
+<h2 id="setup">Run the example</h2>
+
+<p>To follow along, you need Python 3.12 or later, clang with a RISC-V target, lld, and the Blackhole simulator library.
+Download <code>libttsim_bh.so</code> from the
+<a href="https://github.com/tenstorrent/ttsim/releases/tag/v1.11.5">ttsim v1.11.5 release</a>, then prepare a checkout:</p>
+
+<pre tabindex="0" aria-label="Shell commands"><code>git clone https://github.com/baretile/baretile
+cd baretile
+git checkout 6ddd68493551eaeea3079f8a1793b51f00d4814f
+export TTSIM=/absolute/path/to/libttsim_bh.so</code></pre>
+
+<p>Keep <code>TTSIM</code> set: it selects the simulator. Without it, Baretile tries to open a physical card.</p>
+
+<p>The Python blocks below, in order, form a complete script. Save them as <code>add.py</code> in the checkout,
+or <a href="add.py" download>download the complete script</a>.</p>
+
+<p>First, open the simulator, create a runtime, and select its first worker:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">import</span> struct
+
+<span class="k">from</span> baretile <span class="k">import</span> bh, pci
+<span class="k">from</span> baretile.chip <span class="k">import</span> Chip
+<span class="k">from</span> baretile.runtime <span class="k">import</span> Runtime, compile_kernel
+<span class="k">from</span> baretile.tensix <span class="k">import</span> (
+    MATH_END, from_bf16, kernel_config, math_begin,
+    math_program, pack, pack_program, slot_base,
+    to_bf16, tt, unpack, unpack_program,
+)
+
+chip = Chip(pci.open_device())
+rt = Runtime(chip)
+x, y = rt.cores[<span class="n">0</span>]
+
+a = [[float((r * <span class="n">32</span> + c) % <span class="n">7</span> - <span class="n">3</span>) <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>)]
+     <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>)]
+b = [[float((r + <span class="n">2</span> * c) % <span class="n">5</span> - <span class="n">2</span>) <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>)]
+     <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>)]</code></pre>
+
+<p>Both arrays contain small integers represented as floating-point values. We'll store them in bfloat16,
+a 16-bit floating-point format. These inputs and their sums are exactly representable,
+so we can check the answer with an exact comparison.</p>
+
+<h2 id="memory-layout">Put the inputs in memory</h2>
+
+<p>Before writing the inputs, we need to arrange them as Baretile expects.</p>
+
+<p>The word <em>tile</em> has two meanings here. A <strong>Tensix tile</strong> is the hardware unit running our programs.
+A <strong>tensor tile</strong> is a block of values. This example uses one Tensix tile to add two tensor tiles.</p>
+
+<p>Baretile stores each 32x32 tensor tile as four 16x16 <em>faces</em>:</p>
+
+<figure class="diagram">
+  <div class="faces" role="img" aria-label="A 32 by 32 tensor tile split into four 16 by 16 faces. Face 0 holds rows 0-15 and columns 0-15, face 1 rows 0-15 and columns 16-31, face 2 rows 16-31 and columns 0-15, and face 3 rows 16-31 and columns 16-31.">
+    <span class="face-cols" aria-hidden="true"><span>Columns<br>0-15</span><span>Columns<br>16-31</span></span>
+    <span class="face-rows" aria-hidden="true"><span>Rows<br>0-15</span><span>Rows<br>16-31</span></span>
+    <span class="face-tile" aria-hidden="true">
+      <span>Face 0<small>16x16</small></span>
+      <span>Face 1<small>16x16</small></span>
+      <span>Face 2<small>16x16</small></span>
+      <span>Face 3<small>16x16</small></span>
+    </span>
+    <span class="face-label" aria-hidden="true">32x32 tensor tile</span>
+  </div>
+  <figcaption>Each face holds 256 values.</figcaption>
+</figure>
+
+<p>Each face is stored row by row, with the four faces placed consecutively in memory.
+The first 256 values belong to face 0, the next 256 to face 1, and so on.</p>
+
+<p>This layout gives the math unit rows of 16 values to operate on. A complete tensor tile becomes 64 such rows.</p>
+
+<p>We can calculate an element's position and write its bfloat16 representation into L1:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">def</span> tile_index(r, c):
+    face = (r // <span class="n">16</span>) * <span class="n">2</span> + c // <span class="n">16</span>
+    <span class="k">return</span> face * <span class="n">256</span> + (r % <span class="n">16</span>) * <span class="n">16</span> + c % <span class="n">16</span>
+
+
+<span class="k">def</span> to_l1(slot, matrix):
+    words = [<span class="n">0</span>] * <span class="n">1024</span>
+    <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>):
+        <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>):
+            words[tile_index(r, c)] = to_bf16(matrix[r][c])
+    address = slot_base(<span class="s">"bf16"</span>) + slot * <span class="n">2048</span>
+    chip.write(x, y, address, struct.pack(<span class="s">"&lt;1024H"</span>, *words))
+
+
+to_l1(<span class="n">1</span>, a)
+to_l1(<span class="n">2</span>, b)</code></pre>
+
+<p>A bfloat16 tile occupies 2,048 bytes: 1,024 values at two bytes each. We put the inputs in slots 1 and 2
+and reserve slot 3 for the result. These slots are Baretile's convention for addressing tile-sized regions of L1.</p>
+
+<h2 id="instruction-encoding">Build an instruction</h2>
+
+<p>The inputs are now in memory. Next, we need instructions that operate on them.</p>
+
+<p>A Tensix instruction is a 32-bit word. In Baretile's encoding table, the opcode occupies the top byte,
+and named fields describe the remaining bits. An instruction encoder can therefore be a small Python function:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">def</span> ins(name, **fields):
+    opcode, layout = bh.TENSIX_OPS[name]
+    word = opcode &lt;&lt; <span class="n">24</span>
+    <span class="k">for</span> name, value <span class="k">in</span> fields.items():
+        first, width = layout[name]
+        <span class="k">assert</span> <span class="n">0</span> &lt;= value &lt; <span class="n">1</span> &lt;&lt; width
+        word |= value &lt;&lt; first
+    <span class="k">return</span> word
+
+
+add = ins(<span class="s">"ELWADD"</span>, dst=<span class="n">0</span>)
+print(hex(add))
+print(tt([add]))</code></pre>
+
+<p>This prints:</p>
+
+<pre tabindex="0" aria-label="Program output"><code>0x28000000
+asm volatile(".word 0xa0000000" ::: "memory");</code></pre>
+
+<p><code>ELWADD</code> is the elementwise addition instruction.
+Calling <code>ins</code> constructs its encoding as a Python integer.</p>
+
+<p>The second line shows how that instruction reaches the coprocessor. The RISC-V cores support a custom instruction
+encoding that pushes a Tensix instruction into their associated thread's queue. That encoding is the Tensix word
+rotated left by two bits. Baretile's <code>tt</code> function emits it through a <code>.word</code> directive inside C inline assembly.
+<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/BabyRISCV/PushTensixInstruction.md#ttinsn-instruction-set-extension">Tenstorrent documents this mechanism as <code>.ttinsn</code>.</a></p>
+
+<p>Clang compiles the surrounding C program. When a TRISC executes the embedded word,
+it submits the addition instruction to the coprocessor.</p>
+
+<h2 id="three-programs">Coordinate the three programs</h2>
+
+<p>One <code>ELWADD</code> handles an 8x16 block. Our tensor tile contains 64 rows of 16 values,
+so we need eight addition instructions to cover it.
+<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md">The instruction reference</a>
+describes the operation and its Blackhole encoding.</p>
+
+<p>Here are the instruction sequences for all three programs:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python">unpacks = unpack(<span class="n">1</span>, <span class="n">2</span>)
+
+adds = [ins(<span class="s">"SETRWC"</span>, bit_mask=<span class="n">0b1111</span>)]
+adds += [ins(<span class="s">"ELWADD"</span>, dst=<span class="n">0</span>) <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">7</span>)]
+adds += [ins(<span class="s">"ELWADD"</span>, dst=<span class="n">0</span>, clear_dvalid=<span class="n">3</span>)]
+
+maths = math_begin(<span class="k">False</span>) + adds + MATH_END
+packs = pack(<span class="s">"h"</span>, <span class="n">3</span>)</code></pre>
+
+<p><code>unpack(1, 2)</code> selects the two L1 slots and emits instructions to load them into SrcA and SrcB.
+The unpackers mark the source banks ready when the data is available.
+Addition waits for that handoff before reading the operands.</p>
+
+<p>The math sequence starts with <code>SETRWC</code>, which resets the row counters.
+Baretile configures the address mode to advance the source and destination counters by eight rows after each addition.
+Although each instruction says <code>dst=0</code>, that field is an offset added to the current destination counter.
+The instructions therefore write successive parts of the result.</p>
+
+<p>The final addition sets <code>clear_dvalid=3</code>, releasing both source banks so the unpackers can reuse them.</p>
+
+<p>The operations around <code>adds</code> manage the destination:</p>
+
+<ul>
+  <li><code>math_begin(False)</code> waits for available output space and selects the destination region.
+  <code>False</code> means it doesn't clear that region first; these additions overwrite their output.</li>
+  <li><code>MATH_END</code> waits for the math to finish, then posts a semaphore indicating that a result is ready.</li>
+  <li><code>pack("h", 3)</code> waits for that semaphore, writes the result to L1 slot 3 in bfloat16,
+  and releases the destination space.</li>
+</ul>
+
+<p>Here, <code>"h"</code> refers to a variable in the generated C programs.
+It selects the starting row in Dst and begins at zero.</p>
+
+<p>These waits connect three independently executing programs. Without the handoff from math to pack,
+for example, the packer could read Dst before the additions had finished.</p>
+
+<h2 id="compile-and-launch">Compile and launch</h2>
+
+<p>We can now wrap the instruction sequences in complete device programs:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python">kernel = compile_kernel(
+    <span class="k">None</span>,
+    unpack_program(tt(unpacks), kernel_config()),
+    math_program({}, tt(maths)),
+    pack_program(tt(packs)),
+)
+
+rt.launch(kernel, (), <span class="n">1</span>)
+rt.wait()</code></pre>
+
+<p>The program helpers supply the entry points, configuration, and initialization.
+<code>kernel_config()</code> selects the data formats and memory layout.
+The unpack program initializes the shared configuration and semaphores;
+the math and pack programs wait for that setup before running their bodies.</p>
+
+<p><code>compile_kernel</code> accepts programs for BRISC, TRISC0, TRISC1, and TRISC2, in that order.
+We pass <code>None</code> for the BRISC kernel because the host has already placed the inputs in L1.
+A larger tensor kernel would use BRISC to move data between DRAM and L1.</p>
+
+<p>The runtime compiles and loads the programs. The final argument to <code>launch</code> requests one unit of work,
+which runs on the first worker we selected earlier. <code>wait()</code> waits for the kernel to complete.</p>
+
+<h2 id="read-the-answer">Read the answer</h2>
+
+<p>At this point, the result is in L1 slot 3. Reading it back reverses the conversion we used for the inputs:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">def</span> from_l1(slot):
+    address = slot_base(<span class="s">"bf16"</span>) + slot * <span class="n">2048</span>
+    words = struct.unpack(<span class="s">"&lt;1024H"</span>, chip.read(x, y, address, <span class="n">2048</span>))
+    <span class="k">return</span> [
+        [from_bf16(words[tile_index(r, c)]) <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>)]
+        <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>)
+    ]
+
+
+got = from_l1(<span class="n">3</span>)
+expected = [[a[r][c] + b[r][c] <span class="k">for</span> c <span class="k">in</span> range(<span class="n">32</span>)]
+            <span class="k">for</span> r <span class="k">in</span> range(<span class="n">32</span>)]
+
+<span class="k">assert</span> got == expected
+print(<span class="s">"all 1024 sums match"</span>)</code></pre>
+
+<p>The comparison checks every element, including the boundaries between faces.
+Because we chose small, exactly representable values, a mismatch here cannot be explained by ordinary bfloat16 rounding.</p>
+
+<h2 id="tensor-api">Use the tensor API</h2>
+
+<p>Baretile's tensor API builds kernels using the same instruction helpers.
+We can ask it to perform the addition and compare its answer with our handwritten kernel:</p>
+
+<pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">from</span> baretile.tensor <span class="k">import</span> Tensor
+
+A = Tensor.of(rt, a)
+B = Tensor.of(rt, b)
+<span class="k">assert</span> (A + B).tolist() == got
+print(<span class="s">"Tensor result matches the handwritten kernel"</span>)</code></pre>
+
+<p>In this version, the tensor inputs live in device DRAM. The generated kernel also includes the BRISC program
+that brings them into L1 and writes the result back.
+Calling <code>tolist()</code> runs the computation and returns the values to Python.</p>
+
+<p>Run the complete script from the checkout:</p>
+
+<pre tabindex="0" aria-label="Shell command"><code>python3 add.py</code></pre>
+
+<p>It prints:</p>
+
+<pre tabindex="0" aria-label="Program output"><code>0x28000000
+asm volatile(".word 0xa0000000" ::: "memory");
+all 1024 sums match
+Tensor result matches the handwritten kernel</code></pre>
+
+<p>To continue,
+<a href="https://github.com/baretile/baretile/blob/6ddd68493551eaeea3079f8a1793b51f00d4814f/ramps/3_tensix.py">Baretile's Tensix tutorial</a>
+extends this example to multiplication, matrix multiplication, and an exponential applied to an addition's result.
+Each uses the same path through unpack, math, and pack, with a different instruction sequence doing the computation.</p>
+</article>
+</main>
+
+<footer class="blog-footer">
+  <a href="/blog/">All posts</a> | <a href="/">baretile</a>
+</footer>
+</body>
+</html>
