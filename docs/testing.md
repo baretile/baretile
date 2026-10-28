@@ -55,7 +55,8 @@ LLAMA=/path/to/SmolLM-135M python3 -m pytest -s test -k llama_model
 
 `LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` sets the
 number of random expressions in the kernel fuzz test. `TTSIM2=/path/to/libttsim.so`
-enables the two-chip test. Build that library with ttsim's `release_bh_x2` target.
+enables the two-chip test. ttsim's releases include that library as
+`libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2` target.
 
 `llama.accuracy` compares generated choices with Tenstorrent reference tokens.
 The command accepts a `.refpt` prompt file, a step count and a precision mode.
@@ -83,8 +84,16 @@ only check on a card.
 
 [test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds delayed requests and random
 pauses to ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim checkout
-and build the Blackhole library there. Run with delays enabled to check whether
-the kernels wait for their data:
+and build the Blackhole library there:
+
+```sh
+git clone --branch v1.11.5 https://github.com/tenstorrent/ttsim ttsim-chaos
+cd ttsim-chaos
+git apply /path/to/baretile/test/ttsim-chaos.patch
+./make.py src/_out/release_bh/libttsim.so
+```
+
+Run with delays enabled to check whether the kernels wait for their data:
 
 ```sh
 TTSIM=/path/to/ttsim-chaos/src/_out/release_bh/libttsim.so \
@@ -96,6 +105,11 @@ TTSIM=/path/to/ttsim-chaos/src/_out/release_bh/libttsim.so \
 range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
+
+CI builds ttsim-chaos this way for every push and pull request. It runs `test/test_kernels.py`
+with the four delay settings above and the run number as the seed, so each run
+tries other timings, and it runs the whole suite with `TTSIM_CHAOS_UNHARVESTED=1`.
+The log prints the seed, which repeats a failure.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on

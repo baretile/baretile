@@ -24,8 +24,9 @@ Blackhole library from [ttsim](https://github.com/tenstorrent/ttsim). ttsim's
 ./make.py src/_out/release_bh/libttsim.so
 ```
 
-We test with ttsim v1.11.5. CI uses its prebuilt `libttsim_bh.so`, and we also
-build it from source.
+We test with ttsim v1.11.5. CI uses its prebuilt `libttsim_bh.so` and
+`libttsim_bh_x2.so`, and builds [ttsim-chaos](https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos)
+from source.
 
 Clone baretile and run its first two commands:
 

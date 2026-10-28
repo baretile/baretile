@@ -1,5 +1,5 @@
-# Runs ruff and the test suite on ttsim for every push and pull request. Tests that need checkpoints, PyTorch,
-# transformers or tinygrad skip themselves here.
+# Runs ruff and the test suite on ttsim for every push and pull request, then the suite again on ttsim-chaos. Tests
+# that need checkpoints, PyTorch, transformers or tinygrad skip themselves here.
 name: test
 on: [push, pull_request]
 permissions:
@@ -40,10 +40,11 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
           python -m pip install numpy pytest ruff
+      # The one-chip library, and the two-chip one that test_two_chips copies a tensor between
       - name: Download ttsim
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh.so --dir "$RUNNER_TEMP/ttsim"
+        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh.so --pattern libttsim_bh_x2.so --dir "$RUNNER_TEMP/ttsim"
       # Compiled kernels are cached by their source, so a cache from an older commit only saves time.
       - uses: actions/cache@v4
         with:
@@ -54,3 +55,47 @@ jobs:
       - run: python -m pytest -s test
         env:
           TTSIM: ${{ runner.temp }}/ttsim/libttsim_bh.so
+          TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
+  # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
+  # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
+  # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. The other job runs the suite on all 140
+  # Tensix tiles, since a p150a reports 120 or 140 depending on its firmware.
+  chaos:
+    name: chaos (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: every setting
+            key: noise
+            tests: test/test_kernels.py
+            settings: TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40
+          - name: 140 tiles
+            key: unharvested
+            tests: test
+            settings: TTSIM_CHAOS_UNHARVESTED=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install clang, lld and the Python packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          python -m pip install numpy pytest
+      - name: Build ttsim-chaos
+        run: |
+          git clone --depth 1 --branch v1.11.5 https://github.com/tenstorrent/ttsim "$RUNNER_TEMP/ttsim-chaos"
+          cd "$RUNNER_TEMP/ttsim-chaos"
+          git apply "$GITHUB_WORKSPACE/test/ttsim-chaos.patch"
+          ./make.py src/_out/release_bh/libttsim.so
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/baretile
+          key: kernels-${{ matrix.key }}-${{ github.sha }}
+          restore-keys: kernels-
+      - run: env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} python -m pytest -s ${{ matrix.tests }}
+        env:
+          TTSIM: ${{ runner.temp }}/ttsim-chaos/src/_out/release_bh/libttsim.so
