@@ -73,6 +73,12 @@ def test_l1(chip):
   (x, y), d = next(iter(data.items()))
   at = chip.map(x, y, addr)
   assert chip.map(x, y, addr) == at and chip.pci.read(at, 64) == d[:64]
+  # Explicitly remapping the movable TLB must invalidate its cached target.
+  assert chip.read(x, y, addr, 64) == d[:64]
+  chip.map(*chip.tensix[-1], addr, tlb=0)
+  assert chip.read(x, y, addr, 64) == d[:64]
+  with pytest.raises(ValueError, match="TLB index"): chip.map(x, y, addr, tlb=-1)
+  with pytest.raises(ValueError, match="nonnegative"): chip.read(x, y, addr, -4)
 
 def test_dram(chip):
   addr, data = bh.TLB_WINDOW - 2048, [random.randbytes(4096) for _ in bh.DRAM]  # straddles two 2 MiB windows
@@ -100,6 +106,20 @@ def test_cache_prune(tmp_path, monkeypatch):
   runtime._prune.__wrapped__()
   assert not old.exists() and new.exists() and folder.exists()
 
+def test_compile_concurrent(tmp_path, monkeypatch):
+  # Both threads finish compiling before either publishes the same cache entry. Temporary files must not collide.
+  import concurrent.futures, threading
+  import baretile.runtime as runtime
+  monkeypatch.setattr(runtime, "CACHE", tmp_path)
+  barrier, replace = threading.Barrier(2, timeout=10), os.replace
+  def publish(src, dst):
+    barrier.wait()
+    return replace(src, dst)
+  monkeypatch.setattr(os, "replace", publish)
+  with concurrent.futures.ThreadPoolExecutor(2) as pool:
+    a, b = pool.map(runtime.compile_rv32, ["void kmain(volatile unsigned *a) { a[0] = 42; }"] * 2)
+  assert a == b and len(list(tmp_path.iterdir())) == 1 and next(tmp_path.iterdir()).read_bytes() == a
+
 def test_card_copies():
   # A card's BARs are read and written a word at a time, since libc's memcpy may go byte by byte on uncached memory. A
   # word is 8 bytes, or 4 where the address and length don't allow 8, and a byte where neither fits. This test runs on
@@ -117,6 +137,16 @@ def test_card_wants_root():
   if os.geteuid() == 0: pytest.skip("as root, Card would go on to open the device")
   with pytest.raises(PermissionError, match="root"): pci.Card("0000:00:00.0")
   with pytest.raises(PermissionError, match="root"): pci.reset("0000:00:00.0")
+
+def test_capability_chain():
+  card = object.__new__(pci.Card)
+  config = {0x34: 0x40, 0x40: 0x4801, 0x48: 0x10}
+  card.cfg_read = config.__getitem__
+  assert card.capability(0x10) == 0x48 and card.capability(0xFF) == 0
+  config[0x48] = 0x4002
+  with pytest.raises(RuntimeError, match="capability chain"): card.capability(0x10)
+  config[0x34] = 0x20
+  with pytest.raises(RuntimeError, match="capability chain"): card.capability(0x10)
 
 def test_card_sysfs(tmp_path, monkeypatch):
   # This runs pci.Card and reset against a fake sysfs, so no card is needed. Card unbinds the driver, enables the
@@ -246,6 +276,31 @@ def test_queue(chip):
   finally: chip.pci.write = write
   rt.wait()
   for x, y in rt.cores: assert chip.read32(x, y, DATA) == sum(range(100))
+
+def test_queue_blocks(chip):
+  # A block can fill the ring from any starting offset, or span several turns. Variable command lengths also
+  # leave a tail too short for the next command. Replay must execute every launch in order each time.
+  rt = Runtime(chip, end=chip.tensix[1], ring=256)
+  chip.write32(*rt.cores[0], DATA, 0)
+  add = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[2]; }")
+  rt.launch(add, (1,))
+  block = rt.block([(add, (i,) + (0,) * (20 if i % 2 else 0), 1, "add") for i in range(1, 10)])
+  for _ in range(3): rt.send(*block)
+  rt.wait()
+  assert rt.launches == 28 and chip.read32(*rt.cores[0], DATA) == 1 + 3 * sum(range(1, 10))
+
+def test_runtime_inputs(chip):
+  taken = chip.taken.copy()
+  for ring in (0, -64, 32, 192, 1 << 21):
+    with pytest.raises(ValueError, match="ring"): Runtime(chip, ring=ring)
+  with pytest.raises(ValueError, match="endpoints"): Runtime(chip, start=(0, 0))
+  assert chip.taken == taken, "reject invalid settings before stopping an existing runtime"
+  with pytest.raises(ValueError, match="four programs"): compile_kernel(*[None] * 5)
+  rt = Runtime(chip, end=chip.tensix[1], ring=64)
+  for units in (0, -1):
+    with pytest.raises(ValueError, match="unit"): rt.launch(bytes(16), units=units)
+  with pytest.raises(ValueError, match="command"): rt.launch(bytes(16), (0,) * 20)
+  assert not rt.loaded and not rt.launches
 
 def test_hung_kernel_times_out(chip):
   # A timeout reports unfinished workers, active cores, synchronization counters and outstanding NoC requests.

@@ -19,6 +19,10 @@ are ordered by row. Element `(r, c)` has this offset within a tile:
 Ordinary storage assigns tile `i` to bank `i % 8`. Tensor dimensions are padded
 to tiles. A dimension of one is repeated across its tile for broadcasting.
 Other padding is zeroed.
+Tensor dimensions must be positive integers. `Tensor.of` accepts rectangular
+matrices of the same shape, and `Tensor.frombytes` checks the byte count before
+allocating memory. Operations require operands from the same runtime; use
+`Tensor.to` to transfer data between chips.
 
 `Tensor.columns()` rearranges a matrix for use as the right operand of a
 matmul. Tile column `j` goes in bank `j % 8`, with consecutive tiles along the
@@ -56,6 +60,8 @@ Some slices and reshapes change only the view of a tensor: its batch, strides
 and offset. When data has to move, `move_kernel` copies it to the new layout.
 `gather` reads rows by index, and `put` writes them. The models use these for
 embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
+`assign` preserves the original source when source and destination views overlap
+with different layouts. It copies that source before writing the destination.
 
 Autograd walks the expression backwards and builds lazy operations for the
 gradients. `test_autograd` checks these against numerical differences.

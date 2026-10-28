@@ -1,5 +1,5 @@
 # Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
-import json, math, os, pathlib, random, re, subprocess, sys, pytest
+import json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
 import numpy as np
 from baretile import bh, tensix, tensor, viz
 from baretile.kernels import grid_parts
@@ -123,7 +123,7 @@ def test_viz_script(tmp_path):
 
 def test_jit(chip, monkeypatch):
   # tensor.jit records the second call of a function and replays its launches after that. Later calls copy their inputs
-  # in and send the same launches without building anything, so the copy is the only realize. The function is a block
+  # in and send the same launches without building anything or realizing another expression. The function is a block
   # of matmuls, a softmax and a layer norm. The DRAM that the recording took stays pinned for the replays.
   rt = Runtime(chip)
   rng = np.random.default_rng(7)
@@ -136,7 +136,99 @@ def test_jit(chip, monkeypatch):
     y = step(x)
     monkeypatch.setattr(Tensor, "realize", realize)
     assert y.tobytes() == f(x).tobytes(), call
-  assert len(realized) == 1 and rt.pinned, realized
+  assert not realized and rt.pinned, realized
+
+def test_jit_formats(chip):
+  # Copy replay inputs in their storage format. Adding zero cannot copy block floats and changes negative zero.
+  rt = Runtime(chip)
+  same = tensor.jit(lambda x: x)
+  for n in (1, 2, 3, 4):
+    raw = struct.pack("<2f", n, -0.0)
+    assert same(Tensor.frombytes(rt, 1, 2, raw, dtype="fp32")).tobytes() == raw
+  a = Tensor.full(rt, 32, 32, 1)
+  for dtype in ("bfp8", "bfp4"):
+    step = tensor.jit(lambda x: a @ x)
+    for n in (1, 2, 3, 4):
+      x = Tensor.full(rt, 32, 32, n).cast(dtype).realize()
+      assert step(x).tolist() == [[32 * n] * 32] * 32
+
+def test_tensor_inputs(chip):
+  # Reject malformed inputs before allocating DRAM. Ragged rows can have the right total byte count.
+  rt = Runtime(chip, end=chip.tensix[1])
+  used = dict(rt.used)
+  for data in ([], [[]], [[1, 2], [3], [4, 5, 6]], [[[1]], [[2], [3]]]):
+    with pytest.raises(ValueError, match="nonempty|rectangular"): Tensor.of(rt, data)
+  for rows, cols, batch in ((0, 1, 1), (1, -1, 1), (1, 1, 0)):
+    with pytest.raises(ValueError, match="positive"): Tensor(rt, rows, cols, batch=batch)
+  with pytest.raises(ValueError, match="dtype"): Tensor(rt, 1, 1, dtype="float64")
+  with pytest.raises(ValueError, match="bytes"): Tensor.frombytes(rt, 1, 2, bytes(2))
+  assert rt.used == used
+  x = Tensor.of(rt, [[[1, 2]], [[3, 4]]], "fp32")
+  assert x[-1].tolist() == [[3, 4]]
+  for index in (-3, 2):
+    with pytest.raises(IndexError, match="batch"): x[index]
+  for shape in ((), (1, 1, 2, 2)):
+    with pytest.raises(ValueError, match="dimensions"): x.reshape(*shape)
+    with pytest.raises(ValueError, match="dimensions"): x.expand(*shape)
+  for axis in (-4, 3):
+    with pytest.raises(ValueError, match="axis"): x.sum(axis)
+    with pytest.raises(ValueError, match="axis"): x.cat(x, axis=axis)
+  for k, parts in ((0, 1), (-1, 1), (1, 0)):
+    with pytest.raises(ValueError, match="positive"): x.topk(k, parts)
+  for op in (lambda: x.sum(1.5), lambda: x.cat(x, axis=1.5), lambda: x.split(1.5), lambda: x.topk(1.5)):
+    with pytest.raises(TypeError): op()
+
+def test_bf16_special_values(chip):
+  # Host conversion must keep NaNs as NaNs, including payloads that would round to infinity or overflow 16 bits.
+  bits = [0, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7FFFFFFF, 0xFFFFFFFF, 0x7F800001, 0x3F808000, 0x3F818000]
+  floats = struct.unpack(f"<{len(bits)}f", struct.pack(f"<{len(bits)}I", *bits))
+  want = [0, 0x8000, 0x7F80, 0xFF80, 0x7FC0, 0x7FFF, 0xFFFF, 0x7FC0, 0x3F80, 0x3F82]
+  assert list(map(tensix.to_bf16, floats)) == want
+  rt = Runtime(chip, end=chip.tensix[1])
+  assert Tensor.of(rt, [floats]).tobytes() == struct.pack(f"<{len(want)}H", *want)
+
+def test_jit_inputs_and_retry(chip):
+  rt = Runtime(chip, end=chip.tensix[1])
+  x, y = Tensor.full(rt, 1, 1, 2), Tensor.full(rt, 1, 1, 3)
+  calls = []
+  def add(x, y):
+    calls.append(None)
+    if len(calls) == 2:
+      (x + y).realize()  # an abandoned intermediate must not stay pinned after the failed recording
+      raise ValueError("recording failed")
+    return x + y
+  step = tensor.jit(add)
+  assert step(x, y).tolist() == [[5]]
+  with pytest.raises(ValueError, match="recording failed"): step(x, y)
+  rt.wait()
+  assert rt.log is None and not rt.pinned and not rt.pinned_freed and len(rt.used) == 2
+  assert step(x, y).tolist() == [[5]]  # retry records, and the following call replays
+  assert step(x, y).tolist() == [[5]] and len(calls) == 3
+  for xs in ((), (x,), (x, y, x)):
+    with pytest.raises(ValueError, match="inputs"): step(*xs)
+  # An overlapping runtime owns different allocations even when its addresses happen to match.
+  other = Runtime(chip, end=chip.tensix[1])
+  z = Tensor.full(other, 1, 1, 7)
+  with pytest.raises(ValueError, match="runtime"): step(z, z)
+  with pytest.raises(ValueError, match="runtime"): x + z
+  with pytest.raises(ValueError, match="runtime"): x.assign(z)
+  with pytest.raises(ValueError, match="runtime"): x.gather(z.cast("int32"))
+  with pytest.raises(ValueError, match="runtime"): x.put(x.cast("int32"), z)
+  with pytest.raises(ValueError, match="runtime"): (x + 1).realize(z)
+  with pytest.raises(ValueError, match="runtime"): x.attend(z, z, z)
+  with pytest.raises(ValueError, match="runtime"): x.topk(1, labels=z.cast("int32"))
+  with pytest.raises(ValueError, match="runtime"): x.cat(z)
+
+def test_gradient_targets(chip):
+  rt = Runtime(chip, end=chip.tensix[1])
+  x = Tensor.of(rt, [[2, 3]], "fp32").requires_grad_()
+  middle = x * x
+  loss = (middle * 3).sum()
+  gx, gm, gl = loss.gradient(x, middle, loss)
+  assert gx.tolist() == [[12, 18]] and gm.tolist() == [[3, 3]] and gl.tolist() == [[1]]
+  x.sum().backward()
+  (x > 0).sum().backward()  # a nondifferentiable path leaves an existing gradient alone
+  assert x.grad.tolist() == [[1, 1]]
 
 def test_dram_is_freed(chip):
   # DRAM is allocated first fit, 64-byte aligned, and a freed block merges with the holes on both sides. A tensor gives
@@ -256,6 +348,8 @@ def test_matmul_fidelity(chip):
   # from two. On random values, three phases stay within bf16 rounding of four, and two within that plus 2^-7.
   rt = Runtime(chip)
   x, eye = Tensor.full(rt, 64, 64, 1 + 2**-7), Tensor.of(rt, np.eye(64).tolist())
+  for phases in (0, -1, 5):
+    with pytest.raises(ValueError, match="fidelity"): x.matmul(eye, fidelity=phases)
   for phases in (4, 3, 2, 1):
     assert x.matmul(eye, fidelity=phases).tolist()[0][0] == (1 + 2**-7 if phases >= 3 else 1.0), phases
     assert eye.matmul(x, fidelity=phases).tolist()[0][0] == (1 + 2**-7 if phases >= 2 else 1.0), phases
@@ -544,6 +638,25 @@ def test_assign(chip):
   step = tensor.jit(lambda x: w.assign(w + x))
   for _ in range(4): step(Tensor.of(rt, np.ones((64, 96)).tolist()))
   assert np.allclose(value(w), fresh + 4, rtol=1e-2, atol=0.05), "four updates, two of them replayed"
+
+def test_assign_overlapping_views(chip):
+  # A copy must read the original source even if a different tile of the destination aliases it. Cover both
+  # directions, raw copies and fused expressions, on one worker and across the grid.
+  a = np.arange(64 * 640, dtype=np.float32).reshape(64, 640)
+  for end in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, end=end)
+    for left, right in ((slice(32, None), slice(None, -32)), (slice(None, -32), slice(32, None))):
+      for add in (False, True):
+        x = Tensor.of(rt, a.tolist(), "fp32")
+        source, want = x[:, right], a.copy()
+        x[:, left].assign(source + 1 if add else source)
+        want[:, left] = a[:, right] + int(add)
+        assert np.array_equal(value(x)[0], want), (end, left, add)
+    x = Tensor.of(rt, a.tolist()).cast("bfp8").realize()
+    want = value(x)[0]
+    x[:, 32:].assign(x[:, :-32])
+    want[:, 32:] = want[:, :-32].copy()
+    assert np.array_equal(value(x)[0], want), "overlapping block floats copy without elementwise arithmetic"
 
 def test_matmul_fusion(chip):
   # Matmuls inside elementwise trees run as one kernel: the matmul's result tile is packed into L1 and read from there.

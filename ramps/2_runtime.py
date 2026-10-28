@@ -119,6 +119,7 @@ print("8. squared m's tiles with our own kernel")
 rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"), units=1, name="hang")
 try: rt.wait(timeout=0.5)
 except TimeoutError as e: report = str(e)
+else: raise AssertionError("the deliberately hung kernel should have timed out")
 assert "still running on" in report and "not finished by BRISC" in report
 launches, rt = rt.launches, Runtime(chip)
 rt.launch(compile_kernel(ME))

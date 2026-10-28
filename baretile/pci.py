@@ -1,6 +1,6 @@
 # PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
 # BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, gc, mmap, os, time
+import array, ctypes, gc, mmap, os, pathlib, time
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
@@ -71,30 +71,35 @@ class Card:
   def __init__(self, bdf):
     if os.geteuid() != 0: raise PermissionError("Card needs root for config space, the BARs, and physical addresses for DMA")
     self.sys = f"{SYS}/devices/{bdf}"
-    if os.path.exists(f"{self.sys}/iommu_group/type") and (kind := open(f"{self.sys}/iommu_group/type").read().strip()) != "identity":
+    if os.path.exists(f"{self.sys}/iommu_group/type") and (kind := pathlib.Path(self.sys, "iommu_group/type").read_text().strip()) != "identity":
       raise RuntimeError(f"the IOMMU translates DMA from {bdf} ({kind}), but Card gives the card physical addresses. Boot with iommu=pt")
     if os.path.exists(f"{self.sys}/driver"): _write(f"{self.sys}/driver/unbind", bdf)
     _write(f"{self.sys}/enable", "1")
-    self.cfg = os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC)
+    self.cfg = os.fdopen(os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0)
     self.cfg_write(0x04, self.cfg_read(0x04) | 0x6)  # memory decode, and bus mastering so the device can reach host memory
     # Set Max Read Request Size in the PCI Express capability to 4 KiB, so the device reads host memory in requests of
     # up to 4 KiB. kmd sets it up the same way.
     if at := self.capability(0x10):
-      os.pwrite(self.cfg, (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)
+      os.pwrite(self.cfg.fileno(), (self.cfg_read(at + 8) & 0x8FFF | 5 << 12).to_bytes(2, "little"), at + 8)
     # Map only BAR0, which has the TLB windows and registers that baretile uses. BAR4 may not be all there.
     fd = os.open(f"{self.sys}/resource0", os.O_RDWR | os.O_SYNC)
-    self.map = mmap.mmap(fd, os.fstat(fd).st_size)
+    try: self.map = mmap.mmap(fd, os.fstat(fd).st_size)
+    finally: os.close(fd)
     self.bar0 = ctypes.addressof(ctypes.c_char.from_buffer(self.map))
-    os.close(fd)
     # Zero the strided multicast words of TLBs 0-31, as kmd leaves them, so a multicast skips no tiles of its rectangle.
     # An earlier user may have set them.
     for i in range(32): self.write(bh.TLB_STRIDED + 4 * i, bytes(4))
-  def cfg_read(self, off): return int.from_bytes(os.pread(self.cfg, 4, off), "little")
-  def cfg_write(self, off, val): os.pwrite(self.cfg, val.to_bytes(4, "little"), off)
+  def cfg_read(self, off): return int.from_bytes(os.pread(self.cfg.fileno(), 4, off), "little")
+  def cfg_write(self, off, val): os.pwrite(self.cfg.fileno(), val.to_bytes(4, "little"), off)
   def capability(self, cap):  # the offset of a PCI capability in config space, or 0
-    at = self.cfg_read(0x34) & 0xFC
-    while at and self.cfg_read(at) & 0xFF != cap: at = self.cfg_read(at) >> 8 & 0xFC
-    return at
+    at, seen = self.cfg_read(0x34) & 0xFC, set()
+    while at:
+      if at < 0x40 or at in seen: raise RuntimeError(f"invalid PCI capability chain at {at:#x}")
+      seen.add(at)
+      word = self.cfg_read(at)
+      if word & 0xFF == cap: return at
+      at = word >> 8 & 0xFC
+    return 0
 
   def read(self, off, n): return _load(self.bar0 + off, n)
   def write(self, off, data): _store(self.bar0 + off, data)
@@ -140,7 +145,7 @@ def _write(path, s):
 
 def find_cards():
   """List the Blackholes on the PCI bus by their sysfs names (domain:bus:device.function)."""
-  ids = lambda bdf: [int(open(f"{SYS}/devices/{bdf}/{f}").read(), 16) for f in ("vendor", "device")]
+  ids = lambda bdf: [int(pathlib.Path(SYS, "devices", bdf, f).read_text(), 16) for f in ("vendor", "device")]
   if cards := [bdf for bdf in sorted(os.listdir(f"{SYS}/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]: return cards
   raise RuntimeError("no Blackhole on the PCI bus. Set TTSIM=/path/to/libttsim.so to use the simulator")
 
@@ -159,11 +164,10 @@ def reset(bdf, timeout=10.0):
   docs/bring-up.md."""
   if os.geteuid() != 0: raise PermissionError("reset needs root to write the card's config space and sysfs")
   path, deadline, gone = f"{SYS}/devices/{bdf}", time.monotonic() + timeout, False
-  fd = os.open(f"{path}/config", os.O_RDWR | os.O_SYNC)
-  command = int.from_bytes(os.pread(fd, 2, 0x04), "little")
-  os.pwrite(fd, (command | bh.RESET_MARKER).to_bytes(2, "little"), 0x04)
-  for off, val in bh.RESET_TIMER: os.pwrite(fd, val.to_bytes(4, "little"), off)
-  os.close(fd)
+  with os.fdopen(os.open(f"{path}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0) as cfg:
+    command = int.from_bytes(os.pread(cfg.fileno(), 2, 0x04), "little")
+    os.pwrite(cfg.fileno(), (command | bh.RESET_MARKER).to_bytes(2, "little"), 0x04)
+    for off, val in bh.RESET_TIMER: os.pwrite(cfg.fileno(), val.to_bytes(4, "little"), off)
   def back():  # whether the reset is over
     nonlocal gone
     if not os.path.exists(path): gone = True; return False
