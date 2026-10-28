@@ -225,6 +225,9 @@ class Weight:
   def __init__(self, bits): self.bits = bits
   def values(self): return gpt2.bf16_floats(self.bits())
 
+def rope_weights(c, n):  # rotary's cos, sin and turn for n positions, as weights to upload
+  return {name: Weight(lambda a=a: gpt2.bf16_bits(a)) for name, a in zip(("cos", "sin", "turn"), rotary(c, n))}
+
 def fuse(w, c):
   """Rearrange each block's weights for fewer, wider matmuls.
 
@@ -434,7 +437,7 @@ def load(folder, places=4096):
   c.mtp = len({k.split(".")[1] for k in out if k.startswith("layers.") and int(k.split(".")[1]) >= c.layers})  # the multi-token prediction blocks
   out["embed"] = out.pop("embed_tokens")
   out["embed.T"] = out.pop("lm_head", None) or Weight(lambda e=out["embed"]: np.ascontiguousarray(e.bits().T))  # tied, or its own
-  for name, a in zip(("cos", "sin", "turn"), rotary(c, c.places)): out[name] = Weight(lambda a=a: gpt2.bf16_bits(a))
+  out |= rope_weights(c, c.places)
   return c, fuse(out, c)
 
 def weight_format(name, prec):
