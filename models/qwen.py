@@ -1,7 +1,8 @@
 # Extensions to the Llama model in llama.py: mixtures of experts, Gated DeltaNet and multi-token
 # prediction. The model operations run with baretile tensors or NumPy arrays. Kernels used only by
-# these models live here: delta updates recurrent state, group sorts prompt tokens by expert, and
-# touched lists the experts selected during decode. gpt-oss weights are converted from MXFP4.
+# these models live here: delta updates recurrent state, group sorts a long prompt's tokens by expert,
+# and touched lists the experts that a decode step's or a short prompt's tokens selected. gpt-oss
+# weights are converted from MXFP4.
 import numpy as np
 from baretile import bh
 from baretile.runtime import DATA, ZEROS, compile_kernel
@@ -197,7 +198,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   sources = 7 + m  # the rows of the conv that a unit reads: the 3 last inputs, one for each token, and the 4 taps
   STAGE = slot_base("fp32") + (OUT + 2) * 4096  # BRISC stages the q and k runs of each source here, then a 64-byte block per scalar
   scalars = 2 + 2 * rep + 2 * m * rep  # live and accept, dt and decay, and b and a for each token
-  assert STAGE + sources * 256 * kt + 64 * scalars <= OUTS and OUT + 2 <= UNPACKABLE, "the tiles of a unit don't fit in L1"
+  if STAGE + sources * 256 * kt + 64 * scalars > OUTS or OUT + 2 > UNPACKABLE: raise ValueError("delta_kernel: a unit's tiles don't fit in L1")
   # Dst rows, 64 to a tile in fp32. R2 and R3 take fills, R4 and R5 the two sums (or a norm, or decay), R6 takes e^g,
   # and R7 takes d or x set aside.
   R2, R3, R4, R5, R6, R7 = 128, 192, 256, 320, 384, 448
@@ -442,9 +443,12 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
   kh = (width - vh * vd) // 2 // kd
   ins = (x, conv, taps, dt, decay, *((first, accept, conv2) if first is not None else ()))
   live = live if live is not None else S.number(1.0, "bf16").expand(1, n * m, 1).realize()
-  assert all(t.dtype == "fp32" for t in (S, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0
-  assert x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)
-  assert dt.shape == decay.shape == (1, 1, vh) and live.shape == (1, n * m, 1) and live.dtype == "bf16"
+  if not (all(t.dtype == "fp32" for t in (S, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0):
+    raise ValueError("delta needs fp32 states and inputs, a token or a token and its draft (with first), and value heads in groups of key heads")
+  if not (x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)):
+    raise ValueError(f"delta needs a row of q, k, v, z, b and a for each token, 3 conv inputs and 4 taps: {x.shape} {conv.shape} {taps.shape}")
+  if not (dt.shape == decay.shape == (1, 1, vh) and live.shape == (1, n * m, 1) and live.dtype == "bf16"):
+    raise ValueError(f"delta needs dt and decay as a row of {vh}, and live as a bf16 column of {n * m}: {dt.shape} {decay.shape} {live.shape}")
   o = Tensor.frombytes(S.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # zeroed, because no unit writes its padding rows
   key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
   return o.run(key, lambda: delta_kernel(*key[1:]), S, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()),
@@ -525,7 +529,7 @@ def group_kernel(rows, k, n):
   t, rp = group_slots(rows, k, n)
   fills = DATA + -(-rows // 32) * 4096  # after the choices: the count of each value, then its next slot
   out = (fills + 4 * (n + 33 * t + k * rp) + 63) // 64 * 64
-  assert out + 4096 <= OUTS, "the choices and their arrays don't fit in L1"
+  if out + 4096 > OUTS: raise ValueError("group_kernel: the choices and their arrays don't fit in L1")
   return compile_kernel(f"""
 #define IDS {DATA:#x}
 #define FILL {fills:#x}
@@ -576,7 +580,8 @@ def group(ids, n):
   padding. Expert groups start on tile boundaries. tiles is a column of t expert IDs, with n for unused
   tiles. places has k runs, one slot index per token per choice, with each run padded to a tile. Indexed
   matmul uses tiles to select the expert weights."""
-  assert ids.dtype == "int32" and ids.batch == 1 and ids.cols <= 32, "ids must be a matrix of int32 choices, at most 32 to a row"
+  if not (ids.dtype == "int32" and ids.batch == 1 and ids.cols <= 32):
+    raise ValueError("group needs ids as a matrix of int32 choices, at most 32 to a row")
   x, rows, k = ids.realize(), ids.rows, ids.cols  # a matrix, so there's no repeat to copy
   t, rp = group_slots(rows, k, n)
   order, tiles, places = Tensor(ids.rt, 1, 32 * t, dtype="int32"), Tensor(ids.rt, t, 1, dtype="int32"), Tensor(ids.rt, 1, k * rp, dtype="int32")
@@ -657,7 +662,8 @@ def touched(ids, n, weights):
 
   Indexed matmul then runs each selected expert over the token rows. Padding entries select no
   matrix and return zeros. Weight the results and sum across experts."""
-  assert ids.dtype == "int32" and weights.dtype == "bf16" and ids.shape == weights.shape and ids.batch == 1 and ids.cols <= 32
+  if not (ids.dtype == "int32" and weights.dtype == "bf16" and ids.shape == weights.shape and ids.batch == 1 and ids.cols <= 32):
+    raise ValueError(f"touched needs int32 ids and bf16 weights of one shape, at most 32 choices to a row: {ids.shape} {weights.shape}")
   x, w, rows, k = ids.realize(), weights.realize(), ids.rows, ids.cols  # matrices, so there are no repeats to copy
   slots = min(rows * k, n)
   experts, out = Tensor(ids.rt, slots, 1, dtype="int32"), Tensor(ids.rt, rows, 1, batch=slots)
