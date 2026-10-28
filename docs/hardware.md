@@ -25,7 +25,8 @@ the ISA, see the simulator's `pcie.cpp` and kmd.
 
 `pci.Card` maps BAR0 through sysfs. It unbinds an existing kernel driver, enables
 memory access and bus mastering, and sets the maximum read request size to
-4 KiB. It copies registers a word at a time. Using `memcpy` could split a register
+4 KiB. `pci.release` binds tt-kmd's `tenstorrent` driver again afterwards, and
+`pci.preflight` checks what `Card` needs without opening the card. It copies registers a word at a time. Using `memcpy` could split a register
 access into separate byte transactions. TLB 201 is reserved for tt-kmd.
 
 A TLB maps a BAR window to a tile and address on the NoC. The configuration

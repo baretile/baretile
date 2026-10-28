@@ -81,7 +81,7 @@ needs explaining.
 Open an [issue](https://github.com/baretile/baretile/issues) with:
 
 - whether you ran on ttsim (and which version) or a card, and for a card, the
-  output of `python3 -m baretile.chip`
+  output of `python3 -m baretile.chip check` and `python3 -m baretile.chip`
 - the command you ran and its full output, including the `TimeoutError` report
   if a launch hung
 - your Python and clang versions
