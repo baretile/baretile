@@ -1,11 +1,11 @@
 # Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
 import json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
 import numpy as np
-from baretile import bh, tensix, tensor, viz
+from baretile import bh, pci, tensix, tensor, viz
 from baretile.kernels import grid_parts
 from baretile.tensor import Tensor
 from baretile.runtime import TIMES, Runtime, compile_kernel
-from conftest import bf16, value
+from conftest import bf16, hold, value
 
 def kernels(rt, since):  # counts launches after launch `since`, leaving out the transfers of tobytes and frombytes
   return sum(rt.sent[n % TIMES][0] not in ("readback", "upload") for n in range(since + 1, rt.launches + 1))
@@ -58,17 +58,20 @@ def test_bench(chip):
 
 def test_profile(chip):
   # Launches write their start and last report times to host memory, on the dispatcher's clock, and Runtime.profile
-  # sums them by name. Three kernels queued back to back four times should take about the time the host saw. The rest
-  # is the gaps between launches.
+  # sums them by name. Three kernels queued back to back four times take no longer than the host saw. On ttsim the
+  # host's clock is the chip's, and they take most of it; the rest is the gaps between launches. On a card the host's
+  # clock is its own, and Python's time between launches counts too.
   rt = Runtime(chip)
   x, y = (Tensor.of(rt, [[float((r + c * k) % 7) for c in range(256)] for r in range(256)]) for k in (1, 2))
   run = lambda: ((x + y).realize(), (x @ y).realize(), x.softmax().realize())
   run(), rt.wait()  # compile them first
   since, start = rt.launches, chip.pci.now()
   for _ in range(4): run()
-  rows, elapsed = rt.profile(since), (chip.pci.now() - start) * bh.AICLK
+  sim = isinstance(chip.pci, pci.Sim)
+  rows, elapsed = rt.profile(since), (chip.pci.now() - start) * (bh.AICLK if sim else chip.aiclk * 1e6)
   assert sorted((name, n) for name, n, *_ in rows) == [("add", 4), ("matmul", 4), ("max2 sub exp sum2 recip mul", 4)], rows
-  assert all(cycles > 0 for _, _, cycles, _ in rows) and 0.5 * elapsed < sum(cycles for _, _, cycles, _ in rows) <= elapsed
+  cycles = sum(c for _, _, c, _ in rows)
+  assert all(c > 0 for _, _, c, _ in rows) and cycles <= elapsed and (0.5 * elapsed < cycles or not sim), (cycles, elapsed)
 
 def test_bytes(chip):
   # On a card or ttsim-chaos, where the NIUs count read data, Runtime.profile has the bytes that each launch read, in
@@ -291,11 +294,14 @@ def test_dram_is_freed(chip):
   assert len(rt.used) == 2, "x and the last y"
   del x, y
   assert rt.holes == [(0, bh.DRAM_BANK_SIZE)] and not rt.used
-  # Launches are queued. DRAM freed while a queued launch may still read it isn't reused until that launch is done.
+  # Launches are queued. DRAM freed while a queued launch may still read it isn't reused until that launch is done. A
+  # launch that waits for the host keeps the multiply queued.
   x = Tensor.of(rt, [[float(r - c) for c in range(64)] for r in range(64)])
-  y, at = (x * 3.0).realize(), x.addr  # queued. On ttsim nothing runs until the host waits
+  go = hold(rt)
+  y, at = (x * 3.0).realize(), x.addr
   del x
   z = Tensor.of(rt, [[1.0] * 64] * 64)
+  go()
   assert z.addr != at and y.tolist()[1][0] == 3.0
 
 def test_tile_math(chip):
@@ -365,13 +371,16 @@ def test_matmul_blocks(chip):
   # On one worker, result tiles go in blocks of up to 4 x 4, with the block's rows of A and column of B kept in L1. On
   # the full grid, each worker takes a block. 5 x 6 tiles leaves partial blocks at the edges either way. Their missing
   # tiles must not be computed, or they'd land past the result in DRAM, on the tensor allocated after it. That tensor
-  # is the canary, written before the queued kernel runs.
+  # is the canary, written while a launch that waits for the host keeps the matmul queued.
   a = [[float((r * 7 + c * 3) % 5 - 2) for c in range(96)] for r in range(160)]
   b = [[float((r + 2 * c) % 3 - 1) for c in range(192)] for r in range(96)]
   for workers in (chip.tensix[1], chip.tensix[-1]):
     rt = Runtime(chip, end=workers)
-    y = (Tensor.of(rt, a) @ Tensor.of(rt, b)).realize()  # queued
+    ta, tb = Tensor.of(rt, a), Tensor.of(rt, b)
+    go = hold(rt)
+    y = (ta @ tb).realize()
     canary = Tensor.of(rt, [[1.0] * 192] * 160)
+    go()
     assert y.tolist() == [[sum(a[i][k] * b[k][j] for k in range(96)) for j in range(192)] for i in range(160)]
     assert canary.tolist() == [[1.0] * 192] * 160
   # Next, a row of result tiles and a long K, like a token's MLP. K is cut into 8 parts on 8 times the workers, then
