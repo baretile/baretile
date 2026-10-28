@@ -302,6 +302,7 @@ def test_displaced_runtime_rejects_work(chip):
   b.close()
 
 def test_runtime_finalizer_keeps_dma_until_halt(chip, monkeypatch):
+  if not isinstance(chip.pci, pci.Sim): pytest.skip("mock DMA addresses cannot run on a physical card")
   # A Card-like allocator owns no references to its mmap. No simulator tick is needed: the queued command is
   # deliberately unfinished when the runtime and its reference cycle are collected.
   pages, halted, halt = [], [], chip.halt
@@ -325,6 +326,25 @@ def test_runtime_finalizer_keeps_dma_until_halt(chip, monkeypatch):
   gc.collect()
   assert ref() is None and pages[0]() is None and halted == [True]
   assert all(chip.read32(*xy, bh.SOFT_RESET) == bh.ALL_CORES for xy in cores)
+
+@pytest.mark.parametrize("kind,tag", [("OUTSTANDING", 1), ("OUTSTANDING", 15), ("OUTGOING", 3), ("CMD", 2)])
+def test_runtime_close_drains_all_transactions(chip, monkeypatch, kind, tag):
+  rt = Runtime(chip, end=chip.tensix[1])
+  addr, page = rt.dram_alloc(64), weakref.ref(rt.status.obj)
+  read, pending, polls = chip.read32, 2, 0
+  watched = bh.NIU + bh.NIU_REGS[kind] + tag * (bh.NIU_REGS["INITIATOR"] if kind == "CMD" else 4)
+  def delayed(x, y, at):
+    nonlocal pending, polls
+    if (x, y, at) == (*rt.cores[0], watched):
+      polls += 1
+      if pending:
+        pending -= 1
+        assert page() is not None and rt.used == {addr: 64}, "DMA and DRAM must survive an unfinished transaction"
+        return 1
+    return read(x, y, at)
+  monkeypatch.setattr(chip, "read32", delayed)
+  rt.close()
+  assert polls >= 3 and page() is None and not rt.used
 
 def test_runtime_startup_and_shutdown_failures(chip, monkeypatch):
   # Failed startup releases the new DMA page. Failed shutdown keeps its page and allocations until a retry.
