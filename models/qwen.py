@@ -437,18 +437,28 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
 
   q, k and v are the SiLU of the conv. q and k go to length 1, and q is scaled by kd^-1/2. beta = sigmoid(b) and
   g = decay softplus(a + dt). Everything but live is fp32. Returns the outputs in fp32, as (value heads, the tokens of
-  each sequence in turn, vd). There's no gradient."""
+  each sequence in turn, vd). Head dimensions must be multiples of 32. There's no gradient."""
   n, kd, vd, width = conv.rows, S.rows, S.cols, conv.cols
+  if kd % 32 or vd % 32: raise ValueError("delta needs key and value head dimensions divisible by 32")
+  if x.rows % n or S.batch % n: raise ValueError("delta needs the same number of sequences in inputs and states")
   m, vh = x.rows // n, S.batch // n
-  kh = (width - vh * vd) // 2 // kd
-  ins = (x, conv, taps, dt, decay, *((first, accept, conv2) if first is not None else ()))
-  live = live if live is not None else S.number(1.0, "bf16").expand(1, n * m, 1).realize()
-  if not (all(t.dtype == "fp32" for t in (S, *ins)) and m in (1, 2) and (first is not None) == (m == 2) and vh % kh == 0):
-    raise ValueError("delta needs fp32 states and inputs, a token or a token and its draft (with first), and value heads in groups of key heads")
+  kh, extra = divmod(width - vh * vd, 2 * kd)
+  if extra or kh < 1 or vh % kh: raise ValueError("delta needs complete q/k/v projections and value heads in groups of key heads")
+  aux = (first, accept, conv2)
+  if m not in (1, 2) or any(t is not None for t in aux) != (m == 2) or m == 2 and any(t is None for t in aux):
+    raise ValueError("delta needs one token, or two tokens with first, accept and conv2 together")
+  ins = (S, x, conv, taps, dt, decay, *(aux if m == 2 else ()))
+  if not all(t.dtype == "fp32" for t in ins): raise ValueError("delta needs fp32 states and inputs")
+  if any(t.rt is not S.rt for t in (*ins, *((live,) if live is not None else ()))):
+    raise ValueError("delta needs states and inputs on the same runtime")
   if not (x.shape == (1, n * m, width + vh * vd + 2 * vh) and conv.batch == 3 and taps.shape == (4, 1, width)):
     raise ValueError(f"delta needs a row of q, k, v, z, b and a for each token, 3 conv inputs and 4 taps: {x.shape} {conv.shape} {taps.shape}")
-  if not (dt.shape == decay.shape == (1, 1, vh) and live.shape == (1, n * m, 1) and live.dtype == "bf16"):
-    raise ValueError(f"delta needs dt and decay as a row of {vh}, and live as a bf16 column of {n * m}: {dt.shape} {decay.shape} {live.shape}")
+  if dt.shape != (1, 1, vh) or decay.shape != dt.shape: raise ValueError(f"delta needs dt and decay as a row of {vh}")
+  if live is not None and (live.shape != (1, n * m, 1) or live.dtype != "bf16"):
+    raise ValueError(f"delta needs live as a bf16 column of {n * m}")
+  if m == 2 and not (first.shape == S.shape and conv2.shape == conv.shape and accept.shape == (1, 1, n)):
+    raise ValueError("delta needs first like S, conv2 like conv, and accept as a row of sequences")
+  live = live if live is not None else S.number(1.0, "bf16").expand(1, n * m, 1).realize()
   o = Tensor.frombytes(S.rt, n * m, vd, bytes(4 * vh * n * m * vd), vh, "fp32")  # zeroed, because no unit writes its padding rows
   key = ("delta", -(-kd // 32), -(-vd // 32), vh, vh // kh, m)
   return o.run(key, lambda: delta_kernel(*key[1:]), S, o, live, *((first, accept) if m > 1 else ()), x, conv, *((conv2,) if m > 1 else ()),
@@ -589,6 +599,13 @@ def group(ids, n):
             units=1, name="group")
   return order, tiles, places
 
+def touched_l1(rows, k, n):
+  """The output tile's L1 address for touched. Reject frames beyond the worker's data area."""
+  if type(n) is not int or n < 1: raise ValueError("touched needs a positive integer expert count")
+  out = (DATA + -(-rows // 32) * 6144 + 4 * -(-n // 32) + 4 * min(rows * k, n) + 63) // 64 * 64
+  if out + 4096 > OUTS: raise ValueError(f"touched inputs and expert list do not fit L1: {rows} rows, {k} choices, {n} experts")
+  return out
+
 def touched_kernel(rows, k, n):
   """The kernel for touched, which lists the experts that some row picks. It runs on BRISC alone, with a unit for each
   entry.
@@ -600,12 +617,13 @@ def touched_kernel(rows, k, n):
   of each tile row of its weights: row r holds the weight that row r gave expert s of the list (0 if it didn't pick
   it), across the row. The first entry of each 32 also writes its tile of the experts column, each expert across its
   row, as the tile of a column holds it."""
+  out = touched_l1(rows, k, n)
   tr, slots = -(-rows // 32), min(rows * k, n)
   return compile_kernel(f"""
 #define IDS {DATA:#x}
 #define WEIGHTS {DATA + tr * 4096:#x}
 #define LIST {DATA + tr * 6144:#x}
-#define OUT {(DATA + tr * 6144 + 4 * -(-n // 32) + 4 * slots + 63) // 64 * 64:#x}
+#define OUT {out:#x}
 {ROWS}
 // non-volatile reads of L1 that the NoC wrote. They're safe after the fence in noc_wait
 static unsigned choice(unsigned r, unsigned j) {{ return ((const unsigned *)IDS)[r / 32 * 1024 + at(r % 32, j)]; }}
@@ -664,6 +682,8 @@ def touched(ids, n, weights):
   matrix and return zeros. Weight the results and sum across experts."""
   if not (ids.dtype == "int32" and weights.dtype == "bf16" and ids.shape == weights.shape and ids.batch == 1 and ids.cols <= 32):
     raise ValueError(f"touched needs int32 ids and bf16 weights of one shape, at most 32 choices to a row: {ids.shape} {weights.shape}")
+  touched_l1(ids.rows, ids.cols, n)
+  if ids.rt is not weights.rt: raise ValueError("touched needs ids and weights on the same runtime")
   x, w, rows, k = ids.realize(), weights.realize(), ids.rows, ids.cols  # matrices, so there are no repeats to copy
   slots = min(rows * k, n)
   experts, out = Tensor(ids.rt, slots, 1, dtype="int32"), Tensor(ids.rt, rows, 1, batch=slots)

@@ -55,7 +55,14 @@ the new state.
 Models with a multi-token prediction layer can draft a token and verify it with
 the next token. Verification keeps state after the first token and after both
 tokens. The next step reads whichever state matches the accepted tokens.
-Free server slots leave their recurrent states unchanged.
+Free server slots leave their recurrent states unchanged. DeltaNet decode requires
+key and value head dimensions divisible by 32, and validates speculative state
+shapes before launching. Truncating a hybrid to only its recurrent blocks is
+supported; these stacks use the RoPE tables for position capacity, or the
+server's explicit slot capacity.
+
+Expert routing rejects chunks whose choices and expert list do not fit worker
+L1. Reduce the prefill chunk size for these layouts.
 
 ## Serving
 
@@ -66,8 +73,9 @@ are model, port, slots, positions, precision and optional KV format:
 python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16
 ```
 
-Here, four requests can run at once, with 512 positions per slot. Choose a
-multiple of 32 for that size, and leave room for the answer as well as the
+Here, four requests can run at once, with 512 positions per slot. The slot
+capacity must fit both loaded RoPE tables; construction rejects a larger value.
+Choose a multiple of 32 for that size, and leave room for the answer as well as the
 prompt. The engine also reserves positions at the end for inactive slots.
 
 Downloads go to `~/.cache/baretile/hub`. `HF_TOKEN` supplies access to a gated

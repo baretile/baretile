@@ -315,7 +315,7 @@ def firsts(rt, n, slots, part):
   row = [i // (n // slots) * part for i in range(n)]
   return np.asarray(row) if rt is None else Tensor.of(rt, [row], "int32")
 
-def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None):
+def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hidden=False, length=None, capacity=None):
   """Return logits after processing ids at places, updating each block's cache. Each token sees positions
   up to its own. NumPy takes lists for ids and places; baretile takes int32 rows. Weight lookups happen
   one block at a time so NumPy doesn't need the whole model in memory.
@@ -327,9 +327,16 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   accept: select the DeltaNet state after an accepted or rejected draft (see qwen.deltanet).
   hidden: also return normalized hidden states for qwen.draft.
   length: limit ordinary attention to this many cache rows per sequence. Use a multiple of 32 beyond
-  the current positions. Tensor.attend uses positions to limit its reads regardless of length."""
+  the current positions. Tensor.attend uses positions to limit its reads regardless of length.
+  capacity: positions per sequence, needed for all-linear stacks whose slot capacity is smaller than
+  the RoPE tables. Otherwise capacity comes from an attention cache, or from the tables if none exists."""
   f = fns(w["norm"])
-  x, size = f.rows(w["embed"], ids), next(k.shape[-2] for k in caches if not isinstance(k, list))  # positions in an attention block's cache
+  size = next((k.shape[-2] for k in caches if not isinstance(k, list)), None)
+  table = min(w[k].shape[-2] for k in ("cos", "sin"))
+  if capacity is not None and (type(capacity) is not int or not 0 < capacity <= table or size is not None and size != capacity * (slots or 1)):
+    raise ValueError("forward capacity must fit RoPE tables and match attention cache rows per sequence")
+  size = size if size is not None else (capacity or table) * (slots or 1)
+  x = f.rows(w["embed"], ids)
   rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
   prefill = slots is None and x.shape[-2] > 1
   for l in range(c.layers):
