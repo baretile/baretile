@@ -198,7 +198,7 @@ class Tensor:
     if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
     if self.runs and not runs: raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
-    v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
+    v.op, v.addr, v.owner = None, self.realize().addr, self if self.owner is None else self.owner
     v.offset, v.bstride, v.stride, v.runs = self.offset + offset, bstride, self.stride, runs
     return v
 
@@ -232,9 +232,24 @@ class Tensor:
   def move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
     """Map elements into a new tensor of shape (batch, rows, cols). Output element (b, r, c) reads
     input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order.
-    Output positions outside [lo, hi) on any axis are zero."""
+    Output positions outside [lo, hi) on any axis are zero. Every selected source element must lie
+    inside this tensor; offsets and strides are signed 32-bit integers."""
+    try:
+      shape, strides, lo = (tuple(map(operator.index, values)) for values in (shape, strides, lo))
+      hi, offset = shape if hi is None else tuple(map(operator.index, hi)), operator.index(offset)
+    except TypeError: raise ValueError("move needs integer dimensions, offset, strides and bounds") from None
+    if any(len(values) != 3 for values in (shape, strides, lo, hi)): raise ValueError("move needs three dimensions, strides and bounds")
+    shape = _shape(shape)
+    if not all(0 <= a <= b <= n < 2**31 for a, b, n in zip(lo, hi, shape)):
+      raise ValueError("move bounds must lie inside its signed 32-bit output dimensions")
+    if not all(-2**31 <= v < 2**31 for v in (offset, *strides)): raise ValueError("move offset and strides must fit signed 32 bits")
+    if all(a < b for a, b in zip(lo, hi)):
+      ends = [(a * s, (b - 1) * s) for a, b, s in zip(lo, hi, strides)]
+      first, last = offset + sum(min(v) for v in ends), offset + sum(max(v) for v in ends)
+      if not 0 <= first <= last < min(math.prod(self.shape), 2**32):
+        raise ValueError("move reads outside its input's logical storage or 32-bit element addresses")
     t = Tensor(self.rt, shape[1], shape[2], "move", (self,), shape[0], self.dtype)
-    t.map = (offset, *strides, *lo, *(hi or shape))
+    t.map = (offset, *strides, *lo, *hi)
     return t
   def _map(self, shape, axes, starts, steps):
     """Map output index e on axis a to starts[a] + steps[a] * e on source axis axes[a], using zero outside the
@@ -259,7 +274,10 @@ class Tensor:
     if shape == self.shape: return self
     return self._map(shape, (0, 1, 2), (0, 0, 0), [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
   def pad(self, widths):  # zeros, with (before, after) for each of the last len(widths) axes, like numpy
-    widths = ((0, 0),) * (3 - len(widths)) + tuple(widths)
+    try: widths = tuple(tuple(map(operator.index, w)) for w in widths)
+    except TypeError: raise ValueError("pad needs integer (before, after) pairs") from None
+    if len(widths) > 3 or any(len(w) != 2 for w in widths): raise ValueError("pad needs at most three (before, after) pairs")
+    widths = ((0, 0),) * (3 - len(widths)) + widths
     shape = tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
     return self._map(shape, (0, 1, 2), [-w[0] for w in widths], (1, 1, 1))._track("pad", (self,), widths)
 
@@ -346,7 +364,7 @@ class Tensor:
     if into is not None and any(t.addr == into.addr and (_layout(t) != _layout(into) or "matmul" in _name(e).split()) for t in inputs):
       into.assign(self.realize())  # finish every source read before any destination tile is overwritten
       self.rt.dram_free(self.addr)
-      self.addr, self.owner = into.addr, into.owner or into
+      self.addr, self.owner = into.addr, into if into.owner is None else into.owner
       self.bstride, self.stride, self.offset = into.bstride, into.stride, into.offset
       return self
     shapes = tuple(u.shape for u in inputs)
@@ -354,7 +372,9 @@ class Tensor:
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs), self.rt.readers)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
-    if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
+    if into is not None:
+      self.addr, self.owner = into.addr, into if into.owner is None else into.owner
+      self.bstride, self.stride, self.offset = into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
     # _where(True) is safe: _expr only lets a tensor by columns in as a matmul's B
@@ -390,6 +410,10 @@ class Tensor:
 
   @property
   def shape(self): return (self.batch, self.rows, self.cols)
+
+  def __bool__(self):
+    if self.shape != (1, 1, 1): raise ValueError("the truth value of a tensor with more than one element is ambiguous")
+    return bool(self.tolist()[0][0])
 
   # Elementwise ops: tinygrad's primitives, and the rest built from them. exp, log and cos are SFPU programs too, so
   # their constants stay fp32. As numbers they'd be bf16 tensors, and exp(10) as exp2(10 * log2(e)) would be 2% off.
@@ -499,7 +523,7 @@ class Tensor:
     ids = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype="int32")
     key = ("topk", k, cols, x.dtype, parts, labels is not None)
     return values.run(key, lambda: topk_kernel(*key[1:]), values.addr, ids.addr, *x._where(), x.rows,
-                      *(labels._where() if labels else ()), units=x.batch * parts * -(-x.rows // 32) * 32, name="topk"), ids
+                      *(labels._where() if labels is not None else ()), units=x.batch * parts * -(-x.rows // 32) * 32, name="topk"), ids
   def to(self, rt, ch, back):
     """Copy to rt's chip over Ethernet channel ch, with channel back at the peer (see Chip.links). Wait for
     queued launches on both chips before clearing the transfer flags. This can't be recorded because replay
@@ -721,7 +745,7 @@ def _backward(t, g):
   if op == "reshape": return (g.reshape(*x.shape),)
   if op == "permute": return (g.permute(*sorted(range(3), key=args[0].__getitem__)),)
   if op == "expand": return (_unbroadcast(g, x.shape),)
-  if op == "pad": return (g[tuple(slice(w[0], w[0] + n) for w, n in zip(args[0], x.shape))],)
+  if op == "pad": return (g._map(x.shape, (0, 1, 2), [w[0] for w in args[0]], (1, 1, 1)),)
   if op == "index": return (g.pad(((args[0], x.batch - args[0] - 1), (0, 0), (0, 0))),)
   if op == "split": return (g.merge() if args[0] == 2 else g.reshape(*x.shape),)
   if op == "repeat": return (g.reshape(x.batch, args[0], x.rows * x.cols).sum(1).reshape(*x.shape),)

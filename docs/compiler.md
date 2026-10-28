@@ -60,6 +60,10 @@ Some slices and reshapes change only the view of a tensor: its batch, strides
 and offset. When data has to move, `move_kernel` copies it to the new layout.
 `gather` reads rows by index, and `put` writes them. The models use these for
 embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
+`move` checks that its selected source positions stay inside the input's logical
+shape. Its offset and strides must fit signed 32-bit integers. Padding outside
+the selected output bounds reads no source data. Negative `pad` widths crop
+elements; their gradients are zero. Padding accepts at most three integer pairs.
 `assign` preserves the original source when source and destination views overlap
 with different layouts. `realize(into=...)` also computes through a temporary
 when its destination overlaps a matmul input or a differently laid out input.
@@ -72,6 +76,11 @@ returning, so sequential parameter updates use the same forward values.
 `gradient()` returns lazy expressions; realize all of them before changing any
 forward operand. `test_autograd` checks gradients against numerical differences.
 [test/train.py](../test/train.py) compares a small GPT training run with PyTorch.
+
+A single-element tensor converts to `bool` by waiting and reading its value.
+The truth value of a larger tensor is ambiguous and raises `ValueError`, including
+in Python conditions and container membership checks. A scalar truth test is a
+host read and must stay outside a recorded function.
 
 ## Unpack, math and pack
 

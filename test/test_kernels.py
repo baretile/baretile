@@ -320,6 +320,45 @@ def test_tensor_inputs(chip):
   picked = b.requires_grad_().matmul(w, index=Tensor.of(rt, [[1]], "int32"))
   with pytest.raises(NotImplementedError, match="by index"): picked.sum().backward()
 
+def test_move_bounds_and_tensor_truth(chip):
+  rt = Runtime(chip)
+  x = Tensor.of(rt, [[[1, 2]], [[3, 4]]], "fp32")
+  neighbor = Tensor.of(rt, [[123, 456]], "fp32")
+  before = rt.launches, dict(rt.used)
+  bad = [((1, 1, 2), 16, (0, 0, 1)), ((1, 1, 2), -1, (0, 0, 1)), ((1, 1, 2), 0, (0, 1)),
+         ((1, 2), 0, (0, 0, 1)), ((1, 1, 2), 2**31, (0, 0, 1)), ((1, 1, 2), 0, (0, 0, 2**31))]
+  for args in bad:
+    with pytest.raises(ValueError, match="move"): x.move(*args)
+  for lo, hi in (((0, 0), None), ((0, 0, 0), (1, 1, 3)), ((0, 0, 2), (1, 1, 1))):
+    with pytest.raises(ValueError, match="move"): x.move((1, 1, 2), 0, (0, 0, 1), lo, hi)
+  assert (rt.launches, rt.used) == before
+  assert neighbor.tolist() == [[123, 456]]
+  assert x.move((1, 1, 4), 3, (0, 0, -1)).tolist() == [[4, 3, 2, 1]]
+  assert x.move((1, 1, 4), -1, (0, 0, 1), lo=(0, 0, 1)).tolist() == [[0, 1, 2, 3]]
+  assert x.move((1, 1, 2), 9, (0, 0, 1), hi=(0, 0, 0)).tolist() == [[0, 0]]
+  for v in (0, -0.0, 2, -3, float("nan")):
+    assert bool(Tensor.full(rt, 1, 1, v, "fp32")) == bool(v)
+  a, b = Tensor.full(rt, 1, 1, 2), Tensor.full(rt, 1, 1, 3)
+  assert not bool(a == b) and bool(a != b) and a not in [b]
+  with pytest.raises(ValueError, match="ambiguous"): bool(x)
+  with pytest.raises(ValueError, match="ambiguous"): bool(x == x)
+
+def test_padding_crops_and_validation(chip):
+  rt = Runtime(chip)
+  data = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+  for widths in (((0, 0), (0, 0), (-1, 0)), ((-1, 1), (1, -1), (-1, 2)), ((0, 0), (-1, 0), (0, -2))):
+    x = Tensor.of(rt, data.tolist(), "fp32").requires_grad_()
+    kept = tuple(slice(max(-a, 0), n - max(-b, 0)) for (a, b), n in zip(widths, data.shape))
+    want = np.pad(data[kept], [(max(a, 0), max(b, 0)) for a, b in widths])
+    y = x.pad(widths)
+    assert np.array_equal(value(y), want)
+    y.sum().backward()
+    grad = np.zeros_like(data)
+    grad[kept] = 1
+    assert np.array_equal(value(x.grad), grad)
+  for widths in (((0, 0),) * 4, ((1,),), ((1, 2, 3),), ((0.5, 1),), (1,)):
+    with pytest.raises(ValueError, match="pad"): x.pad(widths)
+
 def test_bf16_special_values(chip):
   # Host conversion must keep NaNs as NaNs, including payloads that would round to infinity or overflow 16 bits.
   bits = [0, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7FFFFFFF, 0xFFFFFFFF, 0x7F800001, 0x3F808000, 0x3F818000]
@@ -1194,7 +1233,8 @@ def test_movement(chip):
   assert value(t).tolist() == want.tolist() and kernels(rt, launches) == 1, "a chain of moves is one move"
   every = Tensor.of(rt, bf16(rng.uniform(-2, 2, (7, 32, 64))).tolist())  # a batch slice with a step is a view of every 3rd matrix
   launches, t = rt.launches, every[1::3, :, :] * 2
-  assert t.realize() and value(t).tolist() == (value(every)[1::3] * 2).tolist() and kernels(rt, launches) == 1, "read in place"
+  t.realize()
+  assert value(t).tolist() == (value(every)[1::3] * 2).tolist() and kernels(rt, launches) == 1, "read in place"
   # The paths of the move kernel, in fp32 so that a datum is a word. It copies tiles as they are, for a pad on tile
   # boundaries, or transposed. It copies runs along x's rows for a reshape or an unaligned slice, runs down its columns
   # for splitting attention heads, and datum by datum for a permute.
