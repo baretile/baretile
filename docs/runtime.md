@@ -102,13 +102,19 @@ finish before reusing that space. A recording keeps its memory for later calls.
 ## Recording repeated work
 
 `tensor.jit(f)` runs the first call normally and records the second. Later calls
-copy inputs into the recorded buffers and resend the launches. If kernels have
+copy inputs into independent recorded buffers and resend the launches. Repeated
+or overlapping arguments keep their original values, and replay does not overwrite
+the caller's inputs. If kernels have
 been evicted, the recording reloads them and rebuilds its commands.
 
 Keep the number of inputs, their runtime, shapes and dtypes fixed from the first
 call. Replay copies input storage without arithmetic, including block-float
 matmul weights. A failed call can be retried; a failed recording releases its abandoned
-allocations. Recordings on the same runtime cannot nest. The function must not read tensors back to
+allocations. Deleting a JIT callable releases its recording's allocations once
+queued work finishes. Live tensors and other recordings still keep their storage.
+`Recording.close()` releases a manual recording explicitly; reusing its context
+replaces the old launches and cached commands. Recordings on the same runtime
+cannot nest or replay inside another recording. The function must not read tensors back to
 the host or depend on changing Python state. Results reuse the same buffers, so
 a later call overwrites an earlier result. Copy a result if you need to keep it.
 

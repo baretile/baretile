@@ -1,5 +1,5 @@
 # Tests for Tensix code generation, kernels and Tensor (layers 2 and 3). See conftest.py for simulator setup.
-import json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
+import gc, json, math, os, pathlib, random, re, struct, subprocess, sys, pytest
 import numpy as np
 from baretile import bh, pci, tensix, tensor, viz
 from baretile.kernels import grid_parts
@@ -140,6 +140,71 @@ def test_jit(chip, monkeypatch):
     monkeypatch.setattr(Tensor, "realize", realize)
     assert y.tobytes() == f(x).tobytes(), call
   assert not realized and rt.pinned, realized
+
+def test_jit_input_aliases(chip):
+  rt = Runtime(chip)
+  a, b = (Tensor.full(rt, 1, 1, v, "fp32") for v in (2, 3))
+  step = tensor.jit(lambda x, y: x * 10 + y)
+  for xs, want in (((a, b), 23), ((a, b), 23), ((b, a), 32), ((a, b), 23)):
+    assert step(*xs).tolist() == [[want]]
+    assert (a.tolist(), b.tolist()) == ([[2]], [[3]])
+  repeated = tensor.jit(lambda x, y: x * 10 + y)
+  repeated(a, a), repeated(a, a)
+  assert repeated(a, b).tolist() == [[23]]
+  view = a.repeat_interleave(2)
+  varied = tensor.jit(lambda x: x + 1)
+  varied(view), varied(view)
+  assert varied(Tensor.of(rt, [[[4]], [[5]]], "fp32")).tolist() == [[[5]], [[6]]]
+  exposed = []
+  def capture(x, y):
+    exposed[:] = [x, y]
+    return x * 10 + y
+  aliased = tensor.jit(capture)
+  aliased(a, b), aliased(a, b)
+  assert aliased(exposed[1], exposed[0]).tolist() == [[32]], "captured inputs can be exposed by user code"
+
+def test_recording_lifetime_and_reuse(chip):
+  rt = Runtime(chip, end=chip.tensix[1])
+  x = Tensor.full(rt, 1, 1, 2, "fp32")
+  step = tensor.jit(lambda t: t + 1)
+  step(x).tolist()
+  baseline = dict(rt.used)  # x and the runtime's cached scalar 1
+  for _ in range(3):
+    step = tensor.jit(lambda t: t + 1)
+    step(x), step(x), step(x)
+    del step
+    gc.collect()
+    rt.wait()
+    assert not rt.pinned and not rt.pinned_freed and rt.used == baseline
+  first, second = tensor.Recording(rt), tensor.Recording(rt)
+  with first: out = (x + 1).realize()
+  with second: other = (out * 2).realize()
+  addr = out.addr
+  del out
+  first.close()
+  rt.wait()
+  assert addr in rt.used and addr in rt.pinned, "another recording still reads this allocation"
+  second.send()
+  assert other.tolist() == [[6]]
+  second.close()
+  rt.wait()
+  assert addr not in rt.used and other.tolist() == [[6]], "live output storage survives closing a recording"
+  with first: out = (x + 1).realize()
+  first.send()
+  assert out.tolist() == [[3]]
+  with first: out = (x * 2).realize()
+  first.send()
+  assert out.tolist() == [[4]]
+  go = hold(rt)
+  first.send()
+  addr = out.addr
+  del out
+  first.close()
+  assert addr in rt.used, "queued replay keeps storage after the recording is closed"
+  go()
+  rt.wait()
+  assert addr not in rt.used and not rt.pinned and not rt.pinned_freed
+  with pytest.raises(RuntimeError, match="not ready"): first.send()
 
 def test_jit_formats(chip):
   # Copy replay inputs in their storage format. Adding zero cannot copy block floats and changes negative zero.
