@@ -517,8 +517,10 @@ class Runtime:
     self.freed.append((self.launches, addr))
     self.reclaim()
 
+  def finished(self): return self.launches - (self.launches - self.read_status(1)) % 2**32  # launches done, from the status
+
   def reclaim(self):  # freed DRAM that no unfinished launch can use goes back into the holes
-    done = self.launches - (self.launches - self.read_status(1)) % 2**32
+    done = self.finished()
     while self.queued and self.queued[0][0] <= done: self.queued.popleft()
     for launches, addr in [f for f in self.freed if f[0] <= done]:
       self.freed.remove((launches, addr))
@@ -536,10 +538,12 @@ class Runtime:
       done = self.read_status(1)
       self.chip.wait(lambda: cond() or self.read_status(1) != done, what, timeout)
 
-  def wait(self, timeout=60):
-    """Poll completion status in host memory, then reclaim memory freed by completed launches. On timeout,
-    report the current launch and its unfinished workers."""
-    try: self.until(lambda: self.read_status(1) == self.launches % 2**32, f"finish launch {self.launches}", timeout)
+  def wait(self, timeout=60, launch=None):
+    """Poll completion status in host memory until launch number `launch` is done, by default the last one
+    queued, then reclaim memory freed by completed launches. On timeout, report the current launch and its
+    unfinished workers."""
+    launch = self.launches if launch is None else launch
+    try: self.until(lambda: self.finished() >= launch, f"finish launch {launch}", timeout)
     except TimeoutError as e:
       current = (self.chip.read32(*self.dispatcher, OUTBOX + 20) + 1) % 2**32  # after the last it saw finish (OUT[5])
       if current == (self.launches + 1) % 2**32: raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
