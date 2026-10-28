@@ -44,9 +44,10 @@ compile them again on the next run. Entries expire after a week without use.
 Most model tests use small configurations. To compare against transformers,
 install PyTorch and a transformers release that includes the model you're
 testing. The MXFP4 test also needs safetensors, `test_tokenizer` needs
-tiktoken, and the adapter tests need tinygrad (see
-[models](models.md#tinygrad-and-pytorch)). Check pytest's skipped tests if you
-expected one of these comparisons to run.
+tiktoken, and the adapter tests need tinygrad at the commit that CI pins (see
+[models](models.md#tinygrad-and-pytorch)). With a checkout in `TINYGRAD`, they
+fail instead of skipping when tinygrad doesn't import. Check pytest's skipped
+tests if you expected one of these comparisons to run.
 
 To include pretrained checkpoint checks:
 

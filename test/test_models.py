@@ -1,5 +1,5 @@
 # Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
-import json, math, os, pathlib, struct, sys, threading, time, unicodedata, pytest
+import importlib, json, math, os, pathlib, struct, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
 from baretile import tensor
@@ -18,11 +18,17 @@ def test_train(chip):
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
+def need_tinygrad(name="tinygrad"):
+  """Import name from tinygrad. With TINYGRAD=/path/to/a/checkout, it comes from the checkout and must import, so CI
+  can't skip the adapter tests by accident. Without TINYGRAD, an installed tinygrad will do, or the test skips."""
+  if "TINYGRAD" not in os.environ: return pytest.importorskip(name)
+  if os.environ["TINYGRAD"] not in sys.path: sys.path.insert(0, os.environ["TINYGRAD"])
+  return importlib.import_module(name)
+
 def test_tinygrad_jit_unrecorded(chip):
   # If the second TinyJit call can't be recorded, a later eligible call must still record. Here the second
   # call has a CPU input; subsequent calls put every input on BARETILE and should replay.
-  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
-  pytest.importorskip("tinygrad")
+  need_tinygrad()
   from adapters import tinygrad_baretile
   from tinygrad import Tensor, TinyJit
   rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)
@@ -39,8 +45,7 @@ def test_tinygrad_jit_unrecorded(chip):
 def test_tinygrad(chip):
   # tinygrad builds the graph and baretile runs it, checked against tinygrad's CPU device. Each case must launch on the
   # chip, so we know the host didn't compute it.
-  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])  # TINYGRAD=/path/to/tinygrad, or installed
-  pytest.importorskip("tinygrad")
+  need_tinygrad()
   from adapters import tinygrad_baretile
   from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
@@ -112,8 +117,7 @@ def test_tinygrad(chip):
 def test_torch_frontend(chip):
   # PyTorch runs on BARETILE through tinygrad's torch frontend (extra/torch_backend, PyTorch's "tiny" device), checked
   # against PyTorch on the CPU. The matmul and conv are good to the FPU's 2^-11.
-  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
-  pytest.importorskip("tinygrad")
+  need_tinygrad()
   pytest.importorskip("extra.torch_backend", reason="needs a tinygrad checkout in TINYGRAD, since an installed tinygrad has no extra/")
   torch = pytest.importorskip("torch")
   from adapters import tinygrad_baretile
@@ -152,8 +156,7 @@ def test_tinygrad_llm(chip):
   # The Transformer in tinygrad/llm runs two SmolLM-shaped blocks on BARETILE, against our numpy Llama with the same
   # bf16 weights. tinygrad's KV cache is fp16, which the adapter doesn't have, so it stays on the host. The blocks are
   # precompiled tinygrad functions, and the adapter inlines them with fresh buffers on each call.
-  if "TINYGRAD" in os.environ: sys.path.insert(0, os.environ["TINYGRAD"])
-  pytest.importorskip("tinygrad.llm.model")
+  need_tinygrad("tinygrad.llm.model")
   from adapters import tinygrad_baretile
   from tinygrad import Tensor as TT, dtypes, nn
   from tinygrad.helpers import Context
