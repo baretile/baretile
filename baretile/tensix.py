@@ -25,7 +25,7 @@ def slot_base(dtype): return DATA - tile_bytes(dtype)
 # Where a kernel packs its results when it packs in a different dtype than it computes in. There's a 4 KiB tile for
 # each of the two frames.
 OUTS = bh.L1_SIZE - 2 * 4096
-DST_HALF = 64  # Dst rows for an fp32 result. Dst holds two, so math fills one half while pack drains the other
+DST_HALF = 64  # Dst rows for an fp32 result. Kernels use two such halves, rows 0-127, so math fills one while pack drains the other
 # SEM_DST counts results in Dst waiting to be packed, SEM_PACKED outputs packed but not reported yet, and SEM_L1
 # intermediates packed into L1 that nobody has waited for yet.
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2
@@ -206,8 +206,8 @@ def matmul_phase(transposed=False):
   """One fidelity phase of Dst += A @ B on a pair of tiles, with A in SrcB and B in SrcA.
 
   MVMUL does Dst[8x16] += SrcB[8x16] @ SrcA[16x16]. Output face (i, j) adds A face (i, k) times B face (k, j) for
-  k = 0, 1, in two MVMULs of 8 rows each (h). In the order below, SrcA steps by 16, -16, 16, -16, ... rows and SrcB by
-  0, 8, 0, 8, ... rows, so four address modes (4-7) cover it. The last one wraps both back to row 0, since the counters
+  k = 0, 1, in two MVMULs of 8 rows each (h). In the order below, SrcA steps by 16, -16, 16 and 16 rows, then again,
+  and SrcB by 0, 8, 0 and 8 rows, so four address modes (4-7) cover it. The last one wraps both back to row 0, since the counters
   wrap at 64, and moves on to the next fidelity phase.
 
   With transposed, B came in as it lies and unpacker 0 transposed each face (haloize). Face (k, j) of B^T is then face
@@ -273,7 +273,7 @@ SIN_P = [1.0, -0.16666658, 0.0083330506, -0.00019809045, 2.6051646e-06]  # sin(r
 def exp(base2, nan=False):
   """2^x, or e^x when base2 is False.
 
-  t is x for 2^x and x log2(e) for e^x. x is first clamped so that |t| <= 150, which sends a NaN to one end.
+  t is x for 2^x and x log2(e) for e^x. x is first clamped so that |t| is at most 150.04, which sends a NaN to one end.
   n = round(t). Adding and then subtracting 1.5 * 2^23 rounds to an integer and leaves its bits in the low bits of the
   sum. r = (x - n) ln 2 for 2^x. For e^x, r = x - n ln 2, in two parts (Cody-Waite: n times 0.693359375 is exact).
   A polynomial gives e^r, which gets multiplied by 2^floor(n/2) and 2^ceil(n/2), each built from its exponent bits.
@@ -315,7 +315,7 @@ def log(scale):
            ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), CC_ALL, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), CC_OFF, sfp_store(3)])
 
 def sin(phase):
-  """sin(x + pi phase), so phase 0.5 gives cos.
+  """sin(x + pi phase) for phase 0 or 0.5, so 0.5 gives cos.
 
   k = round(x / pi + phase) and r = x - k pi + pi phase, which is in [-pi/2, pi/2]. Both k pi and pi phase go in two
   parts (Cody-Waite), so there's no cancellation near a zero. k times 3.140625 is exact, and so is x minus that, since
@@ -490,8 +490,8 @@ MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} 
 
 def allocate(names):
   """Assign runs to the math thread's replay buffer. Prioritize SFPU bodies because they repeat 32 times per
-  tile, allocating the longest first. Matmul and mul phases repeat at most four times and get the remaining
-  space. Push runs that don't fit one word at a time."""
+  tile, allocating the longest first. Matmul phases repeat up to four times a step and mul's four times a tile,
+  and they get the remaining space. Push runs that don't fit one word at a time."""
   slots, at = {}, 0
   # the name breaks ties, so different processes build the same kernel
   for name in sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), -len(MATH_RUNS[n]), n)):
@@ -599,7 +599,8 @@ def tt(words):
 FLAGS_B = 16  # FLAGS has A's flags, for the workers in a grid row, then from here B's, for the workers in a grid column
 # The most matmul steps that can have reads in flight. Each reads into a stream slot of B, and of A if A streams.
 DEPTH = 4
-# Streaming a B laid out by columns, for a token's row: CHUNK bytes of values in each read, and CHUNKS reads in flight
+# Streaming a B laid out by columns, for a token's row: chunks of at most CHUNK bytes of values (a bfp4 chunk has 8 KiB,
+# since B8_SLOTS caps its tiles), with CHUNKS chunks in flight
 CHUNK, CHUNKS = bh.MAX_PACKET, 4
 def chunk_tiles(wt):  # tiles in a chunk: 8 of bf16, or 16 of a block float
   # CHUNKS chunks make a region, and the first datums of the region's slots must stay below BFP_FIRST_DATUM
@@ -682,7 +683,7 @@ static void getb(unsigned base, unsigned t, unsigned s) {{
 // A matmul step fetches B's tile (for SrcA) into b_slot and A's into a_slot. Each is a stream slot, or the tile's place
 // in a row or column kept in L1. KEPT means the tile is there already. With bfp, B is a block float (getb). Otherwise
 // it's bf16, and a transposed B's tile comes as it lies. The reads of step k carry transaction id k % DEPTH + 1, the id
-// of its stream slots. BRISC counts the steps whose reads are out (ISSUED), and it's thread 0 that waits for the reads
+// of its stream slots. BRISC counts the steps whose reads are out (ISSUED), and it's TRISC0 that waits for the reads
 // with that id to land, so up to DEPTH steps can have reads in flight. A frame's reads carry id 0.
 #define KEPT 0xFFFFFFFF
 static unsigned read_id;  // the transaction id that initiator 1 puts on reads
@@ -693,7 +694,7 @@ static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, uns
   tagged(s + 1);
   if (b_slot != KEPT) {{ if (bfp) getb(b, b_tile, b_slot); else get(b, b_tile, b_slot); }}
   if (a_slot != KEPT) get(a, a_tile, a_slot);
-  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 sees ISSUED
+  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before TRISC0 sees ISSUED
   stream_done[s] = ++events;
   SYNC[ISSUED] = ++steps;
 }}
@@ -725,7 +726,7 @@ static void stepc(unsigned bfp, unsigned j, unsigned run, unsigned len, unsigned
 static unsigned part_done[{CHUNKS}], chunks;
 static unsigned chunk_part(void) {{ unsigned p = chunks++ % {CHUNKS}; reached(part_done[p]); tagged(p + 1); return p; }}
 static void chunk_issued(unsigned p, unsigned k) {{
-  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before thread 0 sees ISSUED
+  (void)NIU1(CMD); asm volatile("fence" ::: "memory");  // the NIU must count the reads before TRISC0 sees ISSUED
   part_done[p] = events += k;
   SYNC[ISSUED] = steps += k;
 }}
@@ -751,7 +752,7 @@ static void unflag(unsigned a, unsigned b) {{
   for (unsigned k = 0; k < b; k++) FLAGS[{FLAGS_B} + k] = 0;
   l1_settle({FLAGS:#x});
 }}
-// Multicasts n bytes of this L1 to the same address in the `tiles` other tiles of rect (end | start << 12), and waits
+// Multicasts n bytes of this L1 to the same address in the other `tiles` workers in rect (end | start << 12), and waits
 // until they all have them.
 static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   noc_wait();
@@ -761,7 +762,7 @@ static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   mcast_done(acks);
 }}
 // Sends this worker's part of what a row or column of the grid shares: n bytes at l1, already read in. They go to the
-// same address in the `tiles` other tiles of rect, and then flag, set to v, goes the same way. With no other tiles, it
+// same address in the other `tiles` workers in rect, and then flag, set to v, goes the same way. With no other workers, it
 // waits for the reads and sets the flag.
 static void share(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
   if (tiles && n) mcast(l1, n, rect, tiles);
@@ -833,7 +834,7 @@ def pack_program(body, slots=2, decls=""):
   return TRISC + decls + f"""
 static unsigned outputs, relayed, used[{slots}];
 static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // hands packed results to BRISC
-// Pack the next result into L1 slot, tracked as output slot s, for DRAM tile t. Frames may share an output slot.
+// Queue the result that the caller packs next into L1 slot, tracked as output slot s, for DRAM tile t. Frames may share an output slot.
 // Wait until BRISC has written the previous result from this slot and RING has space, then queue the next result.
 // RING holds at most four results awaiting transfer.
 static void output(unsigned s, unsigned slot, unsigned t) {{

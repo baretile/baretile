@@ -36,8 +36,8 @@ hangs.
 
 ## How the code is organized
 
-The code has five layers, and each one imports only the standard library and the
-layers below it. `test_layers` checks this.
+The code has five layers. Each module in `baretile/` imports only the standard
+library and the layers below it, and `test_layers` checks this.
 
 - Layer 0 is the device (`bh.py`, `pci.py`, `chip.py`) and layer 1 is the runtime
   (`runtime.py`).

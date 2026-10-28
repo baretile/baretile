@@ -126,8 +126,8 @@ You'll need the model's config, tokenizer and safetensors weights in that folder
 The command runs baretile and NumPy side by side. It prints when they choose
 different tokens, then continues with NumPy's choice.
 
-The loader also handles Llama, Mistral, Qwen2, Qwen3, Mixtral, gpt-oss and the
-Qwen3.5/3.6 text models. Most tests use small models. Full checkpoints need
+The loader also handles Llama, Mistral, Qwen2, Qwen2-MoE, Qwen3, Qwen3-MoE,
+Mixtral, gpt-oss and the Qwen3.5/3.6 text models. Most tests use small models. Full checkpoints need
 separate checks, which
 [testing](https://github.com/baretile/baretile/blob/main/docs/testing.md#optional-checks)
 lists.

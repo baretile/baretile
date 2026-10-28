@@ -16,7 +16,7 @@ class Chip:
   def __init__(self, pci, boot=2.0):
     if (ids := pci.cfg_read(0)) != bh.VENDOR | bh.DEVICE << 16: raise RuntimeError(f"not a Blackhole: {ids:#x}")
     self.pci, self.target = pci, None  # TLB 0 is the shared window, and map hands out the others
-    self.taken = {}  # (start, end) -> the cores of each rectangle that a Runtime has taken
+    self.taken = {}  # (start, end) -> the tiles of each rectangle that a Runtime has taken
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
     if not (int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED):
@@ -170,6 +170,6 @@ if __name__ == "__main__":
   chip = Chip(dev, 300 if reset else 2)
   t = chip.telemetry()
   fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
-  print(f"{getattr(dev, 'sys', 'ttsim')}: ARC firmware {fw} is up and Tensix is powered. The AI clock is {t.get(bh.TAG_AICLK, 0)} MHz. "
+  print(f"{getattr(dev, 'sys', 'ttsim')}: firmware bundle {fw}. ARC is up and Tensix is powered. The AI clock is {t.get(bh.TAG_AICLK, 0)} MHz. "
         f"{len(chip.tensix)} Tensix tiles in raw columns {sorted({chip.raw(x, y)[0] for x, y in chip.tensix})}. DRAM banks {chip.banks} trained.")
   print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))

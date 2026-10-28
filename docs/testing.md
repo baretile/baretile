@@ -43,8 +43,10 @@ compile them again on the next run. Entries expire after a week without use.
 
 Most model tests use small configurations. To compare against transformers,
 install PyTorch and a transformers release that includes the model you're
-testing. The MXFP4 test also needs safetensors. Check pytest's skipped tests if
-you expected one of these comparisons to run.
+testing. The MXFP4 test also needs safetensors, `test_tokenizer` needs
+tiktoken, and the adapter tests need tinygrad (see
+[models](models.md#tinygrad-and-pytorch)). Check pytest's skipped tests if you
+expected one of these comparisons to run.
 
 To include pretrained checkpoint checks:
 
@@ -58,9 +60,13 @@ number of random expressions in the kernel fuzz test. `TTSIM2=/path/to/libttsim.
 enables the two-chip test. ttsim's releases include that library as
 `libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2` target.
 
-`llama.accuracy` compares generated choices with Tenstorrent reference tokens.
-The command accepts a `.refpt` prompt file, a step count and a precision mode.
-Append `numpy` to run that comparison on the host. Reading the reference file
+`llama.accuracy` compares generated choices with Tenstorrent reference tokens:
+
+```sh
+python3 models/llama.py /path/to/model /path/to/<model>.refpt [steps] [mode] [numpy]
+```
+
+`numpy` runs the comparison on the host instead. Reading the reference file
 requires PyTorch. The usual reference procedure has a 512-token prompt and
 500 following steps. Top-1 counts how often baretile picks the reference's best
 token. Top-5 counts how often its pick is among the reference's five best tokens.
@@ -82,8 +88,9 @@ only check on a card.
 
 ## ttsim-chaos
 
-[test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds delayed requests and random
-pauses to ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim checkout
+[test/ttsim-chaos.patch](../test/ttsim-chaos.patch) adds NoC delays, FPU and SFPU
+latency, random pauses, a 140-tile option and the NIU counter for read bytes to
+ttsim v1.11.5 at commit `464814f`. Apply it to a separate ttsim checkout
 and build the Blackhole library there:
 
 ```sh

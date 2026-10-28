@@ -1,5 +1,6 @@
-# Runs ruff and the test suite on ttsim for every push and pull request, then the suite again on ttsim-chaos. Tests
-# that need checkpoints, PyTorch, transformers or tinygrad skip themselves here.
+# For every push and pull request: build and check the wheel on Python 3.12 to 3.14, run ruff and the test suite on
+# ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. Tests that need checkpoints, PyTorch,
+# transformers, tiktoken or tinygrad skip themselves here.
 name: test
 on: [push, pull_request]
 permissions:
@@ -59,7 +60,7 @@ jobs:
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
   # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
   # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. The other job runs the suite on all 140
-  # Tensix tiles, since a p150a reports 120 or 140 depending on its firmware.
+  # Tensix tiles, since a p150 reports 120 or 140 depending on its firmware.
   chaos:
     name: chaos (${{ matrix.name }})
     runs-on: ubuntu-24.04

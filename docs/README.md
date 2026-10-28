@@ -68,7 +68,7 @@ tile running a kernel; a tensor tile is the data it processes.
 | --- | --- | --- |
 | 0, device | [bh.py](../baretile/bh.py) | Blackhole's addresses, sizes and instruction encodings, as data |
 | | [pci.py](../baretile/pci.py) | The device: `Sim` wraps libttsim.so, and `Card` opens a PCIe card through sysfs; checking a card first, and giving it back to tt-kmd |
-| | [chip.py](../baretile/chip.py) | NoC reads and writes through TLB windows, ARC messages, telemetry, reset and Ethernet links |
+| | [chip.py](../baretile/chip.py) | NoC reads and writes through TLB windows, ARC messages, telemetry, core reset and Ethernet links; `python3 -m baretile.chip [check \| release \| reset]` |
 | 1, runtime | [runtime.py](../baretile/runtime.py) | Builds device C with clang, loads firmware and kernels, queues launches, allocates DRAM and profiles |
 | 2, codegen | [tensix.py](../baretile/tensix.py) | Tensix instructions from the ISA, and the BRISC, unpack, math and pack programs of a kernel |
 | 3, kernels and tensors | [kernels.py](../baretile/kernels.py) | Fused elementwise, matmul and reduction kernels, attention, data movement and `topk` |

@@ -38,12 +38,12 @@
 then read the answer back into Python. We'll see how Python constructs hardware instructions and how three
 programs coordinate to produce one result.</p>
 
-<p>We'll use <a href="https://github.com/baretile/baretile">Baretile</a>
-and Tenstorrent's ttsim simulator. You can run the example without a card. Baretile hasn't been tested on hardware yet,
+<p>We'll use <a href="https://github.com/baretile/baretile">baretile</a>
+and Tenstorrent's ttsim simulator. You can run the example without a card. baretile hasn't been tested on hardware yet,
 and simulator timings don't predict card performance.</p>
 
 <p>Python runs on the host. It builds instruction words and generates small C programs for the chip's RISC-V cores.
-Clang compiles those programs, and Baretile loads and launches them.</p>
+Clang compiles those programs, and baretile loads and launches them.</p>
 
 <h2 id="one-worker">One worker, three programs</h2>
 
@@ -71,7 +71,7 @@ describes the full tile.</p>
 <p><code>SrcA</code> and <code>SrcB</code> hold the operands where the matrix unit can read them.
 <code>Dst</code> holds the result before it is packed back into L1.</p>
 
-<p>Baretile assigns three RISC-V cores to direct these operations:</p>
+<p>baretile assigns three RISC-V cores to direct these operations:</p>
 
 <table>
   <thead><tr><th scope="col">Core</th><th scope="col">Program</th></tr></thead>
@@ -95,7 +95,7 @@ cd baretile
 git checkout 6ddd68493551eaeea3079f8a1793b51f00d4814f
 export TTSIM=/absolute/path/to/libttsim_bh.so</code></pre>
 
-<p>Keep <code>TTSIM</code> set: it selects the simulator. Without it, Baretile tries to open a physical card.</p>
+<p>Keep <code>TTSIM</code> set: it selects the simulator. Without it, baretile tries to open a physical card.</p>
 
 <p>The Python blocks below, in order, form a complete script. Save them as <code>add.py</code> in the checkout,
 or <a href="add.py" download>download the complete script</a>.</p>
@@ -128,12 +128,12 @@ so we can check the answer with an exact comparison.</p>
 
 <h2 id="memory-layout">Put the inputs in memory</h2>
 
-<p>Before writing the inputs, we need to arrange them as Baretile expects.</p>
+<p>Before writing the inputs, we need to arrange them as baretile expects.</p>
 
 <p>The word <em>tile</em> has two meanings here. A <strong>Tensix tile</strong> is the hardware unit running our programs.
 A <strong>tensor tile</strong> is a block of values. This example uses one Tensix tile to add two tensor tiles.</p>
 
-<p>Baretile stores each 32x32 tensor tile as four 16x16 <em>faces</em>:</p>
+<p>baretile stores each 32x32 tensor tile as four 16x16 <em>faces</em>:</p>
 
 <figure class="diagram">
   <div class="faces" role="img" aria-label="A 32 by 32 tensor tile split into four 16 by 16 faces. Face 0 holds rows 0-15 and columns 0-15, face 1 rows 0-15 and columns 16-31, face 2 rows 16-31 and columns 0-15, and face 3 rows 16-31 and columns 16-31.">
@@ -175,13 +175,13 @@ to_l1(<span class="n">1</span>, a)
 to_l1(<span class="n">2</span>, b)</code></pre>
 
 <p>A bfloat16 tile occupies 2,048 bytes: 1,024 values at two bytes each. We put the inputs in slots 1 and 2
-and reserve slot 3 for the result. These slots are Baretile's convention for addressing tile-sized regions of L1.</p>
+and reserve slot 3 for the result. These slots are baretile's convention for addressing tile-sized regions of L1.</p>
 
 <h2 id="instruction-encoding">Build an instruction</h2>
 
 <p>The inputs are now in memory. Next, we need instructions that operate on them.</p>
 
-<p>A Tensix instruction is a 32-bit word. In Baretile's encoding table, the opcode occupies the top byte,
+<p>A Tensix instruction is a 32-bit word. In baretile's encoding table, the opcode occupies the top byte,
 and named fields describe the remaining bits. An instruction encoder can therefore be a small Python function:</p>
 
 <pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">def</span> ins(name, **fields):
@@ -208,7 +208,7 @@ Calling <code>ins</code> constructs its encoding as a Python integer.</p>
 
 <p>The second line shows how that instruction reaches the coprocessor. The RISC-V cores support a custom instruction
 encoding that pushes a Tensix instruction into their associated thread's queue. That encoding is the Tensix word
-rotated left by two bits. Baretile's <code>tt</code> function emits it through a <code>.word</code> directive inside C inline assembly.
+rotated left by two bits. baretile's <code>tt</code> function emits it through a <code>.word</code> directive inside C inline assembly.
 <a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/BlackholeA0/TensixTile/BabyRISCV/PushTensixInstruction.md#ttinsn-instruction-set-extension">Tenstorrent documents this mechanism as <code>.ttinsn</code>.</a></p>
 
 <p>Clang compiles the surrounding C program. When a TRISC executes the embedded word,
@@ -218,8 +218,9 @@ it submits the addition instruction to the coprocessor.</p>
 
 <p>One <code>ELWADD</code> handles an 8x16 block. Our tensor tile contains 64 rows of 16 values,
 so we need eight addition instructions to cover it.
-<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md">The instruction reference</a>
-describes the operation and its Blackhole encoding.</p>
+<a href="https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/TensixCoprocessor/ELWADD.md">The ISA's ELWADD page</a>
+describes the operation. Blackhole's documentation has no page of its own for it, so this one is Wormhole's, and it notes
+where Blackhole differs.</p>
 
 <p>Here are the instruction sequences for all three programs:</p>
 
@@ -237,7 +238,7 @@ The unpackers mark the source banks ready when the data is available.
 Addition waits for that handoff before reading the operands.</p>
 
 <p>The math sequence starts with <code>SETRWC</code>, which resets the row counters.
-Baretile configures the address mode to advance the source and destination counters by eight rows after each addition.
+baretile configures the address mode to advance the source and destination counters by eight rows after each addition.
 Although each instruction says <code>dst=0</code>, that field is an offset added to the current destination counter.
 The instructions therefore write successive parts of the result.</p>
 
@@ -310,7 +311,7 @@ Because we chose small, exactly representable values, a mismatch here cannot be 
 
 <h2 id="tensor-api">Use the tensor API</h2>
 
-<p>Baretile's tensor API builds kernels using the same instruction helpers.
+<p>baretile's tensor API builds kernels using the same instruction helpers.
 We can ask it to perform the addition and compare its answer with our handwritten kernel:</p>
 
 <pre tabindex="0" aria-label="Python code"><code class="language-python"><span class="k">from</span> baretile.tensor <span class="k">import</span> Tensor
@@ -336,7 +337,7 @@ all 1024 sums match
 Tensor result matches the handwritten kernel</code></pre>
 
 <p>To continue,
-<a href="https://github.com/baretile/baretile/blob/6ddd68493551eaeea3079f8a1793b51f00d4814f/ramps/3_tensix.py">Baretile's Tensix tutorial</a>
+<a href="https://github.com/baretile/baretile/blob/6ddd68493551eaeea3079f8a1793b51f00d4814f/ramps/3_tensix.py">baretile's Tensix tutorial</a>
 extends this example to multiplication, matrix multiplication, and an exponential applied to an addition's result.
 Each uses the same path through unpack, math, and pack, with a different instruction sequence doing the computation.</p>
 </article>

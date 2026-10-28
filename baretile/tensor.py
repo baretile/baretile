@@ -22,7 +22,7 @@ class Tensor:
 
   Batch indexing, tile-aligned slices, split and repeat_interleave can share an owner's storage.
   Tile (b, i, j) of a view is at b // rep * bstride + i * stride + j + offset in that storage.
-  Movement that can't use a view is copied by move_kernel."""
+  Movement that can't use a view is copied in one launch: by move_kernel, or transpose_kernel for a bf16 transpose."""
   def __init__(self, rt, rows, cols, op=None, srcs=(), batch=1, dtype="bf16"):
     self.addr = None  # construction can fail before there is an allocation to release
     batch, rows, cols = _shape((batch, rows, cols))
@@ -31,7 +31,9 @@ class Tensor:
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs, self.dtype = rt, rows, cols, batch, op, srcs, dtype
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
     self.tiles, self.bstride, self.stride, self.offset, self.owner, self.rep = batch * tr * tc, tr * tc, tc, 0, None, 1
-    self.runs = None  # by columns: (runs per matrix in each bank, tiles per run, K tiles per matrix if split cut K)
+    # by columns: (runs a batch entry moves on in each bank, tiles a run, tiles a batch entry moves along its runs).
+    # columns gives (runs a matrix, tiles a run, 0), and split, cutting K, gives (0, tiles a run, K tiles a part)
+    self.runs = None
     self.addr = None if op else self._alloc()
     self.requires_grad, self.grad, self._ctx = False, None, None
     if op not in (None, "move", "view"): self._track(op, srcs)  # moves and views are tracked by their callers
@@ -60,7 +62,7 @@ class Tensor:
     zeros in their L1, so nothing crosses PCIe. Model caches start this way."""
     t = cls(rt, rows, cols, batch=batch, dtype=dtype)
     each = -(-t.tiles // len(bh.DRAM)) * tile_bytes(dtype)  # the bytes it has in each bank
-    return t.run(("zeros",), zeros_kernel, t.addr, each, units=len(bh.DRAM) * -(-each // 4096), name="zeros")
+    return t.run(("zeros",), zeros_kernel, t.addr, each, units=len(bh.DRAM) * -(-each // 4096), name="zeros")  # a unit: 4 KiB of a bank
 
   @classmethod
   def of(cls, rt, data, dtype="bf16"):
@@ -220,7 +222,8 @@ class Tensor:
       t = self._map(shape, (0, 1, 2), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)
 
-  # Movement. Each op maps the result's elements to this tensor's, and one move_kernel launch copies them.
+  # Movement. Each op maps the result's elements to this tensor's, and one launch copies them: move_kernel, or
+  # transpose_kernel for a bf16 transpose.
   def move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
     """Map elements into a new tensor of shape (batch, rows, cols). Output element (b, r, c) reads
     input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order.
@@ -300,7 +303,7 @@ class Tensor:
     writes directly into the result columns. Otherwise, copy the matrices there."""
     if self.cols % 32: raise ValueError(f"merge needs matrices a whole number of tiles wide, not {self.cols} columns")
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
-    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # + 0 copies a realized tensor or a move in
+    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # + 0 copies a realized tensor, T or move in
     return out._track("merge", (self,))
 
   @property
@@ -517,9 +520,9 @@ class Tensor:
     """Multiply matrices by batch, repeating a batch of one. Products accumulate in fp32 Dst. With bf16 self, x
     may be bfp8 or bfp4 to reduce bytes read.
 
-    An fp32 operand is split into bf16 hi and lo. The kernel sums hi@hi, hi@lo and lo@hi, preserving about
-    16 of fp32's 24 bits. The FPU aligns groups of eight products before adding, with error around 2^-11 of
-    the largest terms. See docs/compiler.md, "Matmul precision".
+    An fp32 operand is split into bf16 hi and lo. Three bf16 matmuls compute hi@hi, hi@lo and lo@hi in fp32, and
+    an add sums them, preserving about 16 of fp32's 24 bits. The FPU aligns groups of eight products before adding,
+    with error around 2^-11 of the largest terms. See docs/compiler.md, "Matmul precision".
 
     index is an int32 (rows, k) tensor. For batch entry b, index[b // k, b % k] selects a matrix from x.
     Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero
@@ -535,7 +538,8 @@ class Tensor:
       out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x, index), index.rows * index.cols, dtype or "bf16")
       out.fidelity = fidelity
       return out
-    # an unrealized sum times a small matrix goes term by term, as when RoPE turns the parts of a split K
+    # an unrealized sum times a small matrix (16 tiles at most, like a 128-wide head's turn) goes term by term, as when
+    # RoPE turns the parts of a split K
     if x.tiles <= 16 and (terms := _terms(self)):
       return sum((t.matmul(x, dtype, fidelity) for t in terms[1:]), terms[0].matmul(x, dtype, fidelity))
     if "int32" in (self.dtype, x.dtype): raise ValueError(f"matmul needs floats, since the FPU has no int32: {self.dtype} @ {x.dtype}")
@@ -547,9 +551,9 @@ class Tensor:
       raise ValueError(f"matmul needs A's columns to match B's rows, and batches that match or broadcast: {self.shape} @ {x.shape}")
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     k, tr = -(-self.cols // 32), -(-self.rows // 32)
-    # A row of tiles, like a token's MLP, has too few blocks to keep the workers busy. Cut K into s parts as a batch,
-    # then sum them. With more rows this doesn't help: the matrices of a batch read their own tiles, while blocks of the
-    # same matrix share them.
+    # A row of tiles, like a token's MLP, has too few blocks to keep the workers busy. Cut K into s parts of at least 4
+    # tiles as a batch, then sum them. With more rows this doesn't help: the matrices of a batch read their own tiles,
+    # while blocks of the same matrix share them.
     s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and tr == 1 and self.cols % (32 * s) == 0 and k // s >= 4
              and s * -(-x.cols // 32) <= len(self.rt.cores)], default=1)
     if s > 1:
@@ -716,9 +720,9 @@ def _backward(t, g):
   raise NotImplementedError(f"no backward for {op}")
 
 def _fit(t):
-  """Realize subexpressions until the remaining tree fits a kernel. Realize long matmuls before reductions to
-  avoid recomputing them on each pass. Also realize elementwise values shared with work outside the
-  reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
+  """Realize subexpressions until the remaining tree fits a kernel. Realize long matmuls (K over 256) before
+  reductions to avoid recomputing them on each pass. Also realize elementwise values shared with work outside
+  the reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
   heaviest branch."""
   if any(u.op in COMBINE for u in _lazy(t, set())):
     for u in [u for u in _lazy(t, set()) if u.op == "matmul" and u.srcs[0].cols > 256]: u.realize()

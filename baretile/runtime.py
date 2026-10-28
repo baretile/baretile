@@ -123,7 +123,7 @@ def compile_rv32(src):
   try:
     os.utime(cached)
     return cached.read_bytes()
-  except FileNotFoundError: pass  # another process may have pruned it
+  except FileNotFoundError: pass  # not compiled yet, or another process pruned it
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld")
   with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
@@ -237,7 +237,7 @@ void trisc_loop(unsigned i) {{
 # Commands contain a 16-byte header [length, kernel address, argument bytes, workers], followed by arguments and
 # padding to a multiple of 64 bytes. Length 0 marks the unused tail of the ring. Runtime.load has already put
 # the kernel in worker L1.
-# To reduce PCIe reads, the dispatcher fetches new commands in one request, limited by STAGE and the ring's end.
+# To reduce PCIe reads, the dispatcher fetches new commands in one noc_read, limited by STAGE and the ring's end.
 # It multicasts arguments and go to every worker, including those outside this launch's worker count. Multicast
 # completion uses acknowledgements: the request counter increments once but decrements for each recipient, so
 # the dispatcher clears that counter afterwards. Workers report completion by incrementing DONE.
@@ -345,7 +345,7 @@ class Runtime:
     # how many times the loaded kernels were evicted. A recorded command names its kernels by address, so a replay
     # checks this first.
     self.evictions = 0
-    *self.cores, self.dispatcher = cores  # the dispatcher is end, the last core of the rectangle
+    *self.cores, self.dispatcher = cores  # the dispatcher is end, the last tile of the rectangle
     # The workers as a grid, for kernels that multicast along rows and columns. The grid keeps the rows that have no
     # tile missing, and only the dispatcher's row can be short. grid is (x of each column, y of each row), and worker
     # gy * columns + gx is at (x[gx], y[gy]).
@@ -373,10 +373,10 @@ class Runtime:
     # after the process that owned it is gone, and the next process may get the same page.
     chip.halt(*end, start)
     atexit.register(chip.halt, *end, start)
-    buf, bus = chip.pci.alloc(1 << 21)  # a hugepage for the status, the ring, the times, then tensors read back
+    buf, bus = chip.pci.alloc(1 << 21)  # a hugepage for the status, the ring, the times, then staging for uploads and readback
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
-    self.numbers = {}  # (value, dtype) -> a tensor holding that number, uploaded once for tensor.py's constants
+    self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
     self.log, self.pinned, self.pinned_freed = None, set(), set()
     self.counts = chip.pci.counts  # whether profile knows the bytes each launch read

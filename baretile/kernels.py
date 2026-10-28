@@ -450,6 +450,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                       f"for (unsigned m = 0; m < {K}; m++) kept_step(); if (ii + 1 == {bp} || i_ + 1 == {rt}) col_end[{seq} % 3] = events; }}")
         elif kept_b is not None:  # A's bp rows and B's column stay in L1
           b_slot, a_slots = f"nb ? {0 if bfp else kept_b} + m : KEPT", f"a[{x}], {a_tile}, na ? {rows_at[q]} + i_ % {bp} * {kt} + m : KEPT"
+          # place 15 holds B's column, past A's rows at places 0 to bp - 1, and bp is at most 4 here
           c[B].append(f"{cond}{live}{{ unsigned na = fresh(i_ % {bp}, {which(op['x'])} * {rt} + i_), nb = fresh(15, {b_which} * {w} + j); "
                       f"for (unsigned m = 0; m < {kt}; m++) {step_b(b_slot, a_slots)}; tagged(0); }}")
         if kept_b is not None:  # unpacker 0 walks B's column and unpacker 1 the row of A
@@ -577,6 +578,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                    f"    for (unsigned g = 0; g < {-(-bq // group)}; g++) for (unsigned p = 0; p < {n_parts}; p++) {{\n"
                    f"    unsigned k0 = p * {kp}, kn = k0 + {kp} < {kt} ? {kp} : {kt} - k0, n = g * {n_parts} + p, "
                    f"qv = v > g * {group} ? (v - g * {group} < {group} ? v - g * {group} : {group}) : 0; {start}\n    {tiles_c}\n    {end} }}")
+      # With local, a unit's columns come from its worker's reader (col0), so the step to the next unit below would be
+      # wrong. But a worker takes one unit, since the units are the grid's workers, and the bcast prologue relies on
+      # it too.
       return f"""  unsigned unit = a[0], b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = {col0};
   for (unsigned u = 0; u < a[1]; u++, unit++) {{
     {tiles_c}
@@ -937,8 +941,8 @@ def put_kernel(dtype):
   to last. The unit of the first row to land in a tile row does the work. It reads the tensor's tile once, then the
   tile of x for each row. It copies each row's two runs, the left and right face, in order, so a later row to the
   same place wins. Then it writes the tile back. No two workers write the same tile. 32 rows that fill a tile in
-  order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past the tensor's rows are
-  skipped.
+  order, like a prompt's starting at a tile boundary, use their tile of x as it is. Places past the tensor's last tile
+  row are skipped, and a place in the padding of its last tile row is written there.
 
   Into a block float, like a KV cache in bfp8 or bfp4, x is bf16 and each run of 16 rounds as a cast would. The run
   shares its largest exponent. bfp8 keeps 7 bits of magnitude rounded half up, as the packer does. bfp4 keeps 3 bits
@@ -1024,7 +1028,7 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   which is the bf16 or fp32 bits as an unsigned integer, with negatives flipped and -0 as 0. Once the worst kept value
   has no sign bit, a compare of the raw bits as signed integers is enough. At the end the heap is sorted, best first.
 
-  parts cuts each row into that many parts of cols columns. A split row needs cols to be a multiple of 32. The parts'
+  parts cuts each row into that many parts of cols columns. A split row needs k and cols to be multiples of 32. The parts'
   k best go side by side in the results, which are (batch, rows, parts k). Indices count columns across the row, not
   within the part. With labels, an index is read from an int32 tensor of x's shape at the picked column, as the 64
   bytes around it. Labels are for a topk over the best indices of the parts.
@@ -1358,8 +1362,8 @@ def transpose_kernel(rows, cols):
 
   Result tile (i, j) is tile (j, i) of x, transposed. BRISC fetches that tile with its off-diagonal faces swapped. Then
   unpacker 0 transposes each face on its way into SrcA, because Haloize_mode stays on in this kernel's config. x + 0
-  through the FPU leaves the transpose in Dst. A matmul that reads B transposed does the same, with the mode switched
-  on around its K loop (haloize)."""
+  through the FPU leaves the transpose in Dst. A matmul that reads B transposed also turns the mode on around its K
+  loop (haloize), but reads B's tiles as they lie and picks their faces by address (matmul_phase)."""
   # ct is the result's tile columns. frame(f) gives the slots of x and of the result in frame f.
   ct, frame = -(-rows // 32), lambda f: (FRAMES + 2 * f, FRAMES + 2 * f + 1)
   per = ct * -(-cols // 32)  # tiles in a matrix
