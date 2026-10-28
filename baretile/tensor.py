@@ -423,9 +423,11 @@ class Tensor:
   def rsqrt(self): return self.sqrt().reciprocal()
   def maximum(self, x): return self._binop("max", x)
   def minimum(self, x): return -((-self).maximum(-x))
-  def where(self, x, y):  # x where self isn't 0, else y. a condition of another dtype becomes 0 or 1 in theirs
+  def where(self, x, y):
+    """x where self isn't 0, else y. A condition of another dtype, or an int32 one that isn't a comparison's 0 or 1,
+    becomes 0 or 1 in theirs first, since the SFPU tests it as a float."""
     dtype = next((t.dtype for t in (x, y) if isinstance(t, Tensor)), self.dtype)
-    c = self if self.dtype == dtype else self.ne(0).cast(dtype)
+    c = self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmpne")) else self.ne(0).cast(dtype)
     return c._binop("keep", x) + c._binop("drop", y)
   def __add__(self, x): return self._binop("add", x)
   def __sub__(self, x): return self._binop("sub", x)

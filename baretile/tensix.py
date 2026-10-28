@@ -354,7 +354,8 @@ SFPU = {
 # They load into LRegs 0 and 1, and the result is stored over x. Comparisons give 1.0 or 0: the all ones or 0 from
 # SFPGT, ANDed with the bits of 1.0. x + 0 first turns -0 into 0. keep and drop are the two halves of where.
 # keep(c, x) is x if c else 0, and drop(c, y) is y if not c else 0, where c is true when it isn't 0. They work on the
-# bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would.
+# bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would. c's test is a float's, so an int32
+# c comes as 0 or 1 (Tensor.where).
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
 # In an fp32 kernel the SFPU also does add, sub and mul, rounding once as fp32 does. There, exp, the reciprocal and

@@ -1185,9 +1185,10 @@ def test_fp32(chip):
 def test_int32(chip):
   # int32 tensors stay two's complement through L1, Dst and the SFPU. Values move raw, stored as INT32, since the FP32
   # store flushes denormals, and small positive integers look like denormals. add and sub wrap like int32. max, min,
-  # comparisons (1 or 0) and where are exact over the full int32 range. Multiplies and sums go through fp32, exact
-  # below 2^24. Casts work both ways, and to an integer rounds toward zero. A float number makes fp32, and a float
-  # condition picks ints. gather reads its indices from an int32 tensor on the chip, so they can be computed there.
+  # comparisons (1 or 0) and where, whose condition holds where it isn't 0, negatives too, are exact over the full
+  # int32 range. Multiplies and sums go through fp32, exact below 2^24. Casts work both ways, and to an integer rounds
+  # toward zero. A float number makes fp32, and a float condition picks ints. gather reads its indices from an int32
+  # tensor on the chip, so they can be computed there.
   rng = np.random.default_rng(10)
   wrap = lambda a: (a + 2**31) % 2**32 - 2**31
   for workers in (chip.tensix[1], chip.tensix[-1]):
@@ -1200,6 +1201,7 @@ def test_int32(chip):
     tf = Tensor.of(rt, f.tolist(), "fp32")
     for got, want in [(tx, x), (tx + ty, wrap(x + y)), (tx - ty, wrap(x - y)), (tx.maximum(ty), np.maximum(x, y)), (tx.minimum(ty), np.minimum(x, y)),
                       (tx < ty, x < y), (tx != ts, x != s), (ts == 3, s == 3), (ts >= 0, s >= 0), ((ts > 0).where(tx, ty), np.where(s > 0, x, y)),
+                      (ts.where(tx, ty), np.where(s != 0, x, y)),
                       (ts * ts - 1, s * s - 1), (ts.sum(1), s.sum(0, keepdims=True)), (ts.max(), s.max(keepdims=True)), (ts.relu(), np.maximum(s, 0)),
                       (ts.float(), s), (ts.bfloat16(), s), (tf.cast("int32"), np.trunc(f)), ((tf > 0).where(ts, 0), np.where(f > 0, s, 0)),
                       (tf.gather(Tensor.of(rt, [[44, 0, 3, 44]], "int32")), f[[44, 0, 3, 44]])]:
