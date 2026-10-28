@@ -419,14 +419,20 @@ def across_rows(kind):
   """Fold the rows of the tile across their 32 columns. Columns 0-15 of row r are in Dst row (r // 16) * 32 + r % 16,
   and columns 16-31 are 16 rows further on. An SFPLOAD takes the even or odd columns of 4 such rows, one row per 8-lane
   group. Folding the four loads leaves 8 lanes for each row. Rotating the group by 1, 2 and 4 lanes and folding each
-  time leaves the row's result in all 8 lanes, and the stores write it back to all four positions."""
+  time leaves the row's result in all 8 lanes, and the stores write it back to all four positions.
+
+  A sum's fold is an SFPMAD, whose result takes two cycles, and the stall logic doesn't see that SFPSHFT2's rotation
+  reads it, so an SFPNOP goes between them (ISA SFPMAD.md, "Instruction scheduling"). A max's SFPSWAP stalls by
+  itself."""
   rot = lambda d, s: ins("SFPSHFT2", vd=d, vc=s, mod1=3)
+  gap = [ins("SFPNOP")] * (kind[:3] == "sum")
   p = list(SFPU_START)
   for base in (0, 4, 8, 12, 32, 36, 40, 44):
     at = [base, base + 2, base + 16, base + 18]  # even and odd columns, left and right face
     p += [sfp_load(r, a) for r, a in enumerate(at)]
-    p += [fold(kind, 0, 1), fold(kind, 2, 3), fold(kind, 0, 2)]
-    p += [rot(1, 0), fold(kind, 0, 1), rot(1, 0), rot(1, 1), fold(kind, 0, 1), rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
+    p += [fold(kind, 0, 1), fold(kind, 2, 3), fold(kind, 0, 2), *gap]
+    p += [rot(1, 0), fold(kind, 0, 1), *gap, rot(1, 0), rot(1, 1), fold(kind, 0, 1), *gap,
+          rot(1, 0), rot(1, 1), rot(1, 1), rot(1, 1), fold(kind, 0, 1)]
     p += [sfp_store(0, at=a, step=False) for a in at]
   return p
 def across_cols(kind):

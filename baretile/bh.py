@@ -173,6 +173,7 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   # SFPCAST mod1 0 turns a sign-magnitude int into a float. mod1 3 turns two's complement into sign-magnitude and back.
   "SFPCAST": (0x90, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPGT": (0x97, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 8: vd = all ones if vd > vc (as ordered floats), else 0
+  "SFPNOP": (0x8F, {}),
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
 UNPACK0, UNPACK1, PACK = 1, 2, 4  # cnt_set_mask: which address counters an ADC instruction sets
