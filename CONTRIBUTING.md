@@ -25,7 +25,7 @@ hangs.
 - A test that runs on ttsim. Compare kernels against NumPy.
 - The whole suite passing before you send it.
 - For a new or changed kernel, a passing run under [ttsim-chaos](docs/testing.md#ttsim-chaos),
-  which adds the NoC latency and core jitter that ttsim leaves out.
+  which adds the NoC latency, FPU and SFPU latency, and core jitter that ttsim leaves out.
 - For a refactor of a kernel, the same compiled bytes. Run the suite once before
   and once after with an empty cache (for example `XDG_CACHE_HOME=$(mktemp -d)`)
   and compare the images it leaves in `baretile/` under that cache. Images are

@@ -1,5 +1,5 @@
 diff --git a/src/libttsim.cpp b/src/libttsim.cpp
-index 42fe3c4..3f864d0 100644
+index 42fe3c4..3508988 100644
 --- a/src/libttsim.cpp
 +++ b/src/libttsim.cpp
 @@ -18,9 +18,13 @@ extern "C" API_EXPORT void libttsim_init() {
@@ -16,7 +16,7 @@ index 42fe3c4..3f864d0 100644
  extern "C" API_EXPORT void libttsim_exit() {
      TTSIM_VERIFY(s_ttsim_running, ConfigurationError, "sim is not running");
      ttsim_exit();
-@@ -126,13 +130,14 @@ static void clock_current_chip() {
+@@ -126,17 +130,18 @@ static void clock_current_chip() {
          for (;;) {
              for (uint32_t rv32_mask = p_tile->rv32_cores_active; rv32_mask; rv32_mask &= rv32_mask - 1) {
                  uint32_t rv32_index = __builtin_ctz(rv32_mask);
@@ -32,7 +32,20 @@ index 42fe3c4..3f864d0 100644
                      uint32_t inst_rd_ptr = p_tensix->inst_rd_ptr[pipe];
                      if (inst_rd_ptr != p_tensix->inst_wr_ptr[pipe]) {
                          uint32_t inst = p_tensix->inst[pipe][inst_rd_ptr];
-@@ -175,6 +180,7 @@ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
+-                        if (tensix_decode_and_execute(p_tensix, pipe, inst)) {
++                        if (chaos_tensix_issue(p_tensix, pipe, inst)) { // ttsim-chaos: through its wait gate
+                             any_tensix = true;
+                             inst_rd_ptr = (inst_rd_ptr + 1) % TENSIX_INST_FIFO_SIZE;
+                             p_tensix->inst_rd_ptr[pipe] = inst_rd_ptr;
+@@ -146,6 +151,7 @@ static void clock_current_chip() {
+                         }
+                     }
+                 }
++                if (chaos_tensix_math(p_tensix)) any_tensix = true; // ttsim-chaos: FPU and SFPU instructions that are due
+             }
+             if (!any_tensix) {
+                 break; // no Tensix instructions executed, bail out
+@@ -175,6 +181,7 @@ extern "C" API_EXPORT void libttsim_clock(uint32_t n_clocks) {
  #else
          clock_current_chip();
  #endif
@@ -41,7 +54,7 @@ index 42fe3c4..3f864d0 100644
      }
  #if NUM_CHIPS > 1
 diff --git a/src/libttsim.map b/src/libttsim.map
-index b850272..bb4ef1c 100644
+index b850272..b48acf0 100644
 --- a/src/libttsim.map
 +++ b/src/libttsim.map
 @@ -17,6 +17,7 @@
@@ -53,10 +66,34 @@ index b850272..bb4ef1c 100644
          *;
  };
 diff --git a/src/sim.h b/src/sim.h
-index 37259db..ab61815 100644
+index 37259db..04f9689 100644
 --- a/src/sim.h
 +++ b/src/sim.h
-@@ -343,6 +343,7 @@ struct TensixTile {
+@@ -212,10 +212,23 @@ struct TensixAddrCtrl {
+     uint32_t ch1_w_cr;
+ };
+ 
++// ttsim-chaos (TTSIM_CHAOS_MATH, tensix.cpp): a thread's latched STALLWAIT or SEMWAIT, and an FPU or SFPU instruction
++// that has passed its thread's wait gate and runs when it's due, with its thread's address modes as they were then
++#define CHAOS_ADDR_MODS 24
++struct ChaosWait { uint32_t block, conditions, sem_sel; bool sem; };
++struct ChaosMathInst { uint64_t due; uint32_t inst, pipe, sfpu; uint16_t addr_mods[CHAOS_ADDR_MODS]; };
++#define CHAOS_MATH_DEPTH 32
++
+ struct TensixState {
+     uint32_t tile_id;
+     uint32_t tensix_id;
+ 
++    // ttsim-chaos: each thread's wait gate, then the FPU and SFPU instructions that have passed one, in order: a ring, its
++    // first entry and size, and how many of them each thread has in the FPU (0) and the SFPU (1)
++    ChaosWait chaos_wait[TENSIX_INST_PIPES];
++    ChaosMathInst chaos_math[CHAOS_MATH_DEPTH];
++    uint32_t chaos_math_rd, chaos_math_n, chaos_math_thread[2][TENSIX_INST_PIPES];
++
+     uint32_t inst_pipes_active;
+     uint32_t inst[TENSIX_INST_PIPES][TENSIX_INST_FIFO_SIZE];
+     uint32_t inst_rd_ptr[TENSIX_INST_PIPES];
+@@ -343,6 +356,7 @@ struct TensixTile {
      uint32_t niu_mst_atomic_resp_received[NUM_NOCS];
      uint32_t niu_mst_wr_ack_received[NUM_NOCS];
      uint32_t niu_mst_rd_resp_received[NUM_NOCS];
@@ -64,7 +101,7 @@ index 37259db..ab61815 100644
      uint32_t niu_mst_posted_atomic_sent[NUM_NOCS];
      uint32_t niu_mst_nonposted_wr_req_sent[NUM_NOCS];
      uint32_t niu_mst_posted_wr_req_sent[NUM_NOCS];
-@@ -393,6 +394,7 @@ struct EthTile {
+@@ -393,6 +407,7 @@ struct EthTile {
      uint32_t niu_mst_atomic_resp_received[NUM_NOCS];
      uint32_t niu_mst_wr_ack_received[NUM_NOCS];
      uint32_t niu_mst_rd_resp_received[NUM_NOCS];
@@ -72,7 +109,7 @@ index 37259db..ab61815 100644
      uint32_t niu_mst_posted_atomic_sent[NUM_NOCS];
      uint32_t niu_mst_nonposted_wr_req_sent[NUM_NOCS];
      uint32_t niu_mst_posted_wr_req_sent[NUM_NOCS];
-@@ -578,6 +580,11 @@ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size)
+@@ -578,6 +593,15 @@ void libttsim_pci_dma_mem_wr_bytes(uint64_t paddr, const void *p, uint32_t size)
  void ttsim_init();
  void ttsim_exit();
  void ttsim_select_chip(uint32_t chip_id);
@@ -81,11 +118,146 @@ index 37259db..ab61815 100644
 +void chaos_tick();
 +bool chaos_skip_tensix();
 +bool chaos_skip_rv32();
++bool chaos_math_on();
++uint64_t chaos_math_due();
++bool chaos_tensix_issue(TensixState *p_tensix, uint32_t pipe, uint32_t inst);
++bool chaos_tensix_math(TensixState *p_tensix);
  bool ttsim_rv32_get_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id);
  void ttsim_rv32_set_core_active(char tile_type, uint32_t tile_id, uint32_t rv32_id, bool active);
  void ttsim_heartbeat();
+diff --git a/src/tensix.cpp b/src/tensix.cpp
+index 04e04c2..df191d1 100644
+--- a/src/tensix.cpp
++++ b/src/tensix.cpp
+@@ -181,7 +181,8 @@ static void mop_expander(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+ 
+ // Whether every instruction this thread has pushed has finished executing
+ bool tensix_thread_idle(const TensixState *p_tensix, uint32_t pipe) {
+-    return p_tensix->inst_rd_ptr[pipe] == p_tensix->inst_wr_ptr[pipe];
++    return p_tensix->inst_rd_ptr[pipe] == p_tensix->inst_wr_ptr[pipe]
++        && !p_tensix->chaos_math_thread[0][pipe] && !p_tensix->chaos_math_thread[1][pipe]; // ttsim-chaos: and its FPU and SFPU work
+ }
+ 
+ // Whether the thread's MOP Expander has finished expanding
+@@ -5247,3 +5248,116 @@ static bool tensix_execute_inst(TensixState *p_tensix, uint32_t pipe, uint32_t i
+ bool tensix_decode_and_execute(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
+     return tensix_execute_inst(p_tensix, pipe, inst);
+ }
++
++// ---- ttsim-chaos: Tensix units that take time, off unless TTSIM_CHAOS_MATH is set (see baretile's docs/testing.md) ----
++// ttsim runs each instruction when it reaches the head of its thread, and its STALLWAIT and SEMWAIT block the whole
++// thread. With TTSIM_CHAOS_MATH=lo,hi, a thread's instructions pass a wait gate as in the ISA's STALLWAIT.md instead. A
++// STALLWAIT or SEMWAIT latches there, and blocks only the instructions its block mask names until its conditions are
++// met. An FPU or SFPU instruction that passes the gate runs lo to hi clocks later, and reads Dst and the configuration
++// as they are then. FPU and SFPU instructions run in the order they passed the gate, with the address modes they saw
++// there, since tt-llk relies on their RWCs updating in that order: it moves the Dst counter with SETRWC between SFPU
++// instructions, and rewrites address modes with SETC16, without waiting. The other units still run an instruction when
++// it passes the gate. So a config write or SEMPOST that should wait for the FPU or SFPU, or a packer that a semaphore
++// lets in too early, sees that work unfinished unless a STALLWAIT holds it back.
++
++// The block mask bits that hold back each opcode, from the table in the Blackhole ISA's STALLWAIT.md. 0x040 is the
++// FPU and 0x100 the SFPU. Opcodes the table leaves out are held by any bit.
++static const uint16_t CHAOS_BLOCKED_BY[256] = {
++    0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x040, 0x040, 0x040, 0x040, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x040, 0x040, 0x040, 0x040, 0x1FF, 0x1FF, 0x040, 0x040, 0x040, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x1FF, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x040, 0x1FF, 0x040, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x011, 0x005, 0x009, 0x009, 0x001, 0x021, 0x021, 0x1FF, 0x021, 0x021, 0x005, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x021, 0x021, 0x021, 0x021, 0x021, 0x021, 0x001, 0x1FF,
++    0x021, 0x021, 0x021, 0x021, 0x021, 0x1FF, 0x021, 0x021, 0x021, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100,
++    0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100,
++    0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x002, 0x002, 0x1FF, 0x002, 0x002, 0x002, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x080, 0x080, 0x080, 0x080, 0x080, 0x080, 0x080, 0x080, 0x080, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF,
++    0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF, 0x1FF
++};
++enum { CHAOS_FPU = 0x040, CHAOS_SFPU = 0x100 };
++// The thread config registers that ApplyAddrMod reads (ISA RWCs.md): ADDR_MOD_AB_SEC0-7, ADDR_MOD_DST_SEC0-7 and
++// ADDR_MOD_BIAS_SEC0-7 in cfg_defines.h
++static const uint8_t CHAOS_ADDR_MOD_REGS[CHAOS_ADDR_MODS] = {12, 13, 14, 15, 16, 17, 18, 19, 28, 29, 30, 31, 32, 33, 34, 35,
++                                                              47, 48, 49, 50, 51, 52, 53, 54};
++static uint16_t *chaos_thread_cfg(TensixState *p_tensix, uint32_t pipe, uint32_t reg) {
++    switch (reg) {
++#define THREAD_CFG_REG_AT(i) case i: return &p_tensix->thread[pipe].thread_cfg##i;
++        FOR_EACH_THREAD_CFG_REG(THREAD_CFG_REG_AT)
++#undef THREAD_CFG_REG_AT
++    }
++    TTSIM_ERROR(AssertionFailure, "ttsim-chaos: no thread config register %u", reg);
++}
++// swaps the thread's address modes with the ones in modes
++static void chaos_swap_addr_mods(TensixState *p_tensix, uint32_t pipe, uint16_t *modes) {
++    for (uint32_t i = 0; i < CHAOS_ADDR_MODS; i++) std::swap(*chaos_thread_cfg(p_tensix, pipe, CHAOS_ADDR_MOD_REGS[i]), modes[i]);
++}
++
++// Whether the thread's latched wait must still hold. STALLWAIT conditions C4 and C11 wait for this thread's FPU and
++// SFPU instructions; C5, C7 and C8 for SrcA and SrcB as ttsim's STALLWAIT does. The rest are met at once, since
++// ttsim's other units take no time.
++static bool chaos_waiting(const TensixState *p_tensix, uint32_t pipe) {
++    const ChaosWait &w = p_tensix->chaos_wait[pipe];
++    if (w.sem) {
++        uint32_t i = __builtin_ctz(w.sem_sel);
++        return ((w.conditions & 1) && !p_tensix->sem[i]) || ((w.conditions & 2) && p_tensix->sem[i] >= p_tensix->sem_max[i]);
++    }
++    uint32_t c = w.conditions;
++    return ((c & 0x10) && p_tensix->chaos_math_thread[0][pipe]) || ((c & 0x800) && p_tensix->chaos_math_thread[1][pipe])
++        || ((c & 0x20) && (p_tensix->src_a_valid & (1 << p_tensix->src_a_unpack_bank)))
++        || ((c & 0x80) && !(p_tensix->src_a_valid & (1 << p_tensix->src_a_matrix_bank)))
++        || ((c & 0x100) && !(p_tensix->src_b_valid & (1 << p_tensix->src_b_matrix_bank)));
++}
++
++// Passes the instruction at the head of a thread through its wait gate. Returns false if it must wait there.
++bool chaos_tensix_issue(TensixState *p_tensix, uint32_t pipe, uint32_t inst) {
++    if (!chaos_math_on()) return tensix_decode_and_execute(p_tensix, pipe, inst);
++    uint32_t opcode = bits<31,24>(inst), blocked_by = CHAOS_BLOCKED_BY[opcode];
++    ChaosWait &w = p_tensix->chaos_wait[pipe];
++    if (w.block && !chaos_waiting(p_tensix, pipe)) w.block = 0; // its conditions are met, so it's forgotten
++    if (w.block & blocked_by) return false;
++    if (opcode == TENSIX_OPCODE_STALLWAIT) {
++        uint32_t wait_res = bits<12,0>(inst), stall_res = bits<23,15>(inst);
++        TTSIM_VERIFY(!(wait_res & ~0x1DBF), UnimplementedFunctionality, "ttsim-chaos: STALLWAIT wait_res=0x%x", wait_res);
++        w = {stall_res ? stall_res : 1u << 6, wait_res ? wait_res : 0xFu, 0, false};
++        return true;
++    }
++    if (opcode == TENSIX_OPCODE_SEMWAIT) {
++        uint32_t cond = bits<1,0>(inst), sem_sel = bits<9,2>(inst), stall_res = bits<23,15>(inst);
++        TTSIM_VERIFY(__builtin_popcount(sem_sel) == 1, UnsupportedFunctionality, "sem_sel=0x%x is not one-hot", sem_sel);
++        TTSIM_VERIFY(cond, UndefinedBehavior, "wait_sem_cond=%d", cond);
++        w = {stall_res ? stall_res : 1u << 6, cond, sem_sel, true};
++        return true;
++    }
++    if (blocked_by != CHAOS_FPU && blocked_by != CHAOS_SFPU) return tensix_decode_and_execute(p_tensix, pipe, inst);
++    uint32_t sfpu = blocked_by == CHAOS_SFPU;
++    if (p_tensix->chaos_math_n == CHAOS_MATH_DEPTH) return false; // full, so the thread waits
++    ChaosMathInst &m = p_tensix->chaos_math[(p_tensix->chaos_math_rd + p_tensix->chaos_math_n++) % CHAOS_MATH_DEPTH];
++    m = {chaos_math_due(), inst, pipe, sfpu, {}};
++    for (uint32_t i = 0; i < CHAOS_ADDR_MODS; i++) m.addr_mods[i] = *chaos_thread_cfg(p_tensix, pipe, CHAOS_ADDR_MOD_REGS[i]);
++    p_tensix->chaos_math_thread[sfpu][pipe]++;
++    return true;
++}
++
++// Runs the FPU and SFPU instructions that are due, in order. Returns whether any ran.
++bool chaos_tensix_math(TensixState *p_tensix) {
++    bool ran = false;
++    while (p_tensix->chaos_math_n) {
++        ChaosMathInst &head = p_tensix->chaos_math[p_tensix->chaos_math_rd];
++        if (head.due > g_clock) break;
++        chaos_swap_addr_mods(p_tensix, head.pipe, head.addr_mods); // its address modes in, and the thread's out
++        bool done = tensix_decode_and_execute(p_tensix, head.pipe, head.inst);
++        chaos_swap_addr_mods(p_tensix, head.pipe, head.addr_mods); // and back
++        if (!done) break;
++        p_tensix->chaos_math_thread[head.sfpu][head.pipe]--;
++        p_tensix->chaos_math_rd = (p_tensix->chaos_math_rd + 1) % CHAOS_MATH_DEPTH;
++        p_tensix->chaos_math_n--;
++        ran = true;
++    }
++    return ran;
++}
 diff --git a/src/tile.cpp b/src/tile.cpp
-index 4d19315..8b42125 100644
+index 4d19315..6dcc50f 100644
 --- a/src/tile.cpp
 +++ b/src/tile.cpp
 @@ -2,6 +2,8 @@
@@ -97,7 +269,7 @@ index 4d19315..8b42125 100644
  #include "sim.h"
  #include "topology.h"
  #include "eth_fw_blob.h" // generated
-@@ -24,7 +26,99 @@ static inline auto get_tile(uint32_t tile_id) {
+@@ -24,7 +26,108 @@ static inline auto get_tile(uint32_t tile_id) {
      }
  }
  
@@ -115,8 +287,8 @@ index 4d19315..8b42125 100644
 +    uint32_t regs[10]; // targ lo, mid, hi, ret lo, mid, hi, packet tag, ctrl, at_len_be, at_data
 +};
 +static struct {
-+    uint32_t noc_lo = 0, noc_hi = 0, tensix_stall = 0, rv32_skip = 0; // noc_* in clocks, the others per million
-+    bool noc = false, replaying = false;
++    uint32_t noc_lo = 0, noc_hi = 0, math_lo = 0, math_hi = 0, tensix_stall = 0, rv32_skip = 0; // noc_* and math_* in clocks, the others per million
++    bool noc = false, math = false, replaying = false;
 +    uint64_t rng = 0x9E3779B97F4A7C15ull, seq = 0;
 +    std::map<std::pair<uint64_t, uint64_t>, ChaosRequest> pending; // by (due clock, issue order)
 +    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> last_due; // static VC order
@@ -131,12 +303,18 @@ index 4d19315..8b42125 100644
 +
 +void chaos_init() {
 +    const char *seed = getenv("TTSIM_CHAOS_SEED"), *noc = getenv("TTSIM_CHAOS_NOC");
-+    const char *tensix = getenv("TTSIM_CHAOS_TENSIX"), *rv32 = getenv("TTSIM_CHAOS_RISCV");
++    const char *tensix = getenv("TTSIM_CHAOS_TENSIX"), *rv32 = getenv("TTSIM_CHAOS_RISCV"), *math = getenv("TTSIM_CHAOS_MATH");
 +    if (seed) s_chaos.rng = strtoull(seed, nullptr, 0) * 0x9E3779B97F4A7C15ull + 1;
 +    if (noc) {
 +        TTSIM_VERIFY(sscanf(noc, "%u,%u", &s_chaos.noc_lo, &s_chaos.noc_hi) == 2 && s_chaos.noc_lo <= s_chaos.noc_hi, ConfigurationError,
 +            "TTSIM_CHAOS_NOC=%s: want lo,hi clocks", noc);
 +        s_chaos.noc = true;
++    }
++    if (math) {
++        TTSIM_VERIFY(sscanf(math, "%u,%u", &s_chaos.math_lo, &s_chaos.math_hi) == 2 && s_chaos.math_lo <= s_chaos.math_hi, ConfigurationError,
++            "TTSIM_CHAOS_MATH=%s: want lo,hi clocks", math);
++        s_chaos.math = true;
++        fprintf(stderr, "ttsim-chaos: FPU and SFPU instructions run %u..%u clocks after their wait gate\n", s_chaos.math_lo, s_chaos.math_hi);
 +    }
 +    if (tensix) s_chaos.tensix_stall = uint32_t(atof(tensix) * 1e6);
 +    if (rv32) s_chaos.rv32_skip = uint32_t(atof(rv32) * 1e6);
@@ -149,6 +327,9 @@ index 4d19315..8b42125 100644
 +
 +bool chaos_skip_tensix() { return s_chaos.tensix_stall && chaos_rand() % 1000000 < s_chaos.tensix_stall; }
 +bool chaos_skip_rv32() { return s_chaos.rv32_skip && chaos_rand() % 1000000 < s_chaos.rv32_skip; }
++// whether TTSIM_CHAOS_MATH is set, and when an FPU or SFPU instruction that passes its wait gate now runs
++bool chaos_math_on() { return s_chaos.math; }
++uint64_t chaos_math_due() { return g_clock + s_chaos.math_lo + chaos_rand() % (s_chaos.math_hi - s_chaos.math_lo + 1); }
 +
 +static uint32_t chaos_outgoing(char tile_type, uint32_t tile_id, uint32_t noc_instance, uint32_t txn_id) {
 +    if (tile_type != 'T') return 0;
@@ -198,7 +379,7 @@ index 4d19315..8b42125 100644
      TTSIM_ASSERT(chip_id < NUM_CHIPS);
  #if TT_ARCH_VERSION == 0
  #if NUM_CHIPS == 1
-@@ -42,7 +136,7 @@ static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
+@@ -42,7 +145,7 @@ static constexpr uint32_t logical_harvesting_mask(uint32_t chip_id) {
      return LOGICAL_HARVESTING_MASKS[chip_id];
  #else
  #if NUM_CHIPS == 1
@@ -207,7 +388,7 @@ index 4d19315..8b42125 100644
  #elif NUM_CHIPS == 2
      constexpr uint32_t LOGICAL_HARVESTING_MASKS[] = {0x2080, 0x110}; // P300
  #elif NUM_CHIPS == 4
-@@ -1350,6 +1444,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1350,6 +1453,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
          case NOC_REGS_NIU_MST_ATOMIC_RESP_RECEIVED: return p_tile->niu_mst_atomic_resp_received[noc_instance];
          case NOC_REGS_NIU_MST_WR_ACK_RECEIVED: return p_tile->niu_mst_wr_ack_received[noc_instance];
          case NOC_REGS_NIU_MST_RD_RESP_RECEIVED: return p_tile->niu_mst_rd_resp_received[noc_instance];
@@ -215,7 +396,7 @@ index 4d19315..8b42125 100644
          case NOC_REGS_NIU_MST_POSTED_ATOMIC_SENT: return p_tile->niu_mst_posted_atomic_sent[noc_instance];
          case NOC_REGS_NIU_MST_NONPOSTED_WR_REQ_SENT: return p_tile->niu_mst_nonposted_wr_req_sent[noc_instance];
          case NOC_REGS_NIU_MST_POSTED_WR_REQ_SENT: return p_tile->niu_mst_posted_wr_req_sent[noc_instance];
-@@ -1386,7 +1481,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1386,7 +1490,8 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(13):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(14):
          case NOC_REGS_NIU_MST_WRITE_REQS_OUTGOING_ID(15):
@@ -225,7 +406,7 @@ index 4d19315..8b42125 100644
          default:
              return base_noc_regs_rd32(&p_tile->base, tile_type, tile_id, noc_instance, offset);
      }
-@@ -1394,6 +1490,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
+@@ -1394,6 +1499,7 @@ static uint32_t noc_regs_rd32(uint32_t tile_id, uint32_t noc_instance, uint32_t
  
  template<char tile_type>
  static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_buf) {
@@ -233,7 +414,7 @@ index 4d19315..8b42125 100644
      auto *p_tile = get_tile<tile_type>(tile_id);
      uint32_t noc_at_len_be = p_tile->noc_at_len_be[noc_instance][cmd_buf];
      uint32_t txn_id = bits<13,10>(p_tile->noc_packet_tag[noc_instance][cmd_buf]);
-@@ -1614,6 +1711,39 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
+@@ -1614,6 +1720,39 @@ static void noc_cmd_ctrl(uint32_t tile_id, uint32_t noc_instance, uint32_t cmd_b
          }
          tile_rd_bytes(src_coordinate, src_addr, &p_tile->sram[dst_addr], noc_at_len_be);
          p_tile->niu_mst_rd_resp_received[noc_instance]++;
@@ -273,7 +454,7 @@ index 4d19315..8b42125 100644
      }
  }
  
-@@ -2497,7 +2627,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
+@@ -2497,7 +2636,7 @@ static uint32_t arc_reset_unit_rd32(uint32_t offset) {
      }
  }
  
