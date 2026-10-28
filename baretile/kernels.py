@@ -1457,7 +1457,7 @@ void kmain(volatile unsigned *a) {{
     unsigned t = a[0] + u;
     int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
     int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
-    unsigned e = e0 + b * sb + i * 32 * sr + j * 32 * sc, row = e / xc % xr, col = e % xc;  // where the tile starts in x
+    unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr, col = e % xc;
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
       if (whole) {{ noc_get(BANK(src), AT(base, src, {tb}), OUT, {tb}); noc_wait(); }}  // x's tile src as it is
@@ -1476,7 +1476,7 @@ void kmain(volatile unsigned *a) {{
       int lines0 = down ? c0 : r0, lines1 = down ? (cols == 1 && c1 ? 1 : c1) : r1, k0 = down ? r0 : c0, k1 = down ? r1 : c1;
       for (int line = lines0; line < lines1; line++) {{
         int r = down ? k0 : line, c = down ? line : k0;
-        unsigned e_line = e0 + b * sb + (rows == 1 ? 0 : i * 32 + r) * sr + (cols == 1 ? 0 : j * 32 + c) * sc;
+        unsigned e_line = (unsigned)e0 + (unsigned)b * sb + (rows == 1 ? 0u : i * 32u + r) * sr + (cols == 1 ? 0u : j * 32u + c) * sc;
         unsigned xrow = e_line / xc, xb = xrow / xr, xi = xrow % xr, xj = e_line % xc;
         for (int k = k0; k < k1;) {{
           unsigned xt = xb * bstride + xi / 32 * stride + xj / 32 + offset;
