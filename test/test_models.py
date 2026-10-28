@@ -777,7 +777,7 @@ def test_ramp(ramp):
   run = subprocess.run([sys.executable, str(root / "ramps" / ramp)], capture_output=True, text=True, timeout=600, cwd=root)
   assert run.returncode == 0 and run.stdout.strip().splitlines()[-1].startswith("the ramp ran"), run.stdout + run.stderr
 
-@pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to libttsim.so from ttsim's two-chip build (bh_x2)")
+@pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to ttsim's two-chip libttsim_bh_x2.so")
 def test_two_chips():
   # ttsim's two-chip build is a P300: two Blackholes joined by two Ethernet links. It runs in its own process, since a
   # process can load only one libttsim. Chip.links must pair the links, Chip.send and Tensor.to must move data across
