@@ -1035,6 +1035,14 @@ def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
   with open(os.path.join(folder, ".done"), "w"): pass
   return folder
 
+def generation_defaults(model, generation):
+  """Resolve EOS and sampling defaults per field: generation, selected text model, then outer model config.
+  An explicit null EOS disables automatic end tokens."""
+  fields = model | (model.get("text_config") or {}) | generation
+  eos = fields.get("eos_token_id")
+  defaults = {k: v for k, v in fields.items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
+  return eos if isinstance(eos, list) else [] if eos is None else [eos], defaults
+
 def main():
   from baretile import pci
   from baretile.chip import Chip
@@ -1048,9 +1056,7 @@ def main():
   engine = Engine(rt, llama.upload(rt, weights, c.precision), c, llama.Tokenizer(folder), slots, places)
   config = lambda f: llama.read_json(os.path.join(folder, f)) if os.path.exists(os.path.join(folder, f)) else {}
   generation, name = config("generation_config.json"), os.path.basename(folder.rstrip("/"))
-  eos = (generation or config("config.json")).get("eos_token_id")
-  eos = eos if isinstance(eos, list) else [] if eos is None else [eos]
-  defaults = {k: v for k, v in generation.items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
+  eos, defaults = generation_defaults(config("config.json"), generation)
   threading.Thread(target=engine.run, daemon=True).start()
   print(f"{name} is on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} positions, "
         f"prefilling {engine.chunk} tokens at a time, on port {port}", flush=True)
