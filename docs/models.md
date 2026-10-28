@@ -141,9 +141,10 @@ You can run an existing tinygrad script through the adapter:
 python3 adapters/tinygrad_baretile.py /path/to/script.py
 ```
 
-Install tinygrad or put its checkout on `PYTHONPATH`. The tests also accept a
-checkout in `TINYGRAD`. The adapter calls tinygrad's internal APIs, so a tinygrad
-update can break it.
+The adapter calls tinygrad's internal APIs, so a tinygrad update can break it.
+CI tests it on the tinygrad commit pinned in
+[.github/workflows/test.yml](../.github/workflows/test.yml). Put a checkout of
+that commit on `PYTHONPATH`, or in `TINYGRAD` for the tests.
 
 Unsupported operations fall back to tinygrad's CPU device. These include
 64-bit integers, bit operations, random-number generation and symbolic shapes.

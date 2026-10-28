@@ -1,6 +1,7 @@
 # For every push and pull request: build and check the wheel on Python 3.12 to 3.14, run ruff and the test suite on
-# ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. Tests that need checkpoints, PyTorch,
-# transformers, tiktoken or tinygrad skip themselves here.
+# ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. The suite on ttsim includes the
+# adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or tiktoken
+# skip themselves here.
 name: test
 on: [push, pull_request]
 permissions:
@@ -46,6 +47,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh.so --pattern libttsim_bh_x2.so --dir "$RUNNER_TEMP/ttsim"
+      # The adapter calls tinygrad's internal APIs, so its tests run on this tinygrad commit. Move the pin and the
+      # adapter together.
+      - name: Check out tinygrad
+        run: |
+          git init -q "$RUNNER_TEMP/tinygrad"
+          git -C "$RUNNER_TEMP/tinygrad" fetch -q --depth 1 https://github.com/tinygrad/tinygrad 002630241913a57abccf646b092878ec8a9b882f
+          git -C "$RUNNER_TEMP/tinygrad" checkout -q FETCH_HEAD
       # Compiled kernels are cached by their source, so a cache from an older commit only saves time.
       - uses: actions/cache@v4
         with:
@@ -57,6 +65,7 @@ jobs:
         env:
           TTSIM: ${{ runner.temp }}/ttsim/libttsim_bh.so
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
+          TINYGRAD: ${{ runner.temp }}/tinygrad
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
   # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
   # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. The other job runs the suite on all 140
