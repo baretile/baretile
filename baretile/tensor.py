@@ -42,7 +42,7 @@ class Tensor:
     self.requires_grad = on
     return self
   def _where(self, runs=False):  # the address and tile strides a kernel reads it by, or for a tensor by columns, its runs
-    assert runs or not self.runs, "a tensor by columns can only be a matmul's B, or read back"
+    if not (runs or not self.runs): raise ValueError("a tensor by columns can only be a matmul's B, or read back")
     return (self.addr, *self.runs) if self.runs else (self.addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
@@ -79,7 +79,7 @@ class Tensor:
     """Upload little-endian values in row-major order, with matrices stored consecutively. Convert to tile
     layout in 8-byte chunks, then write each bank: through the BAR below DMA_UPLOAD bytes, and through
     upload_kernel from there. Either way the values are in DRAM on return. Model weights use this path."""
-    assert dtype not in BFP, "upload as bf16, then cast on the chip to a block-float format"
+    if dtype in BFP: raise ValueError("upload as bf16, then cast on the chip to a block-float format")
     if dtype not in ITEMSIZE: raise ValueError(f"unknown tensor dtype: {dtype}")
     batch, rows, cols = _shape((batch, rows, cols))
     n, tr, tc, data = ITEMSIZE[dtype], -(-rows // 32), -(-cols // 32), memoryview(data).cast("B")
@@ -164,10 +164,10 @@ class Tensor:
     """Read rows selected by ids. Accept a Python list or an int32 tensor row, so indices can be computed on
     the chip. Python indices are bounds-checked; tensor indices aren't."""
     if not isinstance(ids, Tensor):
-      assert all(0 <= i < self.rows for i in ids)
+      if not all(0 <= i < self.rows for i in ids): raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
       ids = Tensor.of(self.rt, [list(ids)], "int32")
     self._same_runtime(ids)
-    assert self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1), "gather needs batch 1, and ids as an int32 row"
+    if not (self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1)): raise ValueError("gather needs batch 1, and ids as an int32 row")
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     addr, _, stride, offset = _plain(self.realize())._where()
     return out.run(("gather", d), lambda: gather_kernel(d), out.addr, addr, stride, offset,
@@ -177,18 +177,19 @@ class Tensor:
     """Write x into rows selected by ids, in place. Models use this to update KV caches without changing the
     shape of a decode step. For a block-float destination, x is bf16 and is rounded as in cast."""
     self._same_runtime(ids, x)
-    assert ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows, "ids must be an int32 row with one position per row of x"
-    assert (x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype), \
-      f"{x.shape} {x.dtype} into {self.shape} {self.dtype}"
-    assert self.rep == 1, "put requires a tensor with rep=1"
+    if not (ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows):
+      raise ValueError("put needs ids as an int32 row, with one position for each row of x")
+    if not ((x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype)):
+      raise ValueError(f"put needs rows of the cache's batch and width, bf16 for a block float: {x.shape} {x.dtype} into {self.shape} {self.dtype}")
+    if self.rep != 1: raise ValueError("put requires a tensor with rep=1")
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
-    assert 2 * x.rows + tr <= 2**17, "too many rows to track in a worker's L1"
+    if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
     return self.realize().run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
                               ids.offset, x.rows, tc, tr, units=self.batch * x.rows * tc, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, runs=None):
-    assert self.rep == 1, "can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored"
-    assert not self.runs or runs, "a tensor by columns can only be viewed by split, cutting K into a batch"
+    if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
+    if not (not self.runs or runs): raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
     v.offset, v.bstride, v.stride, v.runs = self.offset + offset, bstride, self.stride, runs
@@ -205,10 +206,11 @@ class Tensor:
       if not -self.batch <= key < self.batch: raise IndexError(f"batch index {key} outside a batch of {self.batch}")
       key %= self.batch
       return self._view(self.rows, self.cols, 1, key * self.bstride)._track("index", (self,), key)
-    assert isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key), "x[b], x[rows, cols] or x[batch, rows, cols]"
+    if not (isinstance(key, tuple) and len(key) in (2, 3) and all(isinstance(k, slice) for k in key)):
+      raise ValueError(f"index a tensor as x[b], x[rows, cols] or x[batch, rows, cols] with slices, not x[{key!r}]")
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
     shape = tuple(map(len, ranges))
-    assert all(shape), f"an empty slice of {self.shape}"
+    if not all(shape): raise ValueError(f"an empty slice of {self.shape}")
     if all(g.step > 0 if ax == 0 else g.step == 1 and g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1)
            for ax, (g, n) in enumerate(zip(ranges, self.shape))):  # tile-aligned. a slice of length 1 must be a copy, filling its tile
       if terms := _terms(self): return sum((t[key] for t in terms[1:]), terms[0][key])
@@ -236,16 +238,16 @@ class Tensor:
     return x.move(shape, offset + sum(strides[k] * o for k, o in zip(axes, starts)), [strides[k] * s for k, s in zip(axes, steps)], *zip(*inside))
   def reshape(self, *shape):  # up to three sizes. missing leading sizes are 1
     shape = _shape(shape)
-    assert math.prod(shape) == math.prod(self.shape), f"cannot reshape {self.shape} to {shape}"
+    if math.prod(shape) != math.prod(self.shape): raise ValueError(f"cannot reshape {self.shape} to {shape}")
     return self if shape == self.shape else self.move(shape, 0, (shape[1] * shape[2], shape[2], 1))._track("reshape", (self,))
   def permute(self, *order):
-    assert sorted(order) == [0, 1, 2]
+    if sorted(order) != [0, 1, 2]: raise ValueError(f"permute needs an order of the axes 0, 1 and 2, not {order}")
     if order == (0, 2, 1): return self.T
     if order == (0, 1, 2): return self
     return self._map(tuple(self.shape[k] for k in order), order, (0, 0, 0), (1, 1, 1))._track("permute", (self,), order)
   def expand(self, *shape):  # repeats dimensions of 1. missing leading sizes are 1
     shape = _shape(shape)
-    assert all(n in (m, 1) for n, m in zip(self.shape, shape)), f"cannot expand {self.shape} to {shape}"
+    if not all(n in (m, 1) for n, m in zip(self.shape, shape)): raise ValueError(f"cannot expand {self.shape} to {shape}")
     if shape == self.shape: return self
     return self._map(shape, (0, 1, 2), (0, 0, 0), [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
   def pad(self, widths):  # zeros, with (before, after) for each of the last len(widths) axes, like numpy
@@ -258,7 +260,8 @@ class Tensor:
     axis = operator.index(axis)
     if not -3 <= axis < 3: raise ValueError(f"axis {axis} outside a tensor's three dimensions")
     ts, axis = (self, *xs), axis % 3
-    assert all(t.shape[a] == self.shape[a] for t in xs for a in range(3) if a != axis), "cat requires matching dimensions outside its axis"
+    if not all(t.shape[a] == self.shape[a] for t in xs for a in range(3) if a != axis):
+      raise ValueError("cat requires matching dimensions outside its axis")
     n, out, at = sum(t.shape[axis] for t in ts), None, 0
     for t in ts:
       widths = [(0, 0)] * 3
@@ -280,14 +283,16 @@ class Tensor:
     n, axis = operator.index(n), operator.index(axis)
     if n <= 0: raise ValueError("split needs a positive number of parts")
     if terms := _terms(self): return sum((t.split(n, axis) for t in terms[1:]), terms[0].split(n, axis))
-    assert axis in (1, 2)
+    if axis not in (1, 2): raise ValueError(f"split cuts columns (axis 2) or rows (axis 1), not axis {axis}")
     if self.runs:  # by columns, split cuts K: each part reads further along the same runs
-      assert axis == 1 and self.batch == 1 and self.rows % (32 * n) == 0, "a tensor by columns splits K, with batch 1, into tile-aligned parts"
+      if not (axis == 1 and self.batch == 1 and self.rows % (32 * n) == 0):
+        raise ValueError("a tensor by columns splits K, with batch 1, into tile-aligned parts")
       return self._view(self.rows // n, self.cols, n, 0, runs=(0, self.runs[1], self.rows // n // 32))._track("split", (self,), axis)
     if axis == 2:
-      assert self.batch == 1 and self.cols % (32 * n) == 0, "split needs batch 1 and tile-aligned parts"
+      if not (self.batch == 1 and self.cols % (32 * n) == 0): raise ValueError("split needs batch 1 and tile-aligned parts")
       return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
-    assert self.rows % (32 * n) == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride), "tile-aligned parts, contiguous matrices"
+    if not (self.rows % (32 * n) == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride)):
+      raise ValueError("split along rows needs tile-aligned parts of matrices stored one after another")
     return self._view(self.rows // n, self.cols, self.batch * n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
   def merge(self):
@@ -310,10 +315,11 @@ class Tensor:
     view passed as into."""
     if into is not None:
       self._same_runtime(into)
-      assert into.op is None and (into.shape, into.dtype) == (self.shape, self.dtype), "realize needs a destination of the same shape and dtype"
+      if not (into.op is None and (into.shape, into.dtype) == (self.shape, self.dtype)):
+        raise ValueError("realize needs a destination of the same shape and dtype")
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
-      assert into is None, "a transpose or a move writes a tensor of its own"
+      if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
       x, op, self.op, self.srcs, d = _plain(self.srcs[0].realize()), self.op, None, (), self.dtype
       self.addr = self._alloc()
       where = (self.addr, *x._where())
@@ -330,7 +336,7 @@ class Tensor:
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs), self.rt.readers)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
-    assert not (into and into.runs), "can't realize into a tensor by columns"
+    if into and into.runs: raise ValueError("can't realize into a tensor by columns")
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
@@ -344,8 +350,8 @@ class Tensor:
     other tiles too, which may already be overwritten, so they're realized first and copied in. Overlapping
     views with different layouts also copy their source before writing."""
     self._same_runtime(x)
-    assert self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype), \
-      "assign requires a realized tensor with rep=1 and an x of the same shape and dtype"
+    if not (self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype)):
+      raise ValueError("assign requires a realized tensor with rep=1 and an x of the same shape and dtype")
     if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     reads = [x] if x.op is None else [s for t in _lazy(x, set()) for s in t.srcs]
     layout = lambda t: (t.shape, t.bstride, t.stride, t.offset, t.rep)
@@ -384,7 +390,7 @@ class Tensor:
     if not isinstance(x, Tensor): x = self.number(x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
     a, b = (x, self) if reverse else (self, x)
     if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32_OPS): a, b = a.float(), b.float()
-    assert all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)), f"cannot broadcast {a.shape} with {b.shape}"
+    if not all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)): raise ValueError(f"cannot broadcast {a.shape} with {b.shape}")
     batch, rows, cols = map(max, a.shape, b.shape)
     return Tensor(self.rt, rows, cols, op, (a, b), batch, a.dtype)
   def cast(self, dtype):  # bfp4 isn't lazy: bfp4_kernel makes it now from the bf16 value, and says why
@@ -397,7 +403,7 @@ class Tensor:
     """Store each tile column of B together so matmul can read several tiles along K per request.
     Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
     readback and use as matmul's B, including indexed selection and splits along K."""
-    assert self.dtype in ("bf16", *BFP), "bf16 or a block float: a matmul's B"
+    if self.dtype not in ("bf16", *BFP): raise ValueError(f"columns lays out a matmul's B, which is bf16 or a block float, not {self.dtype}")
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
     out = Tensor(self.rt, self.rows, self.cols, "view", batch=self.batch, dtype=self.dtype)
@@ -466,8 +472,10 @@ class Tensor:
     k, parts = operator.index(k), operator.index(parts)
     if k <= 0 or parts <= 0: raise ValueError("topk needs positive k and parts")
     cols = self.cols // parts
-    assert self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols, "bf16 or fp32, k up to 64, and equal parts"
-    assert labels is None or (labels.dtype == "int32" and labels.shape == self.shape and parts == 1), "labels need int32, x's shape and parts=1"
+    if not (self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols):
+      raise ValueError(f"topk needs bf16 or fp32, k up to 64 and a part's width, and equal parts: {self.dtype}, k={k}, {parts} parts of {self.cols}")
+    if not (labels is None or (labels.dtype == "int32" and labels.shape == self.shape and parts == 1)):
+      raise ValueError("topk's labels need int32, x's shape and parts=1")
     x, labels = _plain(self.realize()), None if labels is None else _plain(labels.realize())
     values = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype=x.dtype)
     ids = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype="int32")
@@ -478,9 +486,10 @@ class Tensor:
     """Copy to rt's chip over Ethernet channel ch, with channel back at the peer (see Chip.links). Wait for
     queued launches on both chips before clearing the transfer flags. This can't be recorded because replay
     wouldn't clear those flags again."""
-    assert rt is not self.rt and self.rt.log is None and rt.log is None, "to requires different runtimes with neither recording launches"
+    if not (rt is not self.rt and self.rt.log is None and rt.log is None):
+      raise ValueError("to requires different runtimes with neither recording launches")
     x = self.realize()
-    assert not x.runs, "a tensor by columns can only be a matmul's B, or read back"
+    if x.runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
     if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # copy a view into a tensor of its own first
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
     x.rt.wait(), rt.wait()
@@ -515,20 +524,21 @@ class Tensor:
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("matmul fidelity must be between one and four phases")
     if index is not None:
-      assert index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols), \
-        f"{self.shape} @ {x.shape} picked by {index.shape} {index.dtype}"
+      if not (index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols)):
+        raise ValueError(f"matmul by index needs bf16 A and int32 indices to fit: {self.shape} {self.dtype} @ {x.shape}, {index.shape} {index.dtype}")
       out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x, index), index.rows * index.cols, dtype or "bf16")
       out.fidelity = fidelity
       return out
     # an unrealized sum times a small matrix goes term by term, as when RoPE turns the parts of a split K
     if x.tiles <= 16 and (terms := _terms(self)):
       return sum((t.matmul(x, dtype, fidelity) for t in terms[1:]), terms[0].matmul(x, dtype, fidelity))
-    assert "int32" not in (self.dtype, x.dtype), "the FPU multiplies floats"
+    if "int32" in (self.dtype, x.dtype): raise ValueError(f"matmul needs floats, since the FPU has no int32: {self.dtype} @ {x.dtype}")
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
     if "fp32" in (self.dtype, x.dtype):  # autograd sees one op, and keeps the bf16 parts for the two fp32 matmuls of backward
       a, b = _parts(self), _parts(x)
       return _bf16x3(a, b)._track("matmul", (self, x), a, b).cast(dtype)
-    assert self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch)), f"{self.shape} @ {x.shape}"
+    if not (self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch))):
+      raise ValueError(f"matmul needs A's columns to match B's rows, and batches that match or broadcast: {self.shape} @ {x.shape}")
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     k, tr = -(-self.cols // 32), -(-self.rows // 32)
     # A row of tiles, like a token's MLP, has too few blocks to keep the workers busy. Cut K into s parts as a batch,
@@ -556,10 +566,12 @@ class Tensor:
     if not 1 <= fidelity <= 4: raise ValueError("attention fidelity must be between one and four phases")
     if window < 0 or parts is not None and parts <= 0: raise ValueError("attention needs a nonnegative window and positive parts")
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
-    assert self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch
-    assert self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows
-    assert places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32", \
-      f"{self.shape} by {k.shape}, {places.shape}"
+    if not (self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch):
+      raise ValueError(f"attend needs bf16 queries, keys and values in one format, repeated alike, equal batches: {self.dtype} {k.dtype} {v.dtype}")
+    if not (self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows):
+      raise ValueError(f"attend needs heads of one width, 64 or more in steps of 32, and a value for each key: {self.shape} {k.shape} {v.shape}")
+    if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32"):
+      raise ValueError(f"attend needs places as an int32 column with a row for each query: {places.shape} {places.dtype} for {self.shape}")
     units, wt = self.batch * -(-ra // 8), k.dtype if k.dtype in BFP else None
     P = parts or attention_parts(ht, self.rows, wt, kt, units, len(self.rt.cores))
     q, places = (_plain(t.realize()) for t in (self, places))
@@ -582,7 +594,8 @@ class Tensor:
     flattened to a row, from ky * W + kx on, so column y * W + x of the stacked taps is the patch at (y, x). Columns
     that wrap past the right edge are dropped."""
     k = math.isqrt(w.cols)
-    assert k * k == w.cols and w.rows == self.batch, f"{self.shape} by {w.shape}: (out, in, k * k)"
+    if not (k * k == w.cols and w.rows == self.batch):
+      raise ValueError(f"conv2d needs w as (out channels, in channels, k * k), an in channel for each of x's: {self.shape} by {w.shape}")
     x = self.pad(((padding, padding), (padding, padding))) if padding else self
     (c, h, wd), ho, wo = x.shape, x.rows - k + 1, x.cols - k + 1
     rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))  # k - 1 zeros at the end, for the wrapped columns of the last tap
@@ -591,7 +604,7 @@ class Tensor:
     return out.reshape(w.batch, ho, wd)[:, :, :wo]
   def max_pool2d(self, k=2):  # max of each k x k block: over each k rows, then each k columns
     c, h, w = self.shape
-    assert h % k == 0 and w % k == 0, f"{self.shape} in {k} x {k} blocks"
+    if not (h % k == 0 and w % k == 0): raise ValueError(f"max_pool2d needs a height and width that {k} divides: {self.shape}")
     return self.reshape(c * h // k, k, w).max(1).reshape(1, c * h * w // (k * k), k).max(2).reshape(c, h // k, w // k)
 
   # Autograd, like tinygrad's: a rule per op (_backward), made of the same lazy ops, so the backward fuses into kernels
@@ -600,8 +613,8 @@ class Tensor:
     """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that
     self doesn't depend on. self must be scalar unless gradient supplies the derivative of the desired
     output with respect to self."""
-    assert gradient is not None or self.shape == (1, 1, 1), "self must be a single value, or pass gradient"
-    assert gradient is None or gradient.shape == self.shape, "gradient must have the output's shape"
+    if not (gradient is not None or self.shape == (1, 1, 1)): raise ValueError("self must be a single value, or pass gradient")
+    if not (gradient is None or gradient.shape == self.shape): raise ValueError("gradient must have the output's shape")
     if gradient is not None: self._same_runtime(gradient)
     order, seen = [], set()
     def visit(t):  # what self was made of, operands first
@@ -687,7 +700,7 @@ def _backward(t, g):
   if op == "repeat": return (g.reshape(x.batch, args[0], x.rows * x.cols).sum(1).reshape(*x.shape),)
   if op == "merge": return (g.split(x.batch),)
   if op == "slice":  # back into place with zeros around it. a reversed axis is reversed again
-    assert all(abs(r.step) == 1 for r in args[0]), "a slice with a step has no backward"
+    if not all(abs(r.step) == 1 for r in args[0]): raise NotImplementedError("a slice with a step has no backward")
     g = g[tuple(slice(None, None, r.step) for r in args[0])] if any(r.step < 0 for r in args[0]) else g
     lo = [min(r) for r in args[0]]
     return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
@@ -756,7 +769,7 @@ def _tree(t, inputs):
   computes in. The kernel sweeps along the axis of the first reduction. Reductions along other axes are realized
   first."""
   dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
-  assert dtype not in BFP, "a block float can only be a matmul's B"
+  if dtype in BFP: raise ValueError("a block float can only be a matmul's B")
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
   n = ext(t.shape, axis)  # the sweep is as long as t along the axis. if t is a tile long there, its first reduction sets it
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
@@ -790,7 +803,7 @@ def _expr(t, shape, inputs, kernel):
   or two reductions are already included."""
   if t.op is None:
     assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
-    assert not t.runs, "a tensor by columns can only be a matmul's B, or read back"
+    if t.runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
     return _input(t, inputs)
   if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0], shape, inputs, kernel))
   if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
@@ -808,7 +821,7 @@ def _expr(t, shape, inputs, kernel):
     a, b, *picked = t.srcs  # picked: the indices that pick B's matrices, if any
     if b.op == "T":  # read transposed. a block float, like a bfp8 key cache, is read as is and transposed on the way in
       src = b.srcs[0].realize()
-      assert not src.runs, "a tensor by columns can only be a matmul's B as it is, not transposed"
+      if src.runs: raise ValueError("a tensor by columns can only be a matmul's B as it is, not transposed")
       b = ("T" + src.dtype, _input(src, inputs)) if src.dtype in BFP else ("T", _expr(src, shape, inputs, kernel))
     elif b.runs: b = ("C" + (b.dtype if b.dtype in BFP else ""), _input(b, inputs))  # laid out by columns()
     else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
@@ -868,7 +881,7 @@ def jit(f):
     if len(xs) != len(signature): raise ValueError(f"jit expected {len(signature)} inputs, got {len(xs)}")
     for x, (runtime, shape, dtype) in zip(xs, signature):
       if x.rt is not runtime: raise ValueError("jit inputs must use the recorded runtime")
-      assert (x.shape, x.dtype) == (shape, dtype), f"{x.shape} {x.dtype} where jit had {shape} {dtype}"
+      if (x.shape, x.dtype) != (shape, dtype): raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
     if rec is None:
       inputs = [x.realize() for x in xs]
       with Recording(rt) as recording: result = f(*inputs).realize()

@@ -40,7 +40,7 @@ def ins(name, **fields):
   word = opcode << 24
   for k, v in fields.items():
     first, width = layout[k]
-    assert 0 <= v < 1 << width, f"{name} {k}={v} does not fit in {width} bits"
+    if not (0 <= v < 1 << width): raise ValueError(f"{name} {k}={v} does not fit in {width} bits")
     word |= v << first
   return word
 
@@ -48,7 +48,7 @@ def config(**fields):  # backend config as {word index: value}. fields left out 
   regs = {}
   for k, v in fields.items():
     index, first, width = bh.TENSIX_CFG_FIELDS[k]
-    assert 0 <= v < 1 << width, f"{k}={v} does not fit in {width} bits"
+    if not (0 <= v < 1 << width): raise ValueError(f"{k}={v} does not fit in {width} bits")
     regs[index] = regs.get(index, 0) | v << first
   return regs
 
@@ -580,7 +580,7 @@ def tt(words):
   c, pending = [], []
   for w in list(words) + [None]:
     if isinstance(w, int):
-      assert w < 0xC0000000, f"{w:#x} isn't a Tensix instruction"
+      if w >= 0xC0000000: raise ValueError(f"{w:#x} isn't a Tensix instruction")
       pending.append(f"{(w << 2 | w >> 30) & 0xFFFFFFFF:#x}")
       continue
     if pending: c.append(f'asm volatile(".word {", ".join(pending)}" ::: "memory");')
