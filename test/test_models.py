@@ -1271,6 +1271,68 @@ def test_schema_edges():
   assert one("1") == 1 and one("1.5") == 2 and one("1 ") == 0
   assert fits({"oneOf": [{"type": "boolean"}, {"enum": [True]}]})("true") == 0
 
+def test_schema_intersections():
+  def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
+  for schema, text, want in (({"type": "string", "enum": [1]}, "1", 0),
+                             ({"enum": [1, 2], "const": 2}, "1", 0), ({"enum": [1, 2], "const": 2}, "2", 2),
+                             ({"enum": [True]}, "1", 0), ({"const": 1}, "true", 0),
+                             ({"type": "string", "anyOf": [{"type": "integer"}, {"const": "ok"}]}, '"ok"', 2),
+                             ({"anyOf": [{"type": "number"}], "oneOf": [{"const": 1}, {"const": 2}]}, "3", 0)):
+    assert fits(schema)(text) == want, (schema, text)
+  schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"],
+            "anyOf": [{"properties": {"y": {"type": "integer"}}, "required": ["y"]}]}
+  assert fits(schema)('{"x": 1, "y": 2}') == 0 and fits(schema)('{"x": "ok", "y": 2}') == 2
+  assert fits(schema)('{"x": "ok"}') == 0 and fits(schema)('{"y": 2}') == 0
+  schema = {"$defs": {"base": {"type": "object", "properties": {"x": {"type": "string"}}}}, "$ref": "#/$defs/base",
+            "properties": {"x": {"enum": ["a", "b"]}}, "required": ["x"]}
+  assert fits(schema)('{"x": "a"}') == 2
+  for text in ('{"x": 1}', '{"x": "c"}', '{}'): assert fits(schema)(text) == 0
+  same = fits({"enum": [{"é": ["😀", True, 1, None], "b": 2}]})
+  assert same('{"b": 2, "\\u00e9": ["\\ud83d\\ude00", true, 1, null]}') == 2
+  assert same('{"b": 2, "é": ["😀", 1, 1, null]}') == 0
+
+def test_unicode_output_constraints(tmp_path):
+  tok = bytes_tokenizer(tmp_path)
+  for wanted, spellings in (("é", ('"é"', '"\\u00e9"', '"\\u00E9"')),
+                           ("😀", ('"😀"', '"\\ud83d\\ude00"')),
+                           ("/\n\\\"", ('"\\/\\n\\\\\\\""',))):
+    shape = serve.formatted({"type": "json_schema", "json_schema": {"schema": {"enum": [wanted]}}})
+    for text in spellings:
+      assert all(shape(text[:i]) == 1 for i in range(len(text))) and shape(text) == 2, text
+      data = list(text.encode("utf-8"))
+      r = serve.Request(tok, [], len(data) + 5, temperature=0, eos=[0], shape=shape)
+      for token in data + [0]:
+        logits = np.full(256, -np.inf)
+        logits[token] = 1
+        if r.take(logits, True): break
+      assert r.made == data and r.finish == "stop" and json.loads(tok.decode(r.made)) == wanted
+  shape = serve.formatted({"type": "json_schema", "json_schema": {"schema": {"enum": ["é"]}}})
+  r = serve.Request(tok, [], temperature=0, eos=[0], shape=shape)
+  assert not r.fits(0xc3), "a non-ASCII character cannot start a JSON value"
+  r.made = [ord('"')]
+  assert r.fits(0xc3) and not r.fits(0xe0) and not r.fits(0x80)
+  r.made.append(0xc3)
+  assert not r.fits(0) and r.fits(0xa9), "EOS cannot discard a pending UTF-8 character"
+  r.made = [ord('"')]
+  logits = np.full(256, -np.inf)
+  logits[ord('Q')] = 1
+  with pytest.raises(ValueError, match="output constraint"): r.take(logits, True)
+  assert r.finish != "stop", "a constraint dead end is an error, not a successful empty answer"
+
+def test_reasoning_stream_prefixes():
+  texts = ("<think>Reasoning.\n</think>\n\nAnswer.", "Reasoning.\n</think>\n\nAnswer.",
+           "<|channel|>analysis<|message|>Reasoning.\n<|end|><|channel|>final<|message|>Answer.", "Reasoning.<")
+  for text in texts:
+    seen = ("", "")
+    for i in range(len(text) + 1):
+      parts = serve.answer(text[:i], final=False)
+      assert all(new.startswith(old) for old, new in zip(seen, parts)), (text[:i], seen, parts)
+      seen = parts
+    full = serve.answer(text)
+    assert all(new.startswith(old) for old, new in zip(seen, full))
+    if text.endswith("Answer."): assert full == ("Reasoning.", "Answer.")
+    else: assert full == ("Reasoning.<", ""), "flush an unfinished marker as ordinary text when generation ends"
+
 def test_serve(chip, tmp_path):
   # The serve.py engine, against numpy's greedy tokens. Three requests on two slots decode together. When two run
   # again, they find their slots still holding their prompts, and each prefills one token. A free slot idles on a row
@@ -1567,6 +1629,7 @@ def test_chat_tools(tmp_path):
   assert json.loads(reply["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt", "lines": 2}
   events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
   assert "".join(e["delta"].get("content", "") for e in events).strip() == "Let me look." and events[-1]["finish_reason"] == "tool_calls"
+  assert "".join(e["delta"].get("reasoning_content", "") for e in events) == "I should read it."
   assert [json.loads(c["function"]["arguments"]) for e in events for c in e["delta"].get("tool_calls", [])] == [{"path": "a.txt", "lines": 2}]
   with pytest.raises(urllib.error.HTTPError) as e:
     ask({"messages": messages[:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "write"}}})

@@ -101,7 +101,8 @@ class Request:
     """Pick a token from Head when possible, otherwise read the full row. Apply presence and frequency
     penalties to generated tokens, and repetition penalties to prompt and generated tokens, then call draw.
 
-    shape(text) returns 0 for an invalid prefix, 1 for an incomplete valid prefix, or 2 for complete text.
+    shape(text, pending=b"") returns 0 for an invalid prefix, 1 for an incomplete valid prefix, or 2 for complete text.
+    pending holds the bytes of an incomplete UTF-8 character.
     Reject a token that makes the prefix invalid and draw again without it. Accept eos only for complete
     text. This avoids testing every vocabulary token when the first few draws already fit."""
     if not self.whole() and (token := self.sample(head)) is not None: return token
@@ -117,12 +118,19 @@ class Request:
       if not np.isfinite(logits).any(): break
       if self.fits(token := self.draw(logits)): return token
       logits[token] = -np.inf
-    # The likeliest token that fits, else None, which ends the request. None comes for a complete text when the model
-    # has no end of sequence token, or for a shape that leads nowhere.
-    return next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)
+    # If no token fits, only a complete value may end successfully without an EOS token.
+    token = next((int(t) for t in np.argsort(-logits) if logits[t] > -np.inf and self.fits(int(t))), None)
+    if token is None and not self.fits(None): raise ValueError("no token can complete the requested output constraint")
+    return token
 
-  def fits(self, token):  # whether the text with token still fits. For an end of sequence, whether the text is complete
-    return self.shape(self.tok.decode(self.made)) == 2 if token in self.eos else self.shape(self.tok.decode(self.made + [token])) > 0
+  def fits(self, token):
+    # A token may stop partway through UTF-8. Keep incomplete bytes pending, and reject malformed sequences.
+    end = token is None or token in self.eos
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try: text = decoder.decode(b"".join(self.tok.bytes[t] for t in self.made + ([] if end else [token])), final=end)
+    except UnicodeDecodeError: return False
+    state = self.shape(text, decoder.getstate()[0])
+    return state == 2 if end else state > 0
 
   def sample(self, head):
     """The token that draw would pick, found from the head without reading the row back. Returns None where the head
@@ -196,7 +204,10 @@ class Request:
     cut = min((i for i in (self.text.find(s, start) for s in self.stop) if i >= 0), default=-1)
     if end or cut >= 0 or len(self.made) == self.max_tokens or not room:
       text = self.text + self.utf8.decode(b"", True)
-      self.say(text if cut < 0 else text[:cut])
+      text = text if cut < 0 else text[:cut]
+      if self.shape and (end or cut >= 0) and self.shape(text) != 2:
+        raise ValueError("generation stopped before the requested output constraint was complete")
+      self.say(text)
       self.finish = "stop" if end or cut >= 0 else "length"
       return True
     hold = max((k for s in self.stop for k in range(1, len(s)) if self.text.endswith(s[:k])), default=0)  # what may begin a stop string
@@ -571,15 +582,16 @@ def chosen(choice, tools):
   at the start; a named function allows only that function. For reasoning models, validate the answer after
   the reasoning."""
   if choice in (None, "auto"): return None
-  if choice == "none": return lambda text: 0 if "<tool_call>" in text else 2
+  if choice == "none": return lambda text, pending=b"": 0 if "<tool_call>" in text else 1 if pending else 2
   names = [t.get("function", t).get("name") for t in tools or ()]
   if choice != "required": names = [n for n in names if n == choice["function"]["name"]]
   if not names: raise ValueError(f"tool_choice: there's no such tool in tools: {choice}")
   can = lambda part, whole: whole.startswith(part) or part.startswith(whole)  # part could still become whole, or starts with it
-  def fits(text):  # the call must come first, with no whitespace before it, since that could go on forever
-    if not can(text, "<tool_call>\n<function="): return 0
-    if not all(any(can(part, n + ">") for n in names) for part in text.split("<function=")[1:]): return 0
-    return 2 if text.rstrip().endswith("</tool_call>") and calls(text, tools)[1] else 1
+  def fits(text, pending=b""):  # bytes keep an unfinished Unicode tool name meaningful
+    raw = text.encode("utf-8") + pending
+    if not can(raw, b"<tool_call>\n<function="): return 0
+    if not all(any(can(part, (n + ">").encode("utf-8")) for n in names) for part in raw.split(b"<function=")[1:]): return 0
+    return 2 if not pending and text.rstrip().endswith("</tool_call>") and calls(text, tools)[1] else 1
   return fits
 
 class Short(Exception): pass  # the text ends inside a value that could still fit
@@ -591,7 +603,8 @@ def formatted(form):
 
   Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
   maxItems, enum, const, anyOf, oneOf and nonrecursive local $ref into $defs or definitions. String patterns, formats and
-  numeric bounds aren't enforced. enum and const use json.dumps representations.
+  numeric bounds aren't enforced. Sibling fields intersect, including siblings of $ref as in draft 2020-12.
+  Strings may use literal Unicode or equivalent JSON escapes, including in enum and const.
 
   Allow at most one whitespace character between tokens and 32 characters per number to prevent unbounded
   generation. Allow commas only where another key or item can follow, so a valid prefix can still be
@@ -625,10 +638,13 @@ def formatted(form):
     if sc.get("minItems", 0) > sc.get("maxItems", math.inf): raise ValueError("minItems exceeds maxItems")
     for k in ("enum", "anyOf", "oneOf"):
       if k in sc and (not isinstance(sc[k], list) or not sc[k]): raise ValueError(f"{k} must be a nonempty list")
+    for v in [*sc.get("enum", []), *([sc["const"]] if "const" in sc else [])]:
+      try: json.dumps(v, allow_nan=False)
+      except (TypeError, ValueError): raise ValueError("enum and const must contain finite JSON values") from None
     for child in [*sc.get("properties", {}).values(), sc.get("items", True), sc.get("additionalProperties", True),
                   *sc.get("anyOf", []), *sc.get("oneOf", [])]: check(child, refs)
   check(root)
-  def fits(text):
+  def fits(text, pending=b""):
     i = 0
     def ws():
       nonlocal i
@@ -637,54 +653,109 @@ def formatted(form):
       if i - start > 1: raise Bad
     def peek():
       ws()
-      if i == len(text): raise Short
+      if i == len(text): raise Bad if pending else Short
       return text[i]
     def word(w):  # a literal (true, false or null), as far as the text goes
       nonlocal i
       if not w.startswith(text[i:i + len(w)]): raise Bad
-      if i + len(w) > len(text): raise Short
+      if i + len(w) > len(text): raise Bad if pending else Short
       i += len(w)
-    def string(allowed=None):  # returns its value. Short if the text ends inside it, Bad once it can't be any of allowed, as JSON
+    def string(allowed=None):
+      # Compare UTF-16 units so a partial surrogate escape can still become an allowed non-BMP character.
       nonlocal i
-      start, i = i, i + 1
+      start, i, units = i, i + 1, b""
+      allowed = None if allowed is None else [a.encode("utf-16-le", "surrogatepass") for a in allowed]
       while i < len(text) and text[i] != '"':
-        if ord(text[i]) < 32: raise Bad
-        if text[i] == "\\":
-          escape = text[i + 1:i + 2]
-          if escape and escape not in '"\\/bfnrtu' or escape == "u" and not re.fullmatch("[0-9a-fA-F]*", text[i + 2:i + 6]): raise Bad
-          i += 6 if escape == "u" else 2
-        else: i += 1
-      if allowed is not None and not any(json.dumps(a, ensure_ascii=False).startswith(text[start:i + 1]) for a in allowed): raise Bad
-      if i >= len(text): raise Short
+        c = text[i]
+        if ord(c) < 32: raise Bad
+        if c == "\\":
+          if allowed is not None and not any(a.startswith(units) and len(a) > len(units) for a in allowed): raise Bad
+          i += 1
+          if i == len(text): raise Bad if pending else Short
+          c = text[i]
+          if c == "u":
+            digits = text[i + 1:i + 5]
+            if not re.fullmatch("[0-9a-fA-F]*", digits): raise Bad
+            if len(digits) < 4:
+              if pending: raise Bad
+              if allowed is not None and not any(a.startswith(units) and len(a) > len(units) and
+                  f"{int.from_bytes(a[len(units):len(units) + 2], 'little'):04x}".startswith(digits.lower()) for a in allowed): raise Bad
+              raise Short
+            c, i = chr(int(digits, 16)), i + 4
+          elif c in '"\\/bfnrt': c = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}[c]
+          else: raise Bad
+        units += c.encode("utf-16-le", "surrogatepass")
+        i += 1
+        if allowed is not None and not any(a.startswith(units) for a in allowed): raise Bad
+      if i == len(text):
+        if pending and allowed is not None:
+          remaining = [a[len(units):].decode("utf-16-le", "surrogatepass") for a in allowed if a.startswith(units)]
+          if not any(r and not 0xd800 <= ord(r[0]) <= 0xdfff and r[0].encode("utf-8").startswith(pending) for r in remaining): raise Bad
+        raise Short
+      if allowed is not None and units not in allowed: raise Bad
       i += 1
       return json.loads(text[start:i])
+    def combine(parsers, mode="all"):
+      # Every parser starts at the same value. Evaluate all siblings even if an earlier one is incomplete.
+      nonlocal i
+      start, ends, shorts, bad = i, [], 0, False
+      for parse in parsers:
+        i = start
+        try: parse(); ends.append(i)
+        except Short: shorts += 1
+        except Bad: bad = True
+      i = max(ends, default=start)
+      if mode == "all":
+        if bad: raise Bad
+        if shorts: raise Short
+      elif not ends: raise Short if shorts else Bad
+      elif mode == "one" and ends.count(i) != 1:
+        if not pending and i == len(text) and text[start:start + 1] in "-0123456789": raise Short
+        raise Bad
+    def literal(v):
+      nonlocal i
+      c, start = peek(), i
+      if isinstance(v, str):
+        if c != '"': raise Bad
+        string([v])
+      elif isinstance(v, dict):
+        value({"type": "object", "properties": {k: {"const": x} for k, x in v.items()},
+               "required": list(v), "additionalProperties": False})
+      elif isinstance(v, list):
+        if c != "[": raise Bad
+        i += 1
+        for n, x in enumerate(v):
+          if n:
+            if peek() != ",": raise Bad
+            i += 1
+          literal(x)
+        if peek() != "]": raise Bad
+        i += 1
+      else:
+        value({"type": "null" if v is None else "boolean" if isinstance(v, bool) else "number"})
+        if json.loads(text[start:i]) != v:
+          if not pending and i == len(text) and json.dumps(v).startswith(text[start:i]): raise Short
+          raise Bad
     def value(sc):
       nonlocal i
-      while isinstance(sc, dict) and "$ref" in sc: sc = target(sc["$ref"])
       if sc is False: raise Bad
       if sc is True: sc = {}
+      if "$ref" in sc:
+        combine((lambda: value(target(sc["$ref"])), lambda: value({k: v for k, v in sc.items() if k != "$ref"})))
+        return
       if "anyOf" in sc or "oneOf" in sc:
-        start, short, ends = i, False, []
-        for alt in sc.get("anyOf") or sc["oneOf"]:
-          try:
-            base = {k: v for k, v in sc.items() if k not in ("anyOf", "oneOf")}
-            value(base | alt if isinstance(alt, dict) else base if alt else False)
-            ends.append(i)
-          except Short: short = True
-          except Bad: pass
-          i = start
-        if not ends: raise Short if short else Bad
-        i = max(ends)
-        if "oneOf" in sc and ends.count(i) != 1:
-          if i == len(text) and text[start] in "-0123456789": raise Short  # another digit can disambiguate a number
-          raise Bad
+        key = "anyOf" if "anyOf" in sc else "oneOf"
+        combine((lambda: value({k: v for k, v in sc.items() if k != key}),
+                 lambda: combine([lambda alt=alt: value(alt) for alt in sc[key]], "one" if key == "oneOf" else "any")))
+        return
+      if "enum" in sc or "const" in sc:
+        key = "enum" if "enum" in sc else "const"
+        choices = sc[key] if key == "enum" else [sc[key]]
+        combine((lambda: value({k: v for k, v in sc.items() if k != key}),
+                 lambda: combine([lambda v=v: literal(v) for v in choices], "any")))
         return
       c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
       kinds = [kinds] if isinstance(kinds, str) else kinds
-      if "enum" in sc or "const" in sc:  # one of them, as json.dumps writes it
-        texts = [json.dumps(v, ensure_ascii=False) for v in sc.get("enum", [sc.get("const")])]
-        if done := [t for t in texts if text.startswith(t, i)]: i += len(max(done, key=len)); return
-        raise Short if any(t.startswith(text[i:]) for t in texts) else Bad
       if c == '"' and "string" in kinds: string()
       elif c in "-0123456789" and {"number", "integer"} & set(kinds):
         start = i
@@ -694,7 +765,7 @@ def formatted(form):
         # If it isn't a complete number, it may be the start of one that more digits complete
         if not re.fullmatch(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?", number):
           begun = re.fullmatch(r"-?((0|[1-9][0-9]*)(\.[0-9]*|(\.[0-9]+)?[eE][-+]?[0-9]*)?)?", number)
-          if i == len(text) and begun and len(number) < 32 and ("number" in kinds or not re.search("[.eE]", number)): raise Short
+          if not pending and i == len(text) and begun and len(number) < 32 and ("number" in kinds or not re.search("[.eE]", number)): raise Short
           raise Bad
         if "number" not in kinds and re.search("[.eE]", number): raise Bad
       elif c in "tfn":
@@ -727,20 +798,25 @@ def formatted(form):
     try:
       value(root)
       ws()
-      return 2 if i == len(text) else 0
+      return 2 if i == len(text) and not pending else 0
     except Short: return 1
     except Bad: return 0
   return fits
 
-def answer(text):
+def answer(text, final=True):
   """Split generated text into reasoning and answer. The answer is empty until its start marker arrives.
   Qwen3 separates them at </think>. gpt-oss uses analysis and final channels separated by <|end|>."""
+  def held(s, markers):
+    n = 0 if final else max((k for marker in markers for k in range(1, len(marker)) if s.endswith(marker[:k])), default=0)
+    return s[:len(s) - n]
+  if not final and any(marker.startswith(text) for marker in ("<think>", "<|channel|>")): return "", ""
   if text.startswith("<|channel|>"):
     if "<|message|>" not in text: return "", ""  # the name of the channel is still coming
     head, _, content = text.partition("<|channel|>final<|message|>")
-    return head.removeprefix("<|channel|>analysis<|message|>").partition("<|end|>")[0].strip(), content
+    reasoning = head.removeprefix("<|channel|>analysis<|message|>").partition("<|end|>")[0]
+    return held(reasoning, ("<|end|>", "<|channel|>final<|message|>")).strip(), content
   reasoning, _, content = text.partition("</think>")
-  return reasoning.removeprefix("<think>").strip(), content.lstrip()
+  return held(reasoning.removeprefix("<think>"), ("</think>",)).strip(), content.lstrip()
 
 def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None, body_limit=8 << 20, input_wait=10, connections=32):
   """Create an HTTP server for an engine whose thread is already running. Serve /v1/models, /v1/completions and
@@ -817,8 +893,11 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         fits = chosen(choice, tools)
         if form and choice in (None, "auto", "none"):  # the format, or a tool call where tools allow one (auto)
           call = chosen("required", tools) if tools and choice != "none" else None
-          fits = form if call is None else (lambda text: max(form(text), call(text)))
-        shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # a thinking model's shape applies to its answer, after the reasoning
+          fits = form if call is None else (lambda text, pending=b"": max(form(text, pending), call(text, pending)))
+        def shaped(text, pending=b""):
+          started = "</think>" in text or "<|channel|>final<|message|>" in text
+          return fits(answer(text)[1], pending if started else b"")
+        shape = shaped if fits and apart else fits
         given = lambda k, default: q[k] if q.get(k) is not None else defaults[k] if defaults.get(k) is not None else default
         r = Request(engine.tok, ids, max_tokens=given("max_tokens", engine.places if is_chat else 16), temperature=given("temperature", 1.0),
                     top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=given("top_k", 0),
@@ -834,20 +913,21 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       if not offered: return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
       head = {"id": f"baretile-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
-      def parts(text):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
-        out = dict(zip(("reasoning_content", "content"), answer(text))) if apart else {"content": text}
+      def parts(text, final=True):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
+        out = dict(zip(("reasoning_content", "content"), answer(text, final))) if apart else {"content": text}
         if tools:  # also hold back what may be the start of a tool call
           shown = out["content"].partition("<tool_call>")[0]
           out["content"] = shown[:len(shown) - max((k for k in range(1, 11) if shown.endswith("<tool_call>"[:k])), default=0)]
         return out
-      def delta(text):  # the next piece of a chat: what's new in each part
+      def delta(text, final):  # the next piece of a chat: what's new in each part
         seen["text"] += text
-        new = parts(seen["text"])
+        new = parts(seen["text"], final)
         out = {k: v[len(seen[k]):] for k, v in new.items() if len(v) > len(seen[k])}
         seen.update(new)
         return out
       called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the text and tool calls of the answer
-      piece = lambda text, done: ({"index": 0, "delta": delta(text)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
+      def piece(text, done):
+        return ({"index": 0, "delta": delta(text, done is not None)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
       word, raw = lambda t: engine.tok.decode([t]), lambda t: list(engine.tok.bytes[t])
       def chances(made):  # log probabilities in OpenAI's format: a chat's under content, a completion's as lists
         one = lambda t, p: {"token": word(t), "logprob": p, "bytes": raw(t)}
