@@ -15,6 +15,9 @@ them and waits for their reports. The host sees completion in its own memory.
 `Runtime(chip)` uses the available Tensix tiles. You can restrict it with `start`
 and `end` coordinates. The last tile in that rectangle is the dispatcher. The
 others are workers. A new runtime stops any older runtime whose tiles overlap.
+Both endpoints must be available Tensix tiles. The runtime requires all eight
+DRAM banks. A custom command ring must be a power of two from 64 bytes through
+1 MiB, leaving room for status, timing records and readback in its hugepage.
 
 Some kernels need a rectangular grid of workers. The dispatcher's row has a
 tile missing, so `Runtime.grid` leaves that row out. With 120 tiles, you get
@@ -54,7 +57,8 @@ count. Arguments follow, and the command is padded to 64 bytes. Commands never
 straddle the end of the host ring. A zero length marks unused space at the end.
 
 `Runtime.send()` writes commands into the ring and updates the doorbell. A block
-of recorded commands uses the same doorbell write. The dispatcher executes
+of recorded commands uses one doorbell write when it fits with any wrap padding.
+Larger blocks are sent in pieces, split between commands. The dispatcher executes
 launches in order and alternates argument buffers so it can prepare the next
 launch while workers run.
 
@@ -73,7 +77,10 @@ finish before reusing that space. A recording keeps its memory for later calls.
 copy inputs into the recorded buffers and resend the launches. If kernels have
 been evicted, the recording reloads them and rebuilds its commands.
 
-Keep input shapes and dtypes fixed. The function must not read tensors back to
+Keep the number of inputs, their runtime, shapes and dtypes fixed from the first
+call. Replay copies input storage without arithmetic, including block-float
+matmul weights. A failed call can be retried; a failed recording releases its abandoned
+allocations. Recordings on the same runtime cannot nest. The function must not read tensors back to
 the host or depend on changing Python state. Results reuse the same buffers, so
 a later call overwrites an earlier result. Copy a result if you need to keep it.
 

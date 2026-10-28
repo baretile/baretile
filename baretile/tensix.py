@@ -218,9 +218,10 @@ def matmul_phase(transposed=False):
     phase.append(ins("MVMUL", dst=32 * i + 16 * j + 8 * h, addr_mode=mode))
   return phase
 
-def to_bf16(x):
-  bits = struct.unpack("<I", struct.pack("<f", x))[0]
+def round_bf16(bits):  # fp32 bits to bf16, preserving infinities and a quiet NaN payload
+  if bits & 0x7FFFFFFF > 0x7F800000: return bits >> 16 | 0x40
   return (bits + 0x7FFF + (bits >> 16 & 1)) >> 16  # round to nearest even
+def to_bf16(x): return round_bf16(struct.unpack("<I", struct.pack("<f", x))[0])
 def from_bf16(b): return struct.unpack("<f", struct.pack("<I", b << 16))[0]
 
 # An SFPU program is a setup, then a body that runs 32 times. Each pass loads 32 datums of the Dst half into LReg 0

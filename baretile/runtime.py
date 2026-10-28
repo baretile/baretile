@@ -119,10 +119,11 @@ def compile_rv32(src):
   link = ("SECTIONS { .text 0 : { *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
           ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
   cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
-  if cached.exists():
+  _prune()
+  try:
     os.utime(cached)
     return cached.read_bytes()
-  _prune()
+  except FileNotFoundError: pass  # another process may have pruned it
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld")
   with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
@@ -130,8 +131,13 @@ def compile_rv32(src):
     subprocess.run(CLANG + [f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)], input=(DEVICE + src).encode(), check=True)
     image = out.read_bytes()
   CACHE.mkdir(parents=True, exist_ok=True)
-  (part := cached.with_suffix(f".{os.getpid()}")).write_bytes(image)
-  os.replace(part, cached)  # atomic, since two processes may compile the same image concurrently
+  with tempfile.NamedTemporaryFile(dir=CACHE, prefix=cached.name + ".", delete=False) as f:
+    part = pathlib.Path(f.name)
+    try:
+      f.write(image)
+      f.close()
+      os.replace(part, cached)  # atomic; threads and processes may compile the same image concurrently
+    finally: part.unlink(missing_ok=True)
   return image
 
 # Kernel programs start here. A kernel stays loaded between launches, so kentry zeroes its .bss at the start of a
@@ -149,6 +155,7 @@ def compile_kernel(*programs):
   """Build an image from C programs for BRISC and TRISC0-2, in that order. Each program defines void
   kmain(volatile unsigned *args). Omitted or None programs leave that core idle. The header gives four entry
   offsets, with 0 for an absent program, followed by the programs. The image can run at any load address."""
+  if len(programs) > 4: raise ValueError("a kernel has at most four programs: BRISC and TRISC0-2")
   image, entry = b"", []
   for src in programs + (None,) * (4 - len(programs)):
     entry.append(16 + len(image) if src else 0)
@@ -321,7 +328,11 @@ class Runtime:
   its rectangle."""
   def __init__(self, chip, start=None, end=None, ring=1 << 20):
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
-    assert ring & (ring - 1) == 0 and ring % 64 == 0, "ring size must be a power of two: pointers wrap at 2**32"
+    if ring < 64 or ring & (ring - 1): raise ValueError("ring size must be a power of two, at least 64 bytes")
+    back = 64 + ring + 16 * TIMES
+    if back + 4096 > 1 << 21: raise ValueError("the ring leaves no room in the hugepage to read a tile back")
+    if start not in chip.tensix or end not in chip.tensix: raise ValueError("runtime endpoints must be available Tensix tiles")
+    if chip.banks != list(range(len(bh.DRAM))): raise ValueError("the runtime needs all eight DRAM banks")
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
     self.chip, self.launches, self.wptr = chip, 0, 0
@@ -363,13 +374,11 @@ class Runtime:
     chip.halt(*end, start)
     atexit.register(chip.halt, *end, start)
     buf, bus = chip.pci.alloc(1 << 21)  # a hugepage for the status, the ring, the times, then tensors read back
-    back = 64 + ring + 16 * TIMES
-    assert back + 4096 <= 1 << 21, "the ring leaves no room in the hugepage to read a tile back"
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (value, dtype) -> a tensor holding that number, uploaded once for tensor.py's constants
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
-    self.log, self.pinned = None, set()
+    self.log, self.pinned, self.pinned_freed = None, set(), set()
     self.counts = chip.pci.counts  # whether profile knows the bytes each launch read
     worker, dispatcher = compile_rv32("#define COUNTED\n" * self.counts + FIRMWARE), compile_rv32(DISPATCHER)
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
@@ -425,18 +434,39 @@ class Runtime:
     return b"".join(cmds), sent
 
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
-    kernel, n = self.load(kernel), min(units or len(self.cores), len(self.cores))
-    body = struct.pack(f"<{2 + len(args)}I", units or n, 0, *args)
+    units = len(self.cores) if units is None else units
+    if units <= 0: raise ValueError("a launch needs at least one unit")
+    n = min(units, len(self.cores))
+    body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
     assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}"
     length = -(-(16 + len(body)) // 64) * 64
-    return struct.pack("<4I", length, kernel, len(body), n) + body.ljust(length - 16, b"\0"), n
+    if length > len(self.ring): raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
+    return struct.pack("<4I", length, self.load(kernel), len(body), n) + body.ljust(length - 16, b"\0"), n
 
   def send(self, cmds, launches):
-    """Write commands back to back into the ring, then ring the doorbell. The doorbell is the host's one PCIe write,
-    however many commands there are. launches has (name, workers, kernel) for each."""
+    """Write commands back to back into the ring, then ring the doorbell. A block uses one PCIe write when it fits
+    with any wrap padding; larger blocks are sent in pieces. launches has (name, workers, kernel) for each."""
     size, at, length = len(self.ring), self.wptr % len(self.ring), len(cmds)
     skip = size - at if at + length > size else 0  # commands don't wrap, so mark the tail unused and start over
-    assert length + skip <= size, f"{length} bytes of commands don't fit in a ring of {size}"
+    if not length: return
+    while length + skip > size:
+      # Keep the whole block replayable, even when it is bigger than the ring. Split only between commands.
+      end, count = 0, 0
+      while end < length:
+        n = struct.unpack_from("<I", cmds, end)[0]
+        if not 0 < n <= size: raise ValueError(f"a {n}-byte command does not fit in a {size}-byte ring")
+        if end + n > size - at: break
+        end, count = end + n, count + 1
+      if end:
+        self.send(cmds[:end], launches[:count])
+      else:
+        self.until(lambda: (self.wptr - self.read_status(0)) % 2**32 + skip <= size, "free space in the ring")
+        self.ring[at:at + 4] = bytes(4)
+        self.wptr += skip
+        self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
+      cmds, launches = cmds[end:], launches[count:]
+      at, length = self.wptr % size, len(cmds)
+      skip = size - at if at + length > size else 0
     self.until(lambda: (self.wptr - self.read_status(0)) % 2**32 + skip + length <= size, "free space in the ring")
     if skip:
       self.ring[at:at + 4] = bytes(4)
@@ -483,7 +513,7 @@ class Runtime:
   def dram_free(self, addr):
     """Release an allocation after the launches queued so far have finished, then merge adjacent free ranges.
     Keep allocations made during recording, since replay uses the same addresses."""
-    if addr in self.pinned: return
+    if addr in self.pinned: self.pinned_freed.add(addr); return
     self.freed.append((self.launches, addr))
     self.reclaim()
 

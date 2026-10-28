@@ -34,8 +34,8 @@ def to_l1(slot, m):  # writes a 32 x 32 matrix into an L1 slot as bf16, in four 
 def from_l1(slot):  # reads a bf16 tile back from an L1 slot as a 32 x 32 matrix
   words = struct.unpack("<1024H", chip.read(x, y, slot_base("bf16") + slot * 2048, 2048))
   return [[from_bf16(words[(r // 16 * 2 + c // 16) * 256 + r % 16 * 16 + c % 16]) for c in range(32)] for r in range(32)]
-def run(unpacks, maths, packs, slots={}):  # builds the three TRISC programs from lists of words and runs them on one worker
-  rt.launch(compile_kernel(None, unpack_program(tt(unpacks), kernel_config()), math_program(slots, tt(maths)), pack_program(tt(packs))), (), 1)
+def run(unpacks, maths, packs, slots=None):  # builds the three TRISC programs from lists of words and runs them on one worker
+  rt.launch(compile_kernel(None, unpack_program(tt(unpacks), kernel_config()), math_program(slots or {}, tt(maths)), pack_program(tt(packs))), (), 1)
   rt.wait()
 
 a = [[float((r * 32 + c) % 7 - 3) for c in range(32)] for r in range(32)]

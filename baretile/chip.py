@@ -57,7 +57,9 @@ class Chip:
       tlb = self.kept[x, y, base, start]
     mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
     cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
+    if not 0 <= tlb < bh.TLB_COUNT: raise ValueError(f"TLB index must be in [0, {bh.TLB_COUNT})")
     for i in range(3): self.pci.write(bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
+    if tlb == 0: self.target = (x, y, base, start)
     return tlb * bh.TLB_WINDOW + addr - base
 
   def window(self, x, y, addr, start=None):  # TLB 0 is shared, and moves only when an access needs another block
@@ -67,6 +69,7 @@ class Chip:
     return addr - base
 
   def chunks(self, x, y, addr, n, start=None):  # [addr, addr+n) as (BAR0 offset, size) pieces, split where the window moves
+    if addr < 0 or n < 0: raise ValueError("addresses and transfer sizes must be nonnegative")
     while n:
       size = min(n, bh.TLB_WINDOW - addr % bh.TLB_WINDOW)
       yield self.window(x, y, addr, start), size
@@ -135,7 +138,7 @@ class Chip:
     still be reading src when this returns. Leave src unchanged until the queue is free; the next send waits
     for it."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
-    assert src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, \
+    assert min(src, dst) >= 0 and n > 0 and src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, \
       "Ethernet addresses and size must be 16-byte aligned and stay below firmware L1"
     def free():  # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)
       self.read32(x, y, reg("CMD"))
