@@ -117,10 +117,12 @@ processed a prefix of it. It can also restore a saved session with its tokens,
 KV cache and recurrent state. DeltaNet must resume from the exact tokens that
 produced its state.
 
-Sessions are saved in spare DRAM on the chip. When that fills, the server copies
-the least recently used sessions to host memory. The host cache has a size limit
-too, after which sessions are dropped. The response's usage field counts the
-prompt tokens that were reused.
+Sessions are saved in spare DRAM on the chip. The server evicts old sessions
+before allocating a new snapshot. When device space is insufficient, it reads
+the snapshot directly into host memory. The host cache has a size limit too; a
+snapshot that cannot fit is dropped without failing the request. Prompt snapshots
+include the prediction layer's final cache update when speculation is enabled.
+The response's usage field counts the prompt tokens that were reused.
 
 ## Sampling and API limits
 
