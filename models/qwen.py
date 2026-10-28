@@ -236,7 +236,7 @@ def delta_kernel(kt, vt, vh, rep, m=1):
   call = lambda *names: " ".join(f"{name(n)}();" for n in names)
   apply = lambda n: f"{name(n)}(0);"  # for a program that stores to its own rows
   to_h = lambda n: f"{name(n)}(h);"  # for a program whose result goes to Dst half h
-  aim_at = lambda row: tt([aim(row)])
+  aim_at = lambda row: tt(aim(row))
   free = tt([ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_SFPU)])  # fills wait until the SFPU is done with their rows
   fills = lambda *pairs: free + " " + tt([w for slot, row in pairs for w in fill(slot, row)] + FILLED)
   half = tt([DST_FREE])  # waits until a Dst half is free for a result

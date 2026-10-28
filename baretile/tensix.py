@@ -179,12 +179,16 @@ def step_unpack(s):  # a matmul step. B's tile goes from stream slot s into SrcA
 PAIR = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
         ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)]
 WALK = PAIR + REPORT
-def aim(row): return field(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)  # FPU and SFPU from Dst row on
+# Aims the FPU and SFPU at Dst row `row` on. The write waits for this thread's FPU and SFPU work first, as tt-llk's
+# dest_section_flip does, since work still in their pipelines would see the new offset. TTSIM_CHAOS_MATH tests this.
+def aim(row):
+  return [ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
+          field(ins("SETC16", setc16_reg=bh.THREAD_CFG["MATH_Offset"], setc16_value=0), row)]
 # In the C programs, h is the first Dst row of the half that the next op gets, 0 or DST_HALF. h ^= DST_HALF moves on.
 DST_FREE = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)  # waits until a Dst half is free
 # Waits for a free Dst half and aims the FPU at it. If the math accumulates, it also zeroes the half, 16 rows at a time.
 def math_begin(zero):
-  return [DST_FREE, aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero]
+  return [DST_FREE, *aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero]
 MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
 def pack(row, slot, *done):  # packs 64 Dst rows from `row` into an L1 slot, then frees them and posts the semaphores in done
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
@@ -533,10 +537,10 @@ def reduce_step(kind, slots, acc, first, edge=0, src=None):
   row, sem = ACCS[acc]
   mask = lambda d: MASK[FOLDS[kind]](kind, edge, d) if edge else []
   put = lambda d: fill(src, row + d) + FILLED if src is not None else elementwise("add", slots, dst=d)
-  if first: return take(sem) + [aim(row)] + put(0) + mask(0)
-  return [aim(row)] + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
+  if first: return take(sem) + aim(row) + put(0) + mask(0)
+  return aim(row) + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
 def reduce_finish(kind, slots, acc, posts):  # folds across the tile and runs the SFPU ops on the result, before MATH_END
-  return [DST_FREE, aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
+  return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
 
 def sfpu(posts, slots):  # runs the SFPU ops in order, over the Dst half that the FPU has written
   return [w for u in posts for w in SFPU_START + SFPU[u][0] + runs(slots, u, 32)]
