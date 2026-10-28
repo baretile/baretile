@@ -2,7 +2,7 @@
 import ast, collections, ctypes, gc, mmap, os, pathlib, random, struct, sys, threading, time, weakref, pytest
 from baretile import bh, pci
 from baretile.hello import hello
-from baretile.runtime import DATA, KERNELS, Runtime, compile_kernel
+from baretile.runtime import DATA, KERNELS, MCAST_STATE, Runtime, compile_kernel
 
 def test_layers():
   # Modules in baretile/ import only the standard library and the layers below their own. A layer's tests, and the
@@ -414,6 +414,62 @@ def test_runtime_close_drains_all_transactions(chip, monkeypatch, kind, tag):
   rt.close()
   assert polls >= 3 and page() is None and not rt.used
 
+def test_runtime_close_during_dispatcher_multicast(chip, monkeypatch):
+  if not isinstance(chip.pci, pci.Sim): pytest.skip("stop at a particular simulated cycle")
+  rt = Runtime(chip, end=chip.tensix[2])  # two acknowledgements decrement a counter incremented only once
+  addr, page = rt.dram_alloc(64), weakref.ref(rt.status.obj)
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))
+  with monkeypatch.context() as patch:
+    patch.setattr(chip.pci, "TICK", 1)
+    chip.wait(lambda: chip.read32(*rt.dispatcher, bh.NIU + bh.NIU_REGS["OUTSTANDING"]) == 255,
+              "reach the dispatcher's multicast counter underflow")
+  rt.close()
+  assert page() is None and addr not in rt.used
+  with Runtime(chip, end=chip.tensix[2]) as fresh:
+    assert all(chip.read32(*xy, MCAST_STATE) == 0 for xy in [*fresh.cores, fresh.dispatcher])
+    fresh.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))
+    fresh.wait()
+
+
+@pytest.mark.parametrize("received", [2, 4, 6])
+def test_runtime_close_during_worker_multicast(chip, monkeypatch, received):
+  if not isinstance(chip.pci, pci.Sim): pytest.skip("stop at a particular simulated cycle")
+  rt = Runtime(chip, end=chip.tensix[3])
+  first, last = rt.cores[0], rt.cores[-1]
+  addr, page = rt.dram_alloc(64), weakref.ref(rt.status.obj)
+  source = bytes(range(64))
+  chip.write(*first, DATA, source)
+  acks = chip.read32(*first, bh.NIU + bh.NIU_REGS["WR_ACKS"])
+  rt.launch(compile_kernel("""void kmain(volatile unsigned *a) {
+    noc_wait();
+    mcast_begin();
+    unsigned acks = NIU(WR_ACKS) + 6;
+    for (unsigned packet = 0; packet < 3; packet++) {
+      noc_issue(L1_DATA, noc_me(), L1_DATA + packet * MAX_PACKET, a[2], MCAST, MAX_PACKET);
+      for (volatile unsigned spin = 0; spin < 64; spin++) {}  // pause before issuing the next packet or clearing the counter
+    }
+    mcast_done(acks);
+  }"""), (bh.noc_rect(first, last),), units=1)
+  with monkeypatch.context() as patch:
+    patch.setattr(chip.pci, "TICK", 1)
+    chip.wait(lambda: (chip.read32(*first, bh.NIU + bh.NIU_REGS["WR_ACKS"]) - acks) % 2**32 >= received,
+              "reach the worker's multicast acknowledgements")
+  assert chip.read32(*first, MCAST_STATE + 4) == 1
+  halt = chip.halt
+  def stopped(*args):
+    assert page() is not None and rt.used == {addr: 64}, "keep memory alive while the multicast finishes"
+    assert chip.read32(*first, MCAST_STATE + 4) == 0
+    assert chip.read32(*first, bh.NIU + bh.NIU_REGS["WR_ACKS"]) == (acks + 6) % 2**32
+    return halt(*args)
+  with monkeypatch.context() as patch:
+    patch.setattr(chip, "halt", stopped)
+    rt.close()
+  assert page() is None and addr not in rt.used
+  assert chip.read32(*first, bh.NIU + bh.NIU_REGS["WR_ACKS"]) == (acks + 6) % 2**32
+  for xy in rt.cores[1:]:
+    for packet in range(3): assert chip.read(*xy, DATA + packet * bh.MAX_PACKET, len(source)) == source
+
+
 def test_runtime_startup_and_shutdown_failures(chip, monkeypatch):
   # Failed startup releases the new DMA page. Failed shutdown keeps its page and allocations until a retry.
   old = Runtime(chip, end=chip.tensix[1])
@@ -610,3 +666,5 @@ def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel(None, None, "void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"\(1, 2\): launch 1 not finished by BRISC, TRISC1\n"): rt.wait(timeout=0.2)
+  rt.close()  # cancellation must not wait for a hung ordinary kernel to return
+  assert rt.resources.closed

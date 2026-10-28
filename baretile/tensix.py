@@ -775,6 +775,7 @@ static void unflag(unsigned a, unsigned b) {{
 // until they all have them.
 static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   noc_wait();
+  mcast_begin();
   unsigned acks = NIU(WR_ACKS) + (n + MAX_PACKET - 1) / MAX_PACKET * tiles;
   l1_settle(l1);
   for (unsigned k; n; l1 += k, n -= k) noc_issue(l1, noc_me(), l1, rect, MCAST, k = n < MAX_PACKET ? n : MAX_PACKET);

@@ -8,6 +8,7 @@ from baretile import bh, pci
 # - MAILBOX: [go, kernel, arguments, workers] [done, dispatcher's x | y << 6, scratch, index]. The dispatcher
 #   multicasts the first half.
 # - TRISCS: [go phase, done 0, 1, 2], alternating 0/1 for each launch that this worker runs
+# - MCAST_STATE: [cancel requested, multicast active], used to stop between acknowledged multicasts
 # - SYNC: words that the cores of a kernel talk through. Its counters are zeroed before each launch.
 # - FLAGS: 32 words that the workers of a kernel use to signal each other over the NoC. Each word is written by one
 #   worker, and zeroed by the worker that holds it at the end.
@@ -21,6 +22,7 @@ from baretile import bh, pci
 # flits read]. DONE holds the count of the workers' reports and the sum of what they read, and STAGING holds up to
 # STAGE bytes of commands. Those two sit above the kernels, since loading a kernel writes the dispatcher's tile too.
 MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
+MCAST_STATE = 0x1030  # two words shared by workers and dispatcher, between their config/mailbox and SYNC
 ARGS_SIZE = (KERNELS - ARGS) // 2  # the size of each argument buffer
 SYNC_COUNTS = 8  # the first 8 words of SYNC are zeroed before each launch. kernels write the rest before reading them
 SYNC_NAMES = ("fetched", "unpacked", "ready", "packed", "sent", "issued")  # the first SYNC counters in compiled kernels
@@ -76,11 +78,26 @@ static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long 
   l1_settle(l1);  // the NIU doesn't see this core's stores in flight, so they must land first
   for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
+// Publish the active region before checking cancellation. Once the host requests cancellation and sees no active
+// region, no later multicast can issue. Ordinary requests can still issue until reset; shutdown drains their counters.
+#define MCAST_STATE ((volatile unsigned *){MCAST_STATE:#x})
+static inline void mcast_begin(void) {{
+  MCAST_STATE[1] = 1;
+  l1_settle({MCAST_STATE + 4:#x});
+  if (MCAST_STATE[0]) {{
+    MCAST_STATE[1] = 0;
+    l1_settle({MCAST_STATE + 4:#x});
+    for (;;) {{}}  // cancelled: the host will reset this core
+  }}
+}}
 // Wait until a multicast has all its acknowledgements, which is when the ack counter reaches acks. A multicast leaves
 // the outstanding count wrong, up once and down once per tile, so no other request may be in flight. We clear it after.
 static inline void mcast_done(unsigned acks) {{
   while (NIU(WR_ACKS) != acks) {{}}
   NIU(CLEAR_OUTSTANDING) = 0xFFFF;
+  l1_settle({bh.NIU + bh.NIU_REGS["OUTSTANDING"]:#x});
+  MCAST_STATE[1] = 0;
+  l1_settle({MCAST_STATE + 4:#x});
 }}
 static inline void noc_wait(void) {{  // wait until reads have landed and writes are acknowledged
   (void)NIU(CMD); (void)NIU1(CMD); (void)NIU2(CMD);  // reading the initiators back keeps the counter read behind their last requests
@@ -276,6 +293,7 @@ __attribute__((naked)) void park(void) {{ asm("1: j 1b"); }}
 __attribute__((naked)) void brisc(void) {{ asm("li sp, {bh.BRISC_STACK_TOP:#x}\\n j loop"); }}
 // n bytes from l1 to addr in the workers, and wait until they all have them
 static void multicast(unsigned l1, unsigned addr, unsigned n) {{
+  mcast_begin();
   unsigned acks = NIU(WR_ACKS) + CONFIG[7];
   l1_settle(l1);
   noc_issue(l1, noc_me(), addr, CONFIG[6], MCAST, n);  // the tiles of the rectangle but this one, which is in it
@@ -283,7 +301,7 @@ static void multicast(unsigned l1, unsigned addr, unsigned n) {{
 }}
 // The go copies the first 16 bytes of the outbox to the workers' mailboxes. It's always the same multicast, so request
 // initiator 1 holds it and a launch starts with one store.
-static void go(void) {{ unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1; mcast_done(acks); }}
+static void go(void) {{ mcast_begin(); unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1; mcast_done(acks); }}
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
@@ -358,7 +376,7 @@ class _Resources:
   def __init__(self, rt, views):
     self.chip, self.start, self.end, self.cores = rt.chip, rt.start, rt.end, {*rt.cores, rt.dispatcher}
     self.owner, self.views, self.used = weakref.ref(rt), views, rt.used
-    self.active, self.closed = True, False
+    self.active, self.closed, self.started = True, False, False
   def close(self):
     if self.closed: return
     # Takeover holds only resources. Keep the Runtime alive until cleanup finishes so cyclic collection
@@ -366,6 +384,11 @@ class _Resources:
     owner = self.owner()
     self.active = False
     try:
+      if self.started:
+        self.chip.write32(*self.end, MCAST_STATE, 1, self.start)
+        self.chip.wait(lambda: all(self.chip.read32(x, y, MCAST_STATE) == 1 and self.chip.read32(x, y, MCAST_STATE + 4) == 0
+                                  for x, y in self.cores),
+                       "finish the runtime's active multicasts")
       self.chip.halt(*self.end, self.start)
       # Read reset back before polling the NoC: requests issued before the cores stopped can still be in flight.
       for x, y in self.cores: self.chip.read32(x, y, bh.SOFT_RESET)
@@ -460,10 +483,12 @@ class Runtime:
       rect = bh.noc_rect(start, end)
       chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
       chip.write(dx, dy, DONE, bytes(8))
+      chip.write(*end, MCAST_STATE, bytes(8), start)
       chip.write(dx, dy, OUTBOX, bytes(64))  # clear completion status left by the previous dispatcher
       self.doorbell = chip.map(dx, dy, DISPATCH)  # its own TLB, so ringing the doorbell doesn't have to move a window first
       for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
       chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
+      self.resources.started = True
       chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go, and NCRISC stays in reset
     except BaseException:
       self.close()
