@@ -169,6 +169,9 @@ The timeline shows each launch from `go` to its last report, using the
 dispatcher's clock. Scroll to zoom, drag to pan, and double-click to show the
 whole timeline. The table sorts kernels by total cycles. Input shapes help
 distinguish fused kernels that share a name such as `C matmul`.
+Tab to a kernel button and press Enter or Space to select it. With the timeline
+focused, Left and Right select launches, plus and minus zoom, and Home resets
+the view. The page announces the selected launch.
 
 Select a kernel to highlight its launches and see its details. For a fused
 kernel, the page draws the compiled expression with inputs at the top. Each
