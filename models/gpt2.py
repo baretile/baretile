@@ -36,12 +36,15 @@ def safetensors(path):  # the header, with each tensor's dtype, shape and byte r
     header = json.loads(f.read(size))
   return header, np.memmap(path, np.uint8, "r", offset=8 + size)
 
-def u8(data, t): assert t["dtype"] == "U8"; return data[t["data_offsets"][0]:t["data_offsets"][1]].reshape(t["shape"])  # raw bytes, for MXFP4
+def u8(data, t):  # raw bytes, for MXFP4
+  if t["dtype"] != "U8": raise ValueError(f"MXFP4 blocks and scales come as U8, not {t['dtype']}")
+  return data[t["data_offsets"][0]:t["data_offsets"][1]].reshape(t["shape"])
 
 def tensor_bits(data, t, transpose=False):  # a tensor as bf16 bits. fp32 is rounded to nearest even, and a vector becomes a one-row matrix
   raw = data[t["data_offsets"][0]:t["data_offsets"][1]]
   if t["dtype"] == "F32": bits = bf16_bits(raw.view(np.float32))
-  else: assert t["dtype"] == "BF16", t["dtype"]; bits = raw.view(np.uint16)
+  elif t["dtype"] == "BF16": bits = raw.view(np.uint16)
+  else: raise ValueError(f"a checkpoint tensor must be F32 or BF16, not {t['dtype']}")
   bits = bits.reshape(t["shape"] if len(t["shape"]) >= 2 else (1, -1))  # gpt-oss's experts come as a batch of matrices
   return np.ascontiguousarray(bits.T) if transpose else bits
 

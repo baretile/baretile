@@ -315,8 +315,8 @@ class Engine:
       data = self.sessions[key][l] if key else None
       if llama.linear(self.c, l):
         for i, x in enumerate(s[:2]):
-          x.assign(data[i] if data and isinstance(data[i], Tensor) else
-                   Tensor.frombytes(self.rt, x.rows, x.cols, data[i] if data else bytes(4 * x.batch * x.rows * x.cols), x.batch, "fp32"))
+          if not data: x.assign(Tensor.zeros(self.rt, x.rows, x.cols, x.batch, "fp32"))
+          else: x.assign(data[i] if isinstance(data[i], Tensor) else Tensor.frombytes(self.rt, x.rows, x.cols, data[i], x.batch, "fp32"))
       elif isinstance(data, Tensor): s[:, :rows, :].assign(data)
       elif data: s.put(self.on(list(range(rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
     self.held[u], self.taken[u] = list(key), 1.0
@@ -377,7 +377,7 @@ class Engine:
     logits = qwen.draft(ids, places, h, self.t, self.c, self.kv, n, length).realize()
     return logits, heads(logits, k=1)
 
-  def guess(self, u, best): return best  # slot u's draft: the best token of the multi-token prediction layer. test_serve overrides it
+  def guess(self, u, best): return best  # slot u's draft: the best token of the multi-token prediction layer. test_serve_speculative overrides it
 
   def speculate(self, live):
     """Verify each slot's token and draft, accept drafts that match the model's sampled choices, then
@@ -424,7 +424,7 @@ class Engine:
       raise
 
 FAMILIES = (("qwen", "<tool_call>\n<function="), ("harmony", "<|channel|>"), ("llama", "<|start_header_id|>"), ("chatml", "<|im_start|>"))
-def family(template): return next((name for name, mark in FAMILIES if mark in template), None)  # the family, by a mark that only it has
+def family(template): return next((name for name, mark in FAMILIES if mark in template), None)  # Qwen3.5's has ChatML's mark too, so qwen goes first
 
 def chat(template, messages, thinking=True, effort="medium", tools=None):
   """Format messages using the model's chat template: Qwen3.5/3.6, gpt-oss (Harmony), Llama 3 or ChatML."""
@@ -717,7 +717,6 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         ids = engine.tok.encode(prompt, special=is_chat)
         if not ids: raise ValueError("a prompt must contain at least one token")
         top = (q.get("top_logprobs") or 0 if q.get("logprobs") else None) if is_chat else q.get("logprobs")  # a completion's is a count
-        if top is not None and not 0 <= top <= 20: raise ValueError("logprobs and top_logprobs must be between 0 and 20")
         apart = is_chat and (thinking and thinks or harmony)
         choice, form = q.get("tool_choice"), formatted(q.get("response_format"))
         fits = chosen(choice, tools)

@@ -43,9 +43,8 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 
             tflops=664e12, phases=2,  # bfp8 matmuls at one fidelity phase (16 cycles a step), and the phases they take
             launch=1e-6, pcie=25e9,  # a launch's seconds on the card (a guess), and PCIe 4.0 x16 in bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)
-# context is the number of positions in a session's slot, and they're all filled. A step reads the rows of a slot up to
-# the power of 2 that holds the longest session. kv is the KV cache's format, and report uses the mode's unless you
-# set it. accept is the share of drafts that get accepted.
+# context is the number of positions in a session's slot. They're all filled, so a step reads every row. kv is the KV
+# cache's format, and report uses the mode's unless you set it. accept is the share of drafts that get accepted.
 USE = dict(context=32768, kv="bf16", accept=0.0)
 
 def probed(card, path):  # the card with the probe's numbers in place of the spec's (python3 -m baretile.probe 8 path)
@@ -68,7 +67,7 @@ def shape(c, mode="bf16"):
   values: matrix values used per token, including selected experts.
   held: total parameter count."""
   prec, d, hd, e, m, sh = llama.precision(c, mode), c.dim, llama.head(c), c.experts, c.moe, c.shared
-  fmt = lambda op, l=None: BYTES[prec.get((op, l), ("bf16",))[0]]  # the routers, the conv's taps and mtp.fc stay bf16, as llama holds them
+  fmt = lambda op, l=None: BYTES[prec.get((op, l), ("bf16",))[0]]  # a matrix's bytes a value. The routers and mtp.fc count as bf16 below
   mixture = lambda l: e and l not in c.dense  # the multi-token prediction block, c.layers, has experts if the model does
   mixer = d * c.heads * hd * (2 if c.gated else 1) + 2 * d * c.kv * hd + c.heads * hd * d  # an attention block's values: q and its gate, k, v, o
   delta = d * (2 * c.kh * c.kd + 2 * c.vh * c.vd + 2 * c.vh) + c.vh * c.vd * d if c.kh else 0  # a Gated DeltaNet block's: projections and o
@@ -109,7 +108,8 @@ def regroups(c, m):
   hd, d, rt = llama.head(c), c.dim, -(-m // 32)
   def again(k, n):  # the bytes of A that a matmul with K k and N n reads more than once
     plan, w = grid_parts(rt, -(-n // 32), -(-k // 32), GRID, 16, 2) if rt > 1 else None, -(-n // 32)
-    return (-(-(-(-w // min(len(GRID[0]), w))) // plan[1]) - 1) * m * k * BYTES["bf16"] if plan else 0
+    bq = -(-w // min(len(GRID[0]), w))  # columns of result tiles in a worker's block, as in grid_parts
+    return (-(-bq // plan[1]) - 1) * m * k * BYTES["bf16"] if plan else 0  # A is read once for each group of them
   def matrices(l):  # (K, N) for each matrix of block l
     mixer = ((d, 2 * c.kh * c.kd + 2 * c.vh * c.vd + 2 * c.vh), (c.vh * c.vd, d)) if llama.linear(c, l) else \
             ((d, c.heads * hd * (2 if c.gated else 1) + 2 * c.kv * hd), (c.heads * hd, d))
@@ -130,7 +130,7 @@ def past(kind, n): return float(np.interp(n, *zip(*CONTROL[kind])))  # CONTROL's
 
 def step(c, s, use, card, users, speculative=False, cards=1):
   """Estimate a decode step for users sessions. Return traffic bytes (including state writes), FLOPs, launches,
-  control cycles, seconds and tokens/s per user. Speculation verifies a token and draft, then makes the next
+  RISC-V control seconds, seconds and tokens/s per user. Speculation verifies a token and draft, then makes the next
   drafts in a second call. Use the longer of DRAM and matmul time, then add launch overhead and RISC-V work
   estimated from ttsim."""
   n, one, d, v = users * (1 + speculative), session(c, use, speculative), c.dim, " verify" * speculative

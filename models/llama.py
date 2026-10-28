@@ -386,7 +386,7 @@ def config(folder, places=4096):
   for k in ("mrope_section", "mrope_interleaved"): rope.pop(k, None)  # Qwen3.5's. A text token's three positions are all the same
   qwen35 = j.get("model_type", "").startswith(("qwen3_5", "qwen3_next"))  # its RMSNorms scale by 1 + w (centered), and its attention is gated
   rope.setdefault("rope_type", kind or "default")
-  assert rope["rope_type"] in ("default", "llama3", "yarn"), f"RoPE scaling {rope} isn't supported"
+  if rope["rope_type"] not in ("default", "llama3", "yarn"): raise ValueError(f"RoPE scaling {rope} isn't supported")
   experts, layers = j.get("num_experts") or j.get("num_local_experts") or 0, j["num_hidden_layers"]
   return model(dim=j["hidden_size"], heads=j["num_attention_heads"], kv=j["num_key_value_heads"], layers=layers, eps=j["rms_norm_eps"], theta=theta,
                places=min(j["max_position_embeddings"], places), vocab=j["vocab_size"], ffn=j.get("intermediate_size"), head_dim=j.get("head_dim"),
@@ -475,7 +475,8 @@ class Made(dict):  # construct a value on each lookup without caching it
 
 def arrays(weights, prec=None):
   """Return lazily constructed NumPy float32 weights with the values held on the chip. weight_format
-  selects each storage format. gpt2.bfp rounds block floats in groups of 1024 rows, matching the chip.
+  selects each storage format. gpt2.bfp rounds block floats as the chip does, 1024 rows at a time to bound NumPy's
+  temporaries.
   Each lookup constructs a new array without caching it, so NumPy holds only the current model block."""
   def made(name, w):
     v, f = w.values(), weight_format(name, prec)
@@ -542,7 +543,7 @@ def python_regex(pat):
   while i < len(pat):
     if pat.startswith(("\\p{", "\\s", "\\S"), i):
       key, i = (pat[i + 3:pat.index("}", i)], pat.index("}", i) + 1) if pat[i + 1] == "p" else (pat[i + 1], i + 2)
-      assert not (inside and key == "S"), "\\S inside a character class isn't supported"
+      if inside and key == "S": raise ValueError("\\S inside a character class isn't supported")
       out.append(f"[^{WHITE}]" if key == "S" else ranges[key] if inside else f"[{ranges[key]}]")
     else:
       n = 2 if pat[i] == "\\" else 1
