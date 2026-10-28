@@ -201,7 +201,12 @@ python3 models/cost.py /path/to/Qwen3.6-35B-A3B experts context=16384 accept=0.5
 
 Add `probe=probe.json` once you've measured a card. Until then, the model assumes
 that decode gets 70% of the specified 512 GB/s DRAM bandwidth and that a launch
-takes one microsecond. Those two assumptions are guesses.
+takes one microsecond. Those two assumptions are guesses. Compute uses the
+fidelity phases selected for each operation by the precision mode, including
+mixed TT/experts modes and attention's separate decode and prefill settings.
+`phases=number` overrides all operations with that uniform assumption; the
+report identifies this override. Prompt chunks charge both the main and draft
+vocabulary projections once per chunk, including the final short chunk.
 Memory estimates reserve the full context for each attention cache, including
 sliding attention, matching the current allocator. If the weights leave no room
 for a session, the report says so and omits throughput estimates.

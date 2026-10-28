@@ -1808,6 +1808,51 @@ def test_attention_cost_units():
   one = 2 * 32 * 64 * 2  # each unit reads one 32-row key tile and value tile for its head
   assert [cost.attention(c, 1, queries, 32, "bf16") for queries in (1, 64, 65, 256)] == [one, one, 2 * one, 4 * one]
 
+def test_cost_fidelity():
+  # Make DRAM negligible so the estimate exposes the phase cost, including TT's mixed MLP and attention phases.
+  c = llama.model(dim=64, heads=1, kv=1, layers=2, ffn=128, vocab=256)
+  use, card = cost.USE | {"context": 64}, cost.CARD | {"bandwidth": 1e30, "tflops": 1e12}
+  for mode in ("bf16", "bfp8", "bfp4"):
+    s = cost.shape(c, mode)
+    step, prompt = cost.step(c, s, use, card, 2), cost.prompt(c, s, use, card, 64)
+    assert s.work == 4 * s.values and step.work == 4 * step.flops and prompt.work == 4 * prompt.flops
+    assert step.compute == step.work / card["tflops"] and prompt.seconds == prompt.work / card["tflops"]
+    overridden = cost.prompt(c, s, use, card | {"phases": 2}, 64)
+    assert prompt.seconds == 2 * overridden.seconds
+  s = cost.shape(c, "tt")
+  gate_up = c.layers * 2 * c.dim * c.ffn
+  assert s.work == 2 * s.values - gate_up
+  step, prompt = cost.step(c, s, use, card, 2), cost.prompt(c, s, use, card, 64)
+  assert step.work == 2 * step.flops - 2 * 2 * gate_up
+  attention = c.layers * 4 * 64 * c.heads * llama.head(c) * 64
+  assert prompt.work == 2 * prompt.flops - 2 * 64 * gate_up + 2 * attention
+  # Llama-3.1-8B's last gate/up uses two phases rather than TT's usual one.
+  large = llama.model(dim=4096, heads=32, kv=8, layers=32, ffn=14336, vocab=128256)
+  s = cost.shape(large, "tt")
+  assert s.work == 2 * s.values - 31 * 2 * 4096 * 14336
+  # B3's mixed-phase roofline uses causal attention and phase-weighted work against the one-phase peak.
+  attention = c.layers * 4 * c.heads * llama.head(c) * 64 * 65 // 2
+  assert benchmark.prefill_flops(c, 64, phases=True) == 2 * benchmark.prefill_flops(c, 64) - 2 * 64 * gate_up + 2 * attention
+
+def test_cost_draft_head():
+  # Experts use one phase, projections two, routers and MTP inputs four, and the draft head one. The draft
+  # vocabulary projection runs once per prompt chunk, including a short final chunk, while its layers run per token.
+  c = llama.model(dim=64, heads=1, kv=1, layers=1, ffn=128, vocab=256, experts=4, k=2, moe=64, shared=32, mtp=1)
+  s, use, card = cost.shape(c, "experts"), cost.USE | {"context": 10}, cost.CARD | {"bandwidth": 1e30, "tflops": 1e12}
+  mixer, mlp, router, head = 4 * 64 * 64, 3 * 64 * (32 + 2 * 64), 64 * 4, 256 * 64
+  assert s.work == 2 * mixer + mlp + 4 * router + 2 * head
+  assert s.draft_work == 2 * mixer + mlp + 4 * router + 4 * 2 * 64 * 64 and s.draft_head_work == head
+  base = llama.model(**(vars(c) | {"mtp": 0}))
+  for chunk in (1, 4, 16):
+    plain, draft = cost.prompt(base, cost.shape(base, "experts"), use, card, chunk), cost.prompt(c, s, use, card, chunk)
+    chunks = math.ceil(use["context"] / chunk)
+    attention = sum(4 * min(chunk, 10 - at) * 64 * (at + min(chunk, 10 - at)) for at in range(0, 10, chunk))
+    assert draft.flops - plain.flops == 2 * 10 * s.draft_values + 2 * chunks * head + attention
+    assert draft.work - plain.work == 2 * 10 * s.draft_work + 2 * chunks * s.draft_head_work + 4 * attention
+  step = cost.step(c, s, use, card, 2, speculative=True)
+  # Verification and drafting both attend to the cache for two positions per user.
+  assert step.flops == 2 * 4 * (s.values + s.draft_values + head) + 2 * 4 * 4 * 64 * 10
+
 def test_cost(tmp_path):
   # models/cost.py works from a config alone. Qwen3.6-35B-A3B has 35.5B parameters (0.9B in the multi-token prediction
   # layer) and reads 2.95B a token, about 21.9 GB in the one-card formats. Its KV cache is 20 KB a token (10 attention
@@ -1846,8 +1891,11 @@ def test_cost(tmp_path):
   # a chunk of 2,048 reads its activations again for each group of columns. 256 doesn't, since the accumulators fit
   assert cost.regroups(c, 256) == 0 < cost.regroups(c, 2048), cost.regroups(c, 2048)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")
-  for keys in ({"contex": 32}, {"context": 0}, {"context": 1.5}, {"bandwidth": 0}, {"reach": 2}, {"reserve": card["dram"]}, {"kv": "fp64"}):
+  for keys in ({"contex": 32}, {"context": 0}, {"context": 1.5}, {"bandwidth": 0}, {"phases": 0}, {"reach": 2},
+               {"reserve": card["dram"]}, {"kv": "fp64"}):
     with pytest.raises(ValueError): cost.report(str(tmp_path / "llama"), **keys)
+  assert "each operation's precision phases" in cost.report(str(tmp_path / "llama"))
+  assert "4 phases for every operation (override)" in cost.report(str(tmp_path / "llama"), phases=4)
   with pytest.raises(ValueError, match="precision"): llama.precision(c, "bpf8")
   windowed = llama.model(dim=128, heads=4, kv=2, layers=2, sliding=32, layer_types=["sliding_attention", "full_attention"])
   assert cost.session(windowed, use | {"context": 1024}).kv == 2 * 1024 * 2 * 2 * 32 * 2, "reserve full KV rows, even with a sliding window"
