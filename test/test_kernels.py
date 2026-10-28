@@ -198,6 +198,26 @@ def test_zeros(chip):
     assert rt.sent[(since + 1) % TIMES][0] == "zeros" and raw(z) == raw(cast) == [bytes(each)] * len(bh.DRAM), dtype
     assert not np.array(z.tolist()).any(), dtype
 
+def test_checks_without_asserts():
+  # A bad call raises an exception, so it still stops under python -O, which drops assert statements. The checks run
+  # before the tensors touch DRAM, so a stand-in runtime that hands out address 0 is enough, and no chip is needed.
+  code = """
+from baretile.tensor import Tensor
+class Runtime:
+  def dram_alloc(self, size): return 0
+  def dram_free(self, addr): pass
+rt = Runtime()
+x, y = Tensor(rt, 2, 3), Tensor(rt, 2, 3)
+for bad in (lambda: x @ y, lambda: x.reshape(5, 5), lambda: x.permute(0, 0, 1), lambda: x + Tensor(rt, 3, 2),
+            lambda: Tensor.frombytes(rt, 1, 1, bytes(2), dtype="bfp8"), lambda: x.cast("int32") @ x.T.cast("int32")):
+  try: bad()
+  except ValueError: continue
+  raise SystemExit("no ValueError")
+print("all raised")
+"""
+  run = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, text=True, timeout=60, cwd=pathlib.Path(__file__).parent.parent)
+  assert run.returncode == 0 and run.stdout.strip() == "all raised", run.stdout + run.stderr
+
 def test_tensor_inputs(chip):
   # Reject malformed inputs before allocating DRAM. Ragged rows can have the right total byte count.
   rt = Runtime(chip, end=chip.tensix[1])
@@ -554,7 +574,7 @@ def test_matmul_by_columns(chip):
       assert np.array_equal(value(x.matmul(w.columns(), index=ids)), value(x.matmul(w, index=ids))), (w.dtype, t, e)
   x, wc = Tensor.of(rt, rng.normal(0, 1, (1, 64)).tolist()), Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()).columns()
   for misuse in (lambda: wc + 1, lambda: x @ wc.T, lambda: wc[:, :32], lambda: wc.gather([0]), lambda: wc.cast("bfp4")):
-    with pytest.raises(AssertionError): misuse().realize()
+    with pytest.raises(ValueError, match="by columns"): misuse().realize()
 
 def test_matmul_chunks(chip):
   # B laid out by columns comes in long reads. A token's row streams each column in chunks with CHUNKS reads in flight,

@@ -58,6 +58,10 @@ file's private names.
 - Facts about the chip live as data in [bh.py](baretile/bh.py). An instruction's
   modifier values stay next to the compiler code that uses them.
 - Every wait has a timeout. If the chip hangs, we report it.
+- A caller's mistake raises an exception (`ValueError` for a bad argument), and so
+  does a card in the wrong state (`RuntimeError`). Use `assert` only for baretile's
+  own invariants, and never put work in one: `python -O` drops asserts.
+  `test_checks_without_asserts` runs bad calls under `-O`.
 - Comments explain a constraint or a reason that the code doesn't make clear.
   Docstrings start with what the function does and mention anything surprising.
   Document kernel arguments and layouts when a caller needs them.

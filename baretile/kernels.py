@@ -175,7 +175,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
   base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
   rows_at, top = [], base  # where each matmul keeps its row of A in L1, or None if it doesn't fit and A streams too
-  assert top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16, "too many tiles in a kernel"
+  if not (top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16):
+    raise ValueError("too many tiles in a kernel")
   for j in matmuls:
     fits = top + ops[j]["kt"] <= UNPACKABLE
     rows_at.append(top if fits else None)
@@ -251,7 +252,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   chunked = ring if ring and not mc and kept_b is None and (rows_at[0] is not None or long) else 0
   b8 = (kp if parts else ops[matmuls[0]]["kt"] if kept_b is not None else chunked or DEPTH) if any(ops[j]["wt"] for j in matmuls) else 0
   wts = {ops[j]["wt"] for j in matmuls if ops[j]["wt"]}  # the block-float formats of B
-  assert len(wts) <= 1, "a kernel takes one block-float format"
+  if len(wts) > 1: raise ValueError("a kernel takes one block-float format")
   wt = next(iter(wts), "bfp8")
   # the number of blocks down and across a matrix
   br, bc = (mc[1], len(grid[0])) if mc else (1, bcast[0] * bcast[1]) if bcast else (-(-rt // bp), -(-w // bq))
@@ -310,7 +311,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   if long: rows_at, top = [top], top + ops[matmuls[0]]["kt"]  # past the singles, which stay below slot 256
   b8_at = slot_base(dtype) + top * tile_bytes(dtype) if long or parts and b8 else None  # a block-float B goes past it, or at B8
   if chunked and not ops[matmuls[0]]["wt"]: ring_slot, top = top, top + chunked  # a bf16 B's ring goes past it too
-  assert slot_base(dtype) + top * tile_bytes(dtype) <= OUTS, "too many tiles in a kernel"
+  if slot_base(dtype) + top * tile_bytes(dtype) > OUTS: raise ValueError("too many tiles in a kernel")
   # An input or swept op lives in the tile's frame (fr in the C is 0 or 1), unless it's kept. A narrow op has its own
   # slot.
   def slot(r):
@@ -358,7 +359,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   if picked:
     (r,), k, ib = picked, shapes[picked[0]][2], tile_bytes("int32")
     it = -(-shapes[r][1] // 32)  # tiles of indices, kept in L1 below OUTS
-    assert shapes[r][0] == 1 and k <= 32 and OUTS - it * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8"), "indices must be one tile column below OUTS"
+    if not (shapes[r][0] == 1 and k <= 32 and OUTS - it * ib >= B8 + 3 * B8_SLOTS * tile_bytes("bfp8")):
+      raise ValueError("indices must be one tile column below OUTS")
     indices = (f"#define IDS {OUTS - it * ib:#x}\nstatic unsigned ids(unsigned b) {{ unsigned t = b / {k}, j = b % {k};  // index (t, j)\n"
                f"  return ((volatile unsigned *)IDS)[t / 32 * 1024 + (t % 32 / 16 * 2 + j / 16) * 256 + t % 16 * 16 + j % 16]; }}\n")
   passes = []
@@ -522,7 +524,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       math = tt(math_begin(op['kind'] == 'mul') + fpu + prog + sfpu(op['posts'], slots))
       c[M].append(f"{cond}{{ {math} {math_end(j)} h ^= {DST_HALF}; }}")
     for acc, j in enumerate(reductions):
-      assert acc < len(ACCS), "at most two reductions in a pass"
+      if acc >= len(ACCS): raise ValueError("at most two reductions in a pass")
       op, me_j, x, kind = ops[j], ("op", j), ops[j]["x"], ops[j]["kind"]
       drain = "drain(); " if isinstance(x, tuple) else ""
       edge = size(x)[axis] % 32 if axis and size(x)[axis] > 1 else 0  # the operand's rows or columns in its last tile, if cut short
@@ -709,14 +711,14 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   R, fs, T, (p_slot, m_slot, q_row), oacc, places, used, ranges = attention_l1(ht, rows, wt, parts)
   per = -(-ra // R)  # units per head
   ones, none, fr0 = 1, 2, 3  # tiles of ones and of -1e9, made by the SFPU once a launch, then the frames
-  assert parts == 1 or R <= 2, "splitting attention keys requires units of at most two tile rows"
+  if not (parts == 1 or R <= 2): raise ValueError("splitting attention keys requires units of at most two tile rows")
   # The slot of frame fr's mask tile for row r, and where the unpackers find its key tile m and value tile j. A block
   # float's are in the frame's region at B8. into() is where BRISC puts a tile: getb's region and slot.
   mask = lambda r: f"{fr0} + fr * {fs} + {r}"
   key = lambda m: f"{m}" if wt else f"{fr0} + fr * {fs} + {R} + {m}"
   val = lambda j: f"{ht} + {j}" if wt else f"{fr0} + fr * {fs} + {R + ht} + {j}"
   into = lambda z: f"fr * {2 * ht} + {z}" if wt else z
-  assert ranges >= B8 + 2 * 2 * ht * tile_bytes(wt or "bf16") and used <= UNPACKABLE, "a unit's tiles don't fit in L1"
+  if not (ranges >= B8 + 2 * 2 * ht * tile_bytes(wt or "bf16") and used <= UNPACKABLE): raise ValueError("a unit's tiles don't fit in L1")
   # keep: a unit's first key rows stay in L1, the rows n = kt - k0 below room. A block float's row n is in region
   # n / rows_a, from slot n % rows_a * ht on. A bf16 row n starts at slot store + n * ht.
   if keep:
@@ -1035,8 +1037,8 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   tb = tile_bytes(dtype)
   pick = "0" if k * parts == 1 else "j"  # the pick that result column j holds. A k of 1 in one part is copied across
   label = f"((volatile unsigned *)(LABELS + {pick} * 64))[at(s, col[{pick}] % 32) % 16]" if labels else f"p * {cols} + col[{pick}]"
-  assert parts == 1 or (k % 32 == 0 and cols % 32 == 0), "with parts, k and cols must be multiples of 32"
-  assert ct <= topk_room(dtype, k), "a part's tile row doesn't fit in L1"
+  if not (parts == 1 or (k % 32 == 0 and cols % 32 == 0)): raise ValueError("with parts, k and cols must be multiples of 32")
+  if ct > topk_room(dtype, k): raise ValueError("a part's tile row doesn't fit in L1")
   return compile_kernel(f"""
 #define X {DATA:#x}
 #define VALUES {DATA + ct * tb:#x}

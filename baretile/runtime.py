@@ -334,7 +334,7 @@ class Runtime:
     if start not in chip.tensix or end not in chip.tensix: raise ValueError("runtime endpoints must be available Tensix tiles")
     if chip.banks != list(range(len(bh.DRAM))): raise ValueError("the runtime needs all eight DRAM banks")
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
-    assert len(cores) >= 2, "a rectangle needs a dispatcher and at least one worker"
+    if len(cores) < 2: raise ValueError("a rectangle needs a dispatcher and at least one worker")
     self.chip, self.launches, self.wptr = chip, 0, 0
     self.queued = collections.deque()  # (launch, workers) for each launch that may not be done yet
     # DRAM: holes lists free (address, size) ranges; used maps address to size.
@@ -403,7 +403,7 @@ class Runtime:
     multicasts over the rectangle, including the dispatcher. If space runs out, wait for queued work before
     evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
     if kernel not in self.loaded:
-      assert len(kernel) <= ZEROS - KERNELS, f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}"
+      if len(kernel) > ZEROS - KERNELS: raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}")
       if self.evicts(kernel): self.evict()
       self.chip.write(*self.end, self.room, kernel, self.start)
       self.loaded[kernel], self.room = self.room, self.room + len(kernel)  # compile_kernel makes it a multiple of 16
@@ -438,7 +438,7 @@ class Runtime:
     if units <= 0: raise ValueError("a launch needs at least one unit")
     n = min(units, len(self.cores))
     body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
-    assert len(body) <= ARGS_SIZE, f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}"
+    if len(body) > ARGS_SIZE: raise ValueError(f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}")
     length = -(-(16 + len(body)) // 64) * 64
     if length > len(self.ring): raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
     return struct.pack("<4I", length, self.load(kernel), len(body), n) + body.ljust(length - 16, b"\0"), n
@@ -485,7 +485,7 @@ class Runtime:
     flits, including DRAM, other tiles' L1 and local copies. Bytes are None without NIU counters. Only the
     last TIMES launches are available."""
     self.wait()
-    assert self.launches - since <= TIMES, f"{self.launches - since} launches to profile, but only the last {TIMES} are kept"
+    if self.launches - since > TIMES: raise ValueError(f"{self.launches - since} launches to profile, but only the last {TIMES} are kept")
     totals = collections.defaultdict(lambda: [0, 0, 0])
     for n in range(since + 1, self.launches + 1):
       go, done, flits = struct.unpack_from("<3I", self.times, n % TIMES * 16)
