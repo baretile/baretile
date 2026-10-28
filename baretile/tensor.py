@@ -298,6 +298,7 @@ class Tensor:
   def merge(self):
     """Place batch matrices side by side, reversing split: x.split(n).merge() is x. An unrealized expression
     writes directly into the result columns. Otherwise, copy the matrices there."""
+    if self.cols % 32: raise ValueError(f"merge needs matrices a whole number of tiles wide, not {self.cols} columns")
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
     (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # + 0 copies a realized tensor or a move in
     return out._track("merge", (self,))
@@ -312,14 +313,16 @@ class Tensor:
 
   def realize(self, into=None):
     """Queue the computation and return this tensor. Allocate DRAM for the result, or write into the tensor or
-    view passed as into."""
+    view passed as into. A tensor that's already realized has nothing to write; assign copies one."""
     if into is not None:
       self._same_runtime(into)
-      if not (into.op is None and (into.shape, into.dtype) == (self.shape, self.dtype)):
-        raise ValueError("realize needs a destination of the same shape and dtype")
+      if not (into.op is None and into.rep == 1 and not into.runs and (into.shape, into.dtype) == (self.shape, self.dtype)):
+        raise ValueError("realize needs a realized destination of the same shape and dtype, not a repeat or a tensor by columns")
+      if self.op is None: raise ValueError("realize writes into a destination only from an unrealized tensor. assign copies a realized one")
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
+      if self.dtype in BFP: raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
       x, op, self.op, self.srcs, d = _plain(self.srcs[0].realize()), self.op, None, (), self.dtype
       self.addr = self._alloc()
       where = (self.addr, *x._where())
@@ -336,7 +339,6 @@ class Tensor:
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs), self.rt.readers)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
-    if into and into.runs: raise ValueError("can't realize into a tensor by columns")
     if into: self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, into.owner or into, into.bstride, into.stride, into.offset
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
@@ -521,13 +523,15 @@ class Tensor:
 
     index is an int32 (rows, k) tensor. For batch entry b, index[b // k, b % k] selects a matrix from x.
     Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero
-    without reading a matrix."""
+    without reading a matrix. A matmul by index has no gradient."""
     self._same_runtime(x, *((index,) if index is not None else ()))
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("matmul fidelity must be between one and four phases")
     if index is not None:
-      if not (index.dtype == "int32" and self.dtype == "bf16" and self.cols == x.rows and self.batch in (1, index.rows * index.cols)):
-        raise ValueError(f"matmul by index needs bf16 A and int32 indices to fit: {self.shape} {self.dtype} @ {x.shape}, {index.shape} {index.dtype}")
+      if not (index.dtype == "int32" and self.dtype == "bf16" and x.dtype in ("bf16", *BFP) and self.cols == x.rows
+              and self.batch in (1, index.rows * index.cols)):
+        raise ValueError(f"matmul by index needs bf16 A, a bf16 or block-float B and int32 indices to fit: {self.shape} {self.dtype} @ "
+                         f"{x.shape} {x.dtype}, {index.shape} {index.dtype}")
       out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x, index), index.rows * index.cols, dtype or "bf16")
       out.fidelity = fidelity
       return out
@@ -684,6 +688,7 @@ def _backward(t, g):
            "cast": lambda: g.cast(x.dtype)}
   if op in unary: return (unary[op](),)
   g = _full(g, t.shape)  # movement and matmul can't take g broadcast
+  if op == "matmul" and len(srcs) == 3: raise NotImplementedError("a matmul by index has no backward")
   if op == "matmul":  # a transposed B gets its gradient as (g.T @ x).T, and the T's own rule cancels that transpose
     turn = y._ctx is not None and y._ctx[0] == "T"
     if args:  # fp32: the forward's parts, transposed, and g's parts, made once for both
