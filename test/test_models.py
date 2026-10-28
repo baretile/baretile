@@ -597,6 +597,59 @@ def test_qwen3_5_sequences(chip):
   free = llama.slot(c, kv, 1, 3)
   assert not any(np.any(np.frombuffer(s.tobytes(), np.float32)) for l in range(3) for s in free[l]), "the free slot's states stay 0"
 
+def test_model_geometry(chip):
+  # Reject unsupported DeltaNet layouts and expert workspaces before output allocation or submission. None of the
+  # malformed tensors below is read by a kernel, so an uninitialized allocation is sufficient for each input.
+  rt = Runtime(chip)
+  t = lambda shape: Tensor(rt, shape[1], shape[2], batch=shape[0], dtype="fp32")
+  base = {k: t(shape) for k, shape in dict(S=(8, 32, 32), x=(1, 4, 392), conv=(3, 2, 256), taps=(4, 1, 256),
+                                         dt=(1, 1, 4), decay=(1, 1, 4), first=(8, 32, 32), accept=(1, 1, 2), conv2=(3, 2, 256)).items()}
+  bad = [dict(S=t((8, 33, 32))), dict(S=t((8, 32, 33))), dict(S=t((9, 32, 32))), dict(x=t((1, 3, 392))),
+         dict(conv=t((3, 2, 257))), dict(conv=t((3, 2, 128))), dict(conv=t((3, 2, 320))), dict(first=None),
+         dict(accept=None), dict(conv2=None), dict(first=t((4, 32, 32))), dict(accept=t((1, 2, 1))), dict(conv2=t((3, 1, 256))),
+         dict(x=t((1, 2, 392))), dict(dt=t((1, 1, 8))), dict(live=Tensor(rt, 2, 1))]
+  for changed in bad:
+    before = rt.used, rt.launches
+    with pytest.raises(ValueError, match="delta"): qwen.delta(**(base | changed))
+    assert (rt.used, rt.launches) == before
+  ids, weights = Tensor(rt, 8192, 1, dtype="int32"), Tensor(rt, 8192, 1)
+  before = rt.used, rt.launches
+  with pytest.raises(ValueError, match="fit L1"): qwen.touched(ids, 1, weights)
+  with pytest.raises(ValueError, match="fit L1"): qwen.touched_kernel(8192, 1, 1)
+  assert (rt.used, rt.launches) == before
+  fitting = next(rows for rows in range(8192, 0, -32) if (qwen.DATA + rows // 32 * 6144 + 8 + 63) // 64 * 64 + 4096 <= qwen.OUTS)
+  assert qwen.touched_l1(fitting, 1, 1) + 4096 <= qwen.OUTS
+  with pytest.raises(ValueError, match="fit L1"): qwen.touched_l1(fitting + 32, 1, 1)
+
+
+def test_all_linear_model(chip):
+  # A truncated hybrid can contain only recurrent blocks. Direct calls use RoPE capacity; the server supplies its
+  # smaller slot capacity so its idle position leaves recurrent state untouched.
+  rt, rng = Runtime(chip), np.random.default_rng(31)
+  c, weights = qwen35(rng, places=64)
+  c.layers, c.mtp = 3, 0
+  weights = {k: v for k, v in weights.items() if not k.startswith(("mtp.", "layers.3.", "layers.4."))}
+  w, t = llama.arrays(weights), llama.upload(rt, weights)
+  on = lambda row, dtype="int32": Tensor.of(rt, [row], dtype)
+  ids = [7, 200, 31]
+  got = gpt2.values(llama.forward(on(ids), on([0, 1, 2]), t, c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
+  want = llama.forward(ids, [0, 1, 2], w, c, llama.kv_cache(c, 32, np.zeros), every=True)
+  assert np.abs(got - want).max() < 0.03 * np.abs(want).max()
+  before = rt.used, rt.launches
+  for k in ("cos", "sin"):
+    with pytest.raises(ValueError, match="RoPE"):
+      serve.Engine(rt, t | {k: t[k][:, :32, :]}, c, None, slots=2, places=64)
+    assert (rt.used, rt.launches) == before
+  engine = serve.Engine(rt, t, c, None, slots=2, places=32, keep=0, park=0)
+  state = llama.kv_cache(c, 32, np.zeros)
+  for place, token in enumerate(ids[:2]):
+    logits, _ = engine.decode(on([token, 0]), on([place, 31]), engine.column([1, 1]), 32)
+    got, want = gpt2.values(logits)[0], llama.forward([token], [place], w, c, state)[0]
+    assert np.abs(got - want).max() < 0.03 * np.abs(want).max()
+  idle = llama.slot(c, engine.kv, 1, 2)
+  assert all(not np.any(np.frombuffer(s.tobytes(), np.float32)) for block in idle for s in block)
+
+
 def test_delta_step(chip):
   # qwen.delta runs Gated DeltaNet decode in one kernel, with a work unit per key head. It must match numpy_delta to 1e-5 with the
   # conv inputs exact. The shapes go up to Qwen3.6's 32 heads of 128 by 128. The second sequence is inactive (live 0). Its

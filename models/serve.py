@@ -241,6 +241,7 @@ class Engine:
   def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=None, keep=4 << 30, park=None):
     if slots < 1: raise ValueError("slots must be positive")
     if places < 32 or places % 32: raise ValueError("places must be a positive multiple of 32, so that slots are whole tiles")
+    if places > min(t[k].shape[-2] for k in ("cos", "sin")): raise ValueError("places exceeds the loaded RoPE tables")
     if chunk is not None and chunk < 1: raise ValueError("chunk must be positive")
     if keep < 0 or park is not None and park < 0: raise ValueError("session cache budgets must be nonnegative")
     self.rt, self.t, self.c, self.tok, self.places, self.keep = rt, t, c, tokenizer, places, keep
@@ -385,7 +386,7 @@ class Engine:
     if r.gone: return self.take(u, None)
     ids = r.ids[at:at + self.chunk]
     places, n = self.on(list(range(at, at + len(ids)))), self.length(at + len(ids) - 1)
-    out = llama.forward(self.on(ids), places, self.t, self.c, self.slot[u], hidden=self.spec, length=n)
+    out = llama.forward(self.on(ids), places, self.t, self.c, self.slot[u], hidden=self.spec, length=n, capacity=self.places)
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
@@ -428,13 +429,14 @@ class Engine:
     r.end()
 
   def decode(self, ids, places, t, length):  # replayed: the next tokens of the slots, giving their logits and their heads at t
-    logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), length=length).realize()
+    logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), length=length, capacity=self.places).realize()
     return logits, heads(logits, t)
 
   def check(self, ids, places, accept, t, length):
     """Replayed when speculating. Takes in the token and draft of each slot, from the states that accept picks.
     Returns their logits and heads, and keeps their hidden states for guesses."""
-    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), accept=accept, hidden=True, length=length)
+    logits, self.hidden[length] = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), accept=accept, hidden=True,
+                                               length=length, capacity=self.places)
     return logits.realize(), heads(logits, t)
 
   def guesses(self, ids, places, taken, length):
