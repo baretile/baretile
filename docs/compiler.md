@@ -61,10 +61,16 @@ and offset. When data has to move, `move_kernel` copies it to the new layout.
 `gather` reads rows by index, and `put` writes them. The models use these for
 embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
 `assign` preserves the original source when source and destination views overlap
-with different layouts. It copies that source before writing the destination.
+with different layouts. `realize(into=...)` also computes through a temporary
+when its destination overlaps a matmul input or a differently laid out input.
+`put` snapshots overlapping source rows and indices before writing, and keeps
+singleton rows replicated across their physical tiles for later broadcasting.
 
-Autograd walks the expression backwards and builds lazy operations for the
-gradients. `test_autograd` checks these against numerical differences.
+Autograd walks the expression backwards and builds tensor operations for the
+gradients. `backward()` queues the forward value and every leaf gradient before
+returning, so sequential parameter updates use the same forward values.
+`gradient()` returns lazy expressions; realize all of them before changing any
+forward operand. `test_autograd` checks gradients against numerical differences.
 [test/train.py](../test/train.py) compares a small GPT training run with PyTorch.
 
 ## Unpack, math and pack

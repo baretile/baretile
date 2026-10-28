@@ -934,7 +934,7 @@ def put_kernel(dtype):
 
   args: [first unit, units, the tensor's and x's address, tile strides for batch and row, and tile offset, then the
   address and tile offset of the int32 row that holds the places of the n rows, then n, and the tensor's tile columns
-  and tile rows].
+  and tile rows, then its logical row count].
 
   A unit is a row of x in a matrix and tile column of the tensor, so the work grows with the rows put, not with the
   size of the tensor. Workers read all the places, 32 to a tile, and chain the rows that land in each tile row, first
@@ -953,6 +953,7 @@ def put_kernel(dtype):
   copy = ("for (unsigned f = 0; f < 2; f++) pack(FROM + run_of(i, f), TILE, r, f);" if bfp else
           f"for (unsigned f = 0; f < 2; f++) for (unsigned k = 0; k < {4 * ITEMSIZE[xd]}; k++) "
           f"((volatile unsigned *)(TILE + run_of(r, f)))[k] = ((volatile unsigned *)(FROM + run_of(i, f)))[k];")
+  copy = f"for (unsigned r = a[15] == 1 ? 0 : place[i], end = a[15] == 1 ? 32 : r + 1; r < end; r++) {{ {copy} }}"
   # value k of the run into the block-float tile: two to a byte for bfp4, 7 bits of magnitude rounded half up for bfp8
   rounded = ("if (k % 2) continue; ((volatile unsigned char *)tile)[64 + n * 8 + k / 2] = nibble(v[k], top) | nibble(v[k + 1], top) << 4;"
              if dtype == "bfp4" else
@@ -1002,7 +1003,7 @@ void kmain(volatile unsigned *a) {{
     else noc_get(BANK(to), AT(a[2], to, {tb}), TILE, {tb});  // in flight with the first row's tile of x
     for (unsigned i = i0; i != ~0u; i = next[i]) {{
       if (whole && i < i0 + 32) continue;
-      unsigned r = place[i], from = b * a[7] + i / 32 * a[8] + j + a[9];
+      unsigned from = b * a[7] + i / 32 * a[8] + j + a[9];
       if (from != held) noc_get(BANK(from), AT(a[6], from, {xb}), FROM, {xb}), held = from;
       noc_wait();
       {copy}

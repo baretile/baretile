@@ -18,6 +18,14 @@ def test_train(chip):
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
+def test_adam_original_gradients(chip):
+  rt = Runtime(chip)
+  a, b = (Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for v in (1, 2))
+  state = {id(p): [Tensor.full(rt, 1, 1, 0, "fp32") for _ in range(2)] for p in (a, b)}
+  (a * b).backward()
+  train.adam((a, b), state, Tensor.full(rt, 1, 1, 10, "fp32"), Tensor.full(rt, 1, 1, 1 / np.sqrt(0.001), "fp32"))
+  assert np.allclose([state[id(p)][0].tolist()[0][0] for p in (a, b)], [0.2, 0.1])
+
 def need_tinygrad(name="tinygrad"):
   """Import name from tinygrad. With TINYGRAD=/path/to/a/checkout, it comes from the checkout and must import, so CI
   can't skip the adapter tests by accident. Without TINYGRAD, an installed tinygrad will do, or the test skips."""

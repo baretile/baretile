@@ -82,7 +82,7 @@ assert (A @ B).tolist() == want and (A @ B8).tolist() == want and (A @ B8.column
 print("7. bf16, bfp8 and bfp8 stored by columns gave the same matmul result")
 
 # 8. requires_grad_() enables gradients for v. backward() accumulates them in v.grad.
-# Gradients are tensor expressions too; v.grad.tolist() compiles and runs them.
+# backward() queues the gradients before returning; tolist() waits and reads them.
 v = Tensor.of(rt, [[1.0, 2.0, 3.0]], "fp32").requires_grad_()
 (v * v).sum().backward()
 assert v.grad.tolist() == [[2.0, 4.0, 6.0]]

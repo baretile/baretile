@@ -761,6 +761,19 @@ def test_assign_overlapping_views(chip):
     want[:, 32:] = want[:, :-32].copy()
     assert np.array_equal(value(x)[0], want), "overlapping block floats copy without elementwise arithmetic"
 
+def test_realize_overlapping_destination(chip):
+  for end in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, end=end)
+    a, b = (Tensor.full(rt, 256, 256, 1) for _ in range(2))
+    out = (a @ b).realize(b)
+    assert out.addr == b.addr and np.all(value(b) == 256) and np.all(value(out) == 256)
+    data = np.arange(64 * 96, dtype=np.float32).reshape(64, 96)
+    x = Tensor.of(rt, data.tolist(), "fp32")
+    (x[:, :-32] + 1).realize(x[:, 32:])
+    want = data.copy()
+    want[:, 32:] = data[:, :-32] + 1
+    assert np.array_equal(value(x)[0], want)
+
 def test_matmul_fusion(chip):
   # Matmuls inside elementwise trees run as one kernel: the matmul's result tile is packed into L1 and read from there.
   # It gives the same bits as one launch per op, since the tile is rounded to bf16 on its way to L1 as it would be on
@@ -1302,6 +1315,31 @@ def test_autograd(chip):
   assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w + w, rtol=1e-6, atol=1e-6), ".grad adds up"
   assert np.allclose(value((ta * ta).sum().gradient(ta)[0])[0], 2 * a, rtol=1e-6), "gradient() gives it without touching .grad"
 
+def test_backward_before_parameter_updates(chip):
+  rt = Runtime(chip)
+  for reverse in (False, True):
+    a, b = (Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for v in (2, 3))
+    loss = a * b
+    loss.backward()
+    for p in ((b, a) if reverse else (a, b)): p.assign(p - p.grad)
+    assert (a.tolist(), b.tolist(), loss.tolist()) == ([[-1]], [[1]], [[6]])
+    assert (a.grad.tolist(), b.grad.tolist()) == ([[3]], [[2]])
+  a, b = (Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for v in (2, 3))
+  @tensor.jit
+  def step(rate):
+    a.grad = b.grad = None
+    loss = a * b
+    loss.backward()
+    a.assign(a - a.grad * rate)
+    b.assign(b - b.grad * rate)
+    return loss
+  want_a, want_b = 2.0, 3.0
+  for _ in range(4):
+    got = step(Tensor.full(rt, 1, 1, 0.125, "fp32"))
+    assert np.allclose(got.tolist(), [[want_a * want_b]])
+    want_a, want_b = want_a - want_b * 0.125, want_b - want_a * 0.125
+    assert np.allclose([a.tolist()[0][0], b.tolist()[0][0]], [want_a, want_b])
+
 def test_fuzz(chip, monkeypatch):
   # Random expressions mix elementwise ops with broadcasting, unary ops, reductions along any axis and matmuls, with odd
   # shapes and batches. The kernels they turn into are checked against numpy separately, on their inputs as read back
@@ -1462,6 +1500,29 @@ def test_put(chip):
   kv, rows = Tensor.of(rt, np.zeros((3, 64, 64)).tolist()), bf16(rng.normal(0, 1, (3, 40, 64)))
   kv.put(Tensor.of(rt, [list(range(5, 45))], "int32"), Tensor.of(rt, rows.tolist()))
   assert np.array_equal(value(kv)[:, 5:45], rows) and not value(kv)[:, :5].any() and not value(kv)[:, 45:].any()
+
+def test_put_aliases_and_singleton(chip):
+  for end in (chip.tensix[1], chip.tensix[-1]):
+    rt = Runtime(chip, end=end)
+    a = np.arange(64, dtype=np.float32).reshape(64, 1)
+    x = Tensor.of(rt, a.tolist(), "fp32")
+    ids = Tensor.of(rt, [list(range(32, 64)) + list(range(32))], "int32")
+    x.put(ids, x)
+    assert np.array_equal(value(x)[0], np.concatenate([a[32:], a[:32]]))
+    x = Tensor.of(rt, a.tolist(), "fp32")
+    x.put(Tensor.of(rt, [list(range(16, 48))], "int32"), x[:32, :])
+    want = a.copy()
+    want[16:48] = a[:32]
+    assert np.array_equal(value(x)[0], want)
+    for dtype in ("bf16", "fp32", "int32", "bfp8", "bfp4"):
+      x = Tensor.zeros(rt, 1, 2, dtype=dtype)
+      x.put(Tensor.of(rt, [[0]], "int32"), Tensor.of(rt, [[2, 3]], "bf16" if dtype in ("bfp8", "bfp4") else dtype))
+      if dtype in ("bfp8", "bfp4"):
+        rt.wait()
+        raw = chip.read(*bh.DRAM[0], x.addr, tensix.tile_bytes(dtype))
+        rows = np.frombuffer(tensor._bf16s(raw, dtype), np.uint16).reshape(4, 16, 16)[[0, 2], :, :2]
+        assert np.all(rows == [0x4000, 0x4040]), dtype
+      else: assert (x + Tensor.zeros(rt, 2, 2, dtype=dtype)).tolist() == [[2, 3], [2, 3]], dtype
 
 def test_block_float_cache(chip):
   # This tests a KV cache in bfp8, the format Tenstorrent's models use, and in bfp4. put writes bf16 rows into a
