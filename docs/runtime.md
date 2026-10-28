@@ -34,8 +34,10 @@ Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
 shutdown cannot establish their destination memory's lifetime.
 
-Some kernels need a rectangular grid of workers. The dispatcher's row has a
-tile missing, so `Runtime.grid` leaves that row out. With 120 tiles, you get
+Some kernels need a rectangular grid of workers. `Runtime.grid` keeps rows that
+contain every x coordinate still present among workers. In a multi-row runtime,
+this excludes the dispatcher's incomplete row. A single-row runtime keeps its
+shortened row, excluding the dispatcher's x coordinate. With 120 tiles, you get
 119 workers and a grid of 108, in nine rows of twelve. `Runtime.readers` assigns
 the grid workers to DRAM banks and ports. It spreads the workers across banks
 and prefers ports with shorter return paths on NoC0.

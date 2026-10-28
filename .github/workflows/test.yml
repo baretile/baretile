@@ -80,7 +80,7 @@ jobs:
         include:
           - name: every setting
             key: noise
-            tests: test/test_kernels.py
+            tests: test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces test/test_models.py::test_moe
             settings: TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40
           - name: 140 tiles
             key: unharvested

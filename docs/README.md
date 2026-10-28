@@ -8,7 +8,8 @@ now, and each page links to the files it covers.
 
 The ramps are scripts that teach baretile in order, from tensors down to Tensix
 instructions. Each one explains its steps in comments and checks its results
-with assertions, so you can change a step and see what breaks. Run them from
+with explicit checks that also run under `python -O`, so you can change a step
+and see what breaks. Run them from
 the checkout with `TTSIM` set:
 
 ```sh

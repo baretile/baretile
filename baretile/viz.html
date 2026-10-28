@@ -12,6 +12,8 @@
   header b, #tabs { flex: none; }  /* only the summary wraps */
   header button { background: none; color: var(--dim); border: 1px solid var(--line); border-radius: 3px; font: inherit; cursor: pointer; }
   header button.on { color: var(--text); border-color: var(--dim); }
+  button:focus-visible, canvas:focus-visible { outline: 2px solid #8bbdff; outline-offset: -2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   .dim { color: var(--dim); }
   #timeline { width: 100%; height: 128px; display: block; border-bottom: 1px solid var(--line); cursor: grab; }
   main { display: grid; grid-template-columns: minmax(360px, 40%) 1fr; min-height: 0; }
@@ -21,6 +23,8 @@
   th, td { padding: 3px 10px; text-align: right; white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
   td:first-child i { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 2px; }
+  td button { display: block; width: 100%; padding: 0; border: 0; background: none; color: inherit; font: inherit;
+              text-align: left; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
   tbody tr { cursor: pointer; } tbody tr:hover { background: #191919; } tbody tr.on { background: var(--pick); }
   #kernel { overflow: auto; padding: 12px 18px; }
   #kernel h2 { font-size: 13px; margin: 0 0 4px; word-break: break-all; }
@@ -32,8 +36,8 @@
   svg path { fill: none; stroke: #555; }
   #tip { position: fixed; display: none; pointer-events: none; padding: 4px 8px; background: #000; border: 1px solid var(--line); }
 </style>
-<header><b>baretile viz</b><span id="tabs"></span><span id="summary"></span></header>
-<canvas id="timeline"></canvas>
+<header><b>baretile viz</b><span id="tabs"></span><span id="summary"></span><span id="launch" class="sr-only" role="status"></span></header>
+<canvas id="timeline" tabindex="0" role="img" aria-label="Launch timeline. Left and right select launches, plus and minus zoom, Home resets the view."></canvas>
 <main><div id="kernels"></div><div id="kernel"><p class="dim">Open this file in a browser with JavaScript enabled to see the launch data.
 File previews that don't run scripts can't display it.</p></div></main>
 <div id="tip"></div>
@@ -44,10 +48,10 @@ const runs = data.startsWith("[") ? JSON.parse(data) : [], $ = id => document.ge
 const esc = s => String(s).replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
 const num = n => n >= 1e9 ? (n / 1e9).toFixed(2) + "G" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
 const color = (k, a = 1) => `hsla(${k * 137.5 % 360}, 50%, 60%, ${a})`;  // golden-angle hues, so kernels next to each other differ
-let run, picked, view;  // the runtime shown, the kernel picked, and the cycles [from, to] the timeline shows
+let run, picked, view, activeLaunch = -1;  // the runtime, kernel, visible cycles and keyboard-selected launch
 
 function show(r) {
-  run = runs[r]; picked = null;
+  run = runs[r]; picked = null; activeLaunch = -1; $("launch").textContent = "";
   $("tabs").innerHTML = runs.length > 1 ? runs.map((u, i) => `<button class="${i == r ? "on" : ""}" onclick="show(${i})">${esc(u.title)}</button>`).join(" ") : esc(run.title);
   const [first, last] = [run.launches[0], run.launches.at(-1)], cycles = run.kernels.reduce((a, k) => a + k.cycles, 0);
   $("summary").innerHTML = (first ? `launches ${first[1]} to ${last[1]} of ${run.total}, ${run.kernels.length} kernels, ${num(cycles)} cycles` : "no finished launches") +
@@ -56,14 +60,18 @@ function show(r) {
   const order = run.kernels.map((k, i) => i).sort((a, b) => run.kernels[b].cycles - run.kernels[a].cycles), bytes = run.kernels[0]?.bytes != null;
   $("kernels").innerHTML = `<table><thead><tr><th>kernel</th><th>launches</th><th>cycles</th><th>%</th>${bytes ? "<th>bytes read</th>" : ""}</tr></thead><tbody>` +
     order.map(i => { const k = run.kernels[i], inputs = k.graph ? k.graph.filter(n => !n[2].length).map(n => n[1]).join(" ") : "";  // kernels often share a name
-      return `<tr id="k${i}" onclick="pick(${i})"><td title="${esc(k.name)} ${esc(inputs)}"><i style="background:${color(i)}"></i>${esc(k.name || "(no name)")} <span class="dim">${esc(inputs)}</span></td>` +
+      return `<tr id="k${i}" onclick="pick(${i})"><td title="${esc(k.name)} ${esc(inputs)}"><button type="button" aria-pressed="false" aria-controls="kernel"><i style="background:${color(i)}"></i>${esc(k.name || "(no name)")} <span class="dim">${esc(inputs)}</span></button></td>` +
       `<td>${k.launches}</td><td>${num(k.cycles)}</td><td>${(100 * k.cycles / (cycles || 1)).toFixed(1)}</td>${bytes ? `<td>${num(k.bytes)}</td>` : ""}</tr>`; }).join("") + "</tbody></table>";
   order.length ? pick(order[0]) : ($("kernel").innerHTML = "", draw());
 }
 
 function pick(i) {
-  if (picked != null) $(`k${picked}`)?.classList.remove("on");
+  if (picked != null) {
+    $(`k${picked}`)?.classList.remove("on");
+    $(`k${picked}`)?.querySelector("button").setAttribute("aria-pressed", "false");
+  }
   picked = i; $(`k${i}`).classList.add("on");
+  $(`k${i}`).querySelector("button").setAttribute("aria-pressed", "true");
   const k = run.kernels[i], workers = new Set(run.launches.filter(l => l[0] == i).map(l => l[5]));
   let h = `<h2>${esc(k.name || "(no name)")}</h2><p>${k.launches} launch${k.launches > 1 ? "es" : ""} on ${[...workers].join(" or ")} worker${Math.max(...workers) > 1 ? "s" : ""}, ` +
     `${num(k.cycles)} cycles${k.bytes != null ? `, ${num(k.bytes)} bytes read` : ""}</p>`;
@@ -182,6 +190,22 @@ onmousemove = e => {
 };
 const whole = () => { const l = run.launches.at(-1); view = [0, Math.max(1, l ? l[2] + l[3] : 1)]; };
 canvas.ondblclick = () => { if (run) whole(), draw(); };
+canvas.onkeydown = e => {
+  if (!run) return;
+  if (e.key == "ArrowLeft" || e.key == "ArrowRight") {
+    if (!run.launches.length) return;
+    activeLaunch = Math.max(0, Math.min(run.launches.length - 1, activeLaunch + (e.key == "ArrowRight" ? 1 : -1)));
+    const l = run.launches[activeLaunch];
+    pick(l[0]);
+    $("launch").textContent = `Launch ${l[1]}: ${run.kernels[l[0]].name || "unnamed kernel"}, ${l[3]} cycles on ${l[5]} workers`;
+    $(`k${l[0]}`).scrollIntoView({ block: "nearest" });
+  } else if (e.key == "+" || e.key == "=" || e.key == "-") {
+    const mid = (view[0] + view[1]) / 2, span = Math.max(10, (view[1] - view[0]) * (e.key == "-" ? 1.5 : 1 / 1.5));
+    view = [mid - span / 2, mid + span / 2]; draw();
+  } else if (e.key == "Home") { whole(); draw(); }
+  else return;
+  e.preventDefault();
+};
 onresize = () => run && draw();  // keeps the zoom
 if (runs.length) show(0);
 else $("kernel").innerHTML = "<p>This file contains no launch data. Run " +
