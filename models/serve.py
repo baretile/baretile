@@ -4,7 +4,7 @@
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]
 # model is a local folder or Hugging Face ID. The final two arguments select the precision mode and KV cache format.
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import codecs, collections, functools, json, math, os, queue, re, shutil, sys, threading, time, urllib.error, urllib.request, uuid
+import codecs, collections, functools, json, math, os, queue, re, shutil, sys, tempfile, threading, time, urllib.error, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +12,7 @@ from baretile import bh
 from baretile.kernels import topk_room
 from baretile.tensix import tile_bytes
 from baretile.tensor import Tensor, jit
-import gpt2, llama, qwen
+from models import gpt2, llama, qwen
 
 class Head:
   """The largest logits in a row, with token IDs in descending logit order. lse is log(sum(exp(x*t))) over the
@@ -61,8 +61,22 @@ class Request:
   semaphore acquired by Engine.offer until the request ends."""
   def __init__(self, tokenizer, ids, max_tokens=16, temperature=1.0, top_p=1.0, stop=(), eos=(), seed=None, top_k=0, min_p=0.0,
                presence=0.0, frequency=0.0, repetition=1.0, logprobs=None, shape=None):
+    for name, v, lo, hi in (("max_tokens", max_tokens, 1, math.inf), ("top_k", top_k, 0, math.inf), ("logprobs", logprobs, 0, 20)):
+      if v is None and name == "logprobs": continue
+      if type(v) is not int or not lo <= v <= hi: raise ValueError(f"{name} must be an integer between {lo} and {hi}")
+    for name, v in (("temperature", temperature), ("top_p", top_p), ("min_p", min_p), ("presence_penalty", presence),
+                    ("frequency_penalty", frequency), ("repetition_penalty", repetition)):
+      try: valid = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+      except OverflowError: valid = False
+      if not valid: raise ValueError(f"{name} must be a finite number")
+    if temperature < 0: raise ValueError("temperature must be nonnegative")
+    if not 0 < top_p <= 1 or not 0 <= min_p <= 1: raise ValueError("top_p must be in (0, 1] and min_p in [0, 1]")
+    if repetition <= 0: raise ValueError("repetition_penalty must be positive")
+    if stop is not None and not isinstance(stop, (str, list, tuple)): raise ValueError("stop must be a string or a list of strings")
+    stop = [stop] if isinstance(stop, str) else list(stop or ())
+    if any(not isinstance(s, str) or not s for s in stop): raise ValueError("stop must contain nonempty strings")
     self.tok, self.ids, self.max_tokens, self.temperature, self.top_p = tokenizer, list(ids), max_tokens, temperature, top_p
-    self.stop, self.eos, self.rng = [stop] if isinstance(stop, str) else list(stop or ()), set(eos), np.random.default_rng(seed)
+    self.stop, self.eos, self.rng = stop, set(eos), np.random.default_rng(seed)
     self.top_k, self.min_p, self.presence, self.frequency, self.repetition, self.logprobs = top_k, min_p, presence, frequency, repetition, logprobs
     self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
@@ -157,7 +171,8 @@ class Request:
         logits = head.row()
         lp = logits - logits.max()
         lp = lp - np.log(np.exp(lp).sum())
-        top = np.argpartition(-lp, self.logprobs)[:self.logprobs] if self.logprobs else []
+        n = min(self.logprobs, len(lp))
+        top = np.argpartition(-lp, n - 1)[:n] if n else []
         self.probs.append((token, float(lp[token]), [(int(t), float(lp[t])) for t in sorted(top, key=lambda t: -lp[t])]))
     before = len(self.text)  # where to look for a stop string that reaches into what this token adds
     self.text += self.utf8.decode(b"" if end else self.tok.bytes[token])
@@ -197,7 +212,10 @@ class Engine:
   the model's sampled choice, then make new drafts in another call. Rejected drafts restore the state after
   the first token on the next step."""
   def __init__(self, rt, t, c, tokenizer, slots=4, places=512, chunk=None, keep=4 << 30, park=None):
-    assert places % 32 == 0, "places must be a multiple of 32, so that slots are whole tiles"
+    if slots < 1: raise ValueError("slots must be positive")
+    if places < 32 or places % 32: raise ValueError("places must be a positive multiple of 32, so that slots are whole tiles")
+    if chunk is not None and chunk < 1: raise ValueError("chunk must be positive")
+    if keep < 0 or park is not None and park < 0: raise ValueError("session cache budgets must be nonnegative")
     self.rt, self.t, self.c, self.tok, self.places, self.keep = rt, t, c, tokenizer, places, keep
     self.chunk = chunk or (2048 if c.experts else 256)  # with a mixture of experts, a chunk reads nearly all the experts of the blocks (cost.prompt)
     self.spec = c.mtp > 0 and "mtp.fc" in t  # drafts with the multi-token prediction layer
@@ -215,15 +233,19 @@ class Engine:
     self.drafted = self.agreed = 0  # drafts checked against the pick of the model, and those taken. This shows what speculation saves
     self.waiting, self.prefilled = queue.Queue(), 0  # the tokens prefilled so far. This shows what the prefix cache saves
     self.room = threading.BoundedSemaphore(slots)  # a slot for each offered request, from its offer to its end
+    self.lock, self.failed = threading.Lock(), False  # serialize offers against failure cleanup
     self.sessions = collections.OrderedDict()  # tokens -> each block's KV cache rows or Gated DeltaNet states, as tensors on the chip or bytes
 
   def on(self, row, dtype="int32"): return Tensor.of(self.rt, [row], dtype)
 
   def offer(self, r):  # queues r if a slot is free and holds the slot until r ends. Otherwise it returns False without waiting
-    if not self.room.acquire(blocking=False): return False
-    r.room = self.room
-    self.waiting.put(r)
-    return True
+    with self.lock:
+      if self.failed: raise RuntimeError("the engine stopped on an error")
+      if not r.ids: raise ValueError("a prompt must contain at least one token")
+      if not self.room.acquire(blocking=False): return False
+      r.room = self.room
+      self.waiting.put(r)
+      return True
 
   def length(self, last):  # the rows of each slot that a call reads when the last position of its sequences is last
     return self.places if self.attends else min(self.places, 1 << max(5, last.bit_length()))
@@ -386,15 +408,19 @@ class Engine:
       if r and self.busy[u] is r: self.drafts[u] = self.guess(u, int(best[2 * u + 1]))
 
   def run(self):  # the thread of the engine: admit while a slot is free, prefill a chunk, take a step. On an error, the requests end
+    admitting = None
     try:
       while True:
-        if not any(self.busy): self.admit(self.waiting.get())
-        while None in self.busy and not self.waiting.empty(): self.admit(self.waiting.get())
+        if not any(self.busy): self.admit(admitting := self.waiting.get()); admitting = None
+        while None in self.busy and not self.waiting.empty(): self.admit(admitting := self.waiting.get()); admitting = None
         if filling := [u for u, r in enumerate(self.busy) if r and not r.made]: self.fill(filling[0])
         self.advance()
     except BaseException:
-      for r in self.busy + list(self.waiting.queue):
-        if r: r.finish = "error"; r.end()
+      with self.lock:
+        self.failed = True
+        pending = list(self.busy) + [admitting]
+        while not self.waiting.empty(): pending.append(self.waiting.get_nowait())
+        for r in set(pending) - {None}: r.finish = "error"; r.end()
       raise
 
 FAMILIES = (("qwen", "<tool_call>\n<function="), ("harmony", "<|channel|>"), ("llama", "<|start_header_id|>"), ("chatml", "<|im_start|>"))
@@ -504,7 +530,7 @@ def formatted(form):
   object; json_schema requires a value matching the supported schema fields.
 
   Supported fields are type (one or a list), properties, required, additionalProperties, items, minItems,
-  maxItems, enum, const, anyOf, oneOf and local $ref into $defs or definitions. String patterns, formats and
+  maxItems, enum, const, anyOf, oneOf and nonrecursive local $ref into $defs or definitions. String patterns, formats and
   numeric bounds aren't enforced. enum and const use json.dumps representations.
 
   Allow at most one whitespace character between tokens and 32 characters per number to prevent unbounded
@@ -514,6 +540,34 @@ def formatted(form):
   if kind == "text": return None
   if kind not in ("json_object", "json_schema"): raise ValueError(f"response_format: unknown type {kind}")
   root = {"type": "object"} if kind == "json_object" else form["json_schema"]["schema"]
+  def target(ref):
+    if not isinstance(ref, str) or not re.fullmatch(r"#/(\$defs|definitions)/[^/]+", ref): raise ValueError(f"unsupported schema reference: {ref}")
+    group, name = ref[2:].split("/")
+    try: return root[group][name.replace("~1", "/").replace("~0", "~")]
+    except (KeyError, TypeError): raise ValueError(f"missing schema reference: {ref}") from None
+  def check(sc, refs=()):  # reject malformed or cyclic schemas before they reach the engine thread
+    if isinstance(sc, bool): return
+    if not isinstance(sc, dict): raise ValueError("a schema must be an object or boolean")
+    if "$ref" in sc:
+      ref = sc["$ref"]
+      if ref in refs: raise ValueError("recursive schema references are not supported")
+      check(target(ref), (*refs, ref))
+    kinds = sc.get("type", [])
+    kinds = [kinds] if isinstance(kinds, str) else kinds
+    if not isinstance(kinds, list) or "type" in sc and not kinds or \
+        any(k not in ("object", "array", "string", "number", "integer", "boolean", "null") for k in kinds):
+      raise ValueError("invalid schema type")
+    if not isinstance(sc.get("properties", {}), dict): raise ValueError("schema properties must be an object")
+    required = sc.get("required", [])
+    if not isinstance(required, list) or any(not isinstance(k, str) for k in required): raise ValueError("required must be a list of property names")
+    for k in ("minItems", "maxItems"):
+      if k in sc and (type(sc[k]) is not int or sc[k] < 0): raise ValueError(f"{k} must be a nonnegative integer")
+    if sc.get("minItems", 0) > sc.get("maxItems", math.inf): raise ValueError("minItems exceeds maxItems")
+    for k in ("enum", "anyOf", "oneOf"):
+      if k in sc and (not isinstance(sc[k], list) or not sc[k]): raise ValueError(f"{k} must be a nonempty list")
+    for child in [*sc.get("properties", {}).values(), sc.get("items", True), sc.get("additionalProperties", True),
+                  *sc.get("anyOf", []), *sc.get("oneOf", [])]: check(child, refs)
+  check(root)
   def fits(text):
     i = 0
     def ws():
@@ -546,16 +600,25 @@ def formatted(form):
       return json.loads(text[start:i])
     def value(sc):
       nonlocal i
-      sc = sc or {}
-      while "$ref" in sc: sc = root["$defs" if "$defs" in sc["$ref"] else "definitions"][sc["$ref"].rsplit("/", 1)[1]]
-      if "anyOf" in sc or "oneOf" in sc:  # the first alternative that parses, else Short if any could still parse
-        start, short = i, False
+      while isinstance(sc, dict) and "$ref" in sc: sc = target(sc["$ref"])
+      if sc is False: raise Bad
+      if sc is True: sc = {}
+      if "anyOf" in sc or "oneOf" in sc:
+        start, short, ends = i, False, []
         for alt in sc.get("anyOf") or sc["oneOf"]:
-          try: return value({k: v for k, v in sc.items() if k not in ("anyOf", "oneOf")} | alt)
+          try:
+            base = {k: v for k, v in sc.items() if k not in ("anyOf", "oneOf")}
+            value(base | alt if isinstance(alt, dict) else base if alt else False)
+            ends.append(i)
           except Short: short = True
           except Bad: pass
           i = start
-        raise Short if short else Bad
+        if not ends: raise Short if short else Bad
+        i = max(ends)
+        if "oneOf" in sc and ends.count(i) != 1:
+          if i == len(text) and text[start] in "-0123456789": raise Short  # another digit can disambiguate a number
+          raise Bad
+        return
       c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
       kinds = [kinds] if isinstance(kinds, str) else kinds
       if "enum" in sc or "const" in sc:  # one of them, as json.dumps writes it
@@ -589,7 +652,7 @@ def formatted(form):
           if key in seen or key not in props and extra is False: raise Bad
           if peek() != ":": raise Bad
           i += 1
-          value(props.get(key, extra if isinstance(extra, dict) else {}))
+          value(props.get(key, extra))
           seen.add(key)
       elif c == "[" and "array" in kinds:
         i, n = i + 1, 0
@@ -647,9 +710,12 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       if not is_chat and self.path != "/v1/completions": return self.reply(404, {"error": {"message": f"not found: {self.path}"}})
       try:
         q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        if not isinstance(q, dict): raise ValueError("the request must be a JSON object")
         thinking, tools = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False, is_chat and q.get("tools")
         prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium", tools) if is_chat else q["prompt"]
+        if not isinstance(prompt, str): raise ValueError("prompt must be a string")
         ids = engine.tok.encode(prompt, special=is_chat)
+        if not ids: raise ValueError("a prompt must contain at least one token")
         top = (q.get("top_logprobs") or 0 if q.get("logprobs") else None) if is_chat else q.get("logprobs")  # a completion's is a count
         if top is not None and not 0 <= top <= 20: raise ValueError("logprobs and top_logprobs must be between 0 and 20")
         apart = is_chat and (thinking and thinks or harmony)
@@ -659,15 +725,17 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
           call = chosen("required", tools) if tools and choice != "none" else None
           fits = form if call is None else (lambda text: max(form(text), call(text)))
         shape = fits and apart and (lambda text: fits(answer(text)[1])) or fits  # a thinking model's shape applies to its answer, after the reasoning
-        given = lambda k, default: q[k] if q.get(k) is not None else defaults.get(k, default)
-        r = Request(engine.tok, ids, max_tokens=q.get("max_tokens") or (engine.places if is_chat else 16), temperature=given("temperature", 1.0),
-                    top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=max(given("top_k", 0), 0),
-                    min_p=given("min_p", 0.0), presence=q.get("presence_penalty") or 0.0, frequency=q.get("frequency_penalty") or 0.0,
+        given = lambda k, default: q[k] if q.get(k) is not None else defaults[k] if defaults.get(k) is not None else default
+        r = Request(engine.tok, ids, max_tokens=given("max_tokens", engine.places if is_chat else 16), temperature=given("temperature", 1.0),
+                    top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=given("top_k", 0),
+                    min_p=given("min_p", 0.0), presence=given("presence_penalty", 0.0), frequency=given("frequency_penalty", 0.0),
                     repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
-      except (ValueError, KeyError, TypeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
+      except (ValueError, KeyError, TypeError, AttributeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens, but a slot holds {engine.places - 2}"}})
       # Reject immediately when all slots are busy, so the client can retry or use another provider.
-      if not engine.offer(r): return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
+      try: offered = engine.offer(r)
+      except RuntimeError as e: return self.reply(503, {"error": {"message": str(e), "code": 503}})
+      if not offered: return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
       head = {"id": f"baretile-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
       def parts(text):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
@@ -727,28 +795,39 @@ def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
   chat and generation settings, and safetensors weights or indexed shards. HF_ENDPOINT changes the server;
   HF_TOKEN authorizes gated downloads. Mark completed downloads with .done and reuse them."""
   if os.path.isdir(model): return model
+  if not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)?", model) or any(p in (".", "..") for p in model.split("/")):
+    raise ValueError("model must be an existing folder or a Hugging Face model ID")
   folder = os.path.join(cache, model)
   if os.path.exists(os.path.join(folder, ".done")): return folder
   os.makedirs(folder, exist_ok=True)
   def get(name, needed=True):
+    if not isinstance(name, str) or not re.fullmatch(r"[\w./-]+", name) or any(p in ("", ".", "..") for p in name.split("/")):
+      raise ValueError(f"invalid model file path: {name!r}")
     path = os.path.join(folder, name)
     if os.path.exists(path): return path
     token = {"Authorization": f"Bearer {os.environ['HF_TOKEN']}"} if "HF_TOKEN" in os.environ else {}
     url = f"{os.environ.get('HF_ENDPOINT', 'https://huggingface.co')}/{model}/resolve/main/{name}"
-    try:
-      with urllib.request.urlopen(urllib.request.Request(url, headers=token), timeout=60) as r, open(path + ".part", "wb") as f:
-        shutil.copyfileobj(r, f)
-    except urllib.error.HTTPError as e:
-      if needed or e.code != 404: raise
-      return None
-    os.replace(path + ".part", path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), suffix=".part", delete=False) as f:
+      try:
+        try:
+          with urllib.request.urlopen(urllib.request.Request(url, headers=token), timeout=60) as r: shutil.copyfileobj(r, f)
+        except urllib.error.HTTPError as e:
+          if needed or e.code != 404: raise
+          return None
+        f.close()
+        os.replace(f.name, path)
+      finally:
+        if os.path.exists(f.name): os.unlink(f.name)
     return path
   for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"):
     get(name, name in ("config.json", "tokenizer.json"))
   if index := get("model.safetensors.index.json", False):
-    for shard in sorted(set(llama.read_json(index)["weight_map"].values())): get(shard)
+    for shard in sorted(set(llama.read_json(index)["weight_map"].values())):
+      if not isinstance(shard, str) or not shard.endswith(".safetensors"): raise ValueError(f"invalid safetensors shard: {shard!r}")
+      get(shard)
   else: get("model.safetensors")
-  open(os.path.join(folder, ".done"), "w").close()
+  with open(os.path.join(folder, ".done"), "w"): pass
   return folder
 
 def main():

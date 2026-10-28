@@ -6,8 +6,8 @@ from baretile import tensor
 from baretile.tensor import Tensor
 from baretile.runtime import Runtime
 from conftest import bf16, value
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "models"))  # for gpt2, llama, qwen, serve and cost
-import benchmark, cost, gpt2, llama, qwen, serve, train
+import benchmark, train
+from models import cost, gpt2, llama, qwen, serve
 
 def test_train(chip):
   # Train a two-block GPT on a fixed counting sequence so documentation edits don't change the test data.
@@ -31,6 +31,10 @@ def test_tinygrad_jit_unrecorded(chip):
     assert add(x, Tensor([3.0, 4.0], device=device)).tolist() == [4.0, 6.0], device
   launches = rt.launches
   assert add(x, Tensor([5.0, 6.0], device="BARETILE")).tolist() == [6.0, 8.0] and rt.launches > launches
+  from tinygrad import Device
+  pending = (tensor.Tensor.full(rt, 1, 1, 2) + 3).realize()
+  Device["BARETILE"].synchronize()
+  assert rt.read_status(1) == rt.launches % 2**32 and pending.tolist() == [[5]], "synchronize completes queued chip work"
 
 def test_tinygrad(chip):
   # tinygrad builds the graph and baretile runs it, checked against tinygrad's CPU device. Each case must launch on the
@@ -341,6 +345,11 @@ def test_tokenizer(tmp_path):
     plain = unicodedata.normalize("NFC", text) if nfc else text
     assert ours.encode(text) == theirs.encode(plain), (split, nfc)
     assert ours.decode(ours.encode(text) + [len(vocab)]) == plain + "<|end|>"
+    assert ours.encode(text + "<|end|>", special=True) == theirs.encode(plain, allowed_special="all") + [len(vocab)]
+  data = json.loads((tmp_path / "tokenizer.json").read_text())
+  (tmp_path / "tokenizer.json").write_text(json.dumps(data | {"added_tokens": []}))
+  ours = llama.Tokenizer(str(tmp_path))
+  assert ours.encode("the", special=True) == ours.encode("the") == [258], "no special tokens must leave BPE merges intact"
 
 @pytest.mark.parametrize("n", [16, 40])
 def test_llama_layer(chip, n):
@@ -731,10 +740,9 @@ t = Tensor.of(rts[0], x)  # 24 tiles: 6 chunks through the 2 slots, so the credi
 for ch, (_, back) in links_a.items():
   y = t.to(rts[1], ch, back)
   assert y.rt is rts[1] and y.tolist() == t.tolist() and (y * 2).to(rts[0], back, ch).tolist() == (t * 2).tolist(), ch
-import sys, numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
+import numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
 from types import SimpleNamespace
-sys.path.insert(0, "models")
-import gpt2, llama
+from models import gpt2, llama
 c, rng = llama.model(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
 draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
 w = {f"layers.{l}.{k}": draw(*how) for l in range(2) for k, how in (("input_layernorm", (1, 0.1, (1, 128))), ("qkv_proj", (0, 0.05, (128, 256))),
@@ -955,6 +963,7 @@ def test_serve_timeout(tmp_path):
   import queue, urllib.error, urllib.request
   class Hung:
     tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(1)
+    lock, failed = threading.Lock(), False
     offer = serve.Engine.offer
   hung = Hung()
   http = serve.server(hung, "hung", port=0, wait=0.2)
@@ -1015,6 +1024,67 @@ def test_sampling():
     r.made = made
     assert r.pick(serve.Head.of(logits)) == want, (made, prompt, kw)
 
+def test_request_inputs(tmp_path):
+  for key, values in {"max_tokens": (0, -1, 1.5, True), "temperature": (-1, math.inf, math.nan, 10**400, "1"), "top_p": (0, 1.1),
+                      "min_p": (-0.1, 1.1), "top_k": (-1, 1.5), "repetition": (0, -1), "presence": (math.nan,),
+                      "frequency": (math.inf,), "logprobs": (-1, 21, 1.5), "stop": ([""], [3])}.items():
+    for v in values:
+      with pytest.raises(ValueError): serve.Request(None, [1], **{key: v})
+  r = serve.Request(bytes_tokenizer(tmp_path), [1], temperature=0, logprobs=20)
+  r.take(np.array([0., 1., 2.]), True)
+  assert r.made == [2] and [t for t, _ in r.probs[0][2]] == [2, 1, 0], "logprobs can exceed a small vocabulary"
+
+def test_tokenizer_without_specials(tmp_path):
+  bytes_tokenizer(tmp_path)
+  data = json.loads((tmp_path / "tokenizer.json").read_text())
+  data["model"]["vocab"] |= {"th": 256, "the": 257}
+  (tmp_path / "tokenizer.json").write_text(json.dumps(data))
+  tok = llama.Tokenizer(str(tmp_path))
+  assert tok.encode("the", special=True) == tok.encode("the") == [257]
+
+def test_serve_bad_requests(tmp_path):
+  import urllib.error, urllib.request
+  class Stand:
+    tok, places, failed = bytes_tokenizer(tmp_path), 64, False
+    def offer(self, r):
+      if self.failed: raise RuntimeError("engine failed")
+      r.finish = "stop"
+      r.end()
+      return True
+  stand = Stand()
+  http = serve.server(stand, "stand", port=0, wait=0.1)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  def ask(body, chat=False):
+    return urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/" +
+                                  ("chat/completions" if chat else "completions"), json.dumps(body).encode()), timeout=5)
+  try:
+    for body in ([], None, {"prompt": ""}, {"prompt": []}, *({"prompt": "Hi", k: v} for k, v in
+                 (("temperature", -1), ("temperature", math.nan), ("max_tokens", 0), ("top_k", 1.5), ("stop", [4])))):
+      with pytest.raises(urllib.error.HTTPError) as e: ask(body)
+      assert e.value.code == 400 and json.load(e.value)["error"]["message"]
+    with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": [None]}, chat=True)
+    assert e.value.code == 400
+    assert json.load(ask({"prompt": "Hi"}))["choices"][0]["finish_reason"] == "stop"
+    stand.failed = True
+    with pytest.raises(urllib.error.HTTPError) as e: ask({"prompt": "Hi"})
+    assert e.value.code == 503
+  finally: http.shutdown(); http.server_close()
+
+def test_engine_failure():
+  # A failure while admitting a request must release it and queued requests. Future offers fail immediately.
+  import queue
+  engine = object.__new__(serve.Engine)
+  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(2)
+  engine.waiting, engine.busy = queue.Queue(), [None, None]
+  def fail(r): raise RuntimeError("admission failed")
+  engine.admit = fail
+  requests = [serve.Request(None, [1]), serve.Request(None, [2])]
+  for r in requests: assert engine.offer(r)
+  with pytest.raises(RuntimeError, match="admission failed"): engine.run()
+  for r in requests: assert r.finish == "error" and r.out.get_nowait() is None and r.room is None
+  assert engine.waiting.empty()
+  with pytest.raises(RuntimeError, match="engine stopped"): engine.offer(serve.Request(None, [3]))
+
 def test_shapes(tmp_path):
   # Request.pick restricts output to the tool call or JSON schema requested. Logits that favor a greeting must still
   # produce a tool call when required; random logits must produce valid JSON under the schema.
@@ -1053,6 +1123,20 @@ def test_shapes(tmp_path):
     got = json.loads(tok.decode(r.made))
     assert r.finish == "stop" and set(got) == set(schema["properties"]) and isinstance(got["ok"], bool) and isinstance(got["n"], int)
     assert got["unit"] in ("C", "F") and set(got["tags"]) <= {"a", "b"} and len(got["tags"]) <= 2 and got["note"] in ("hi", None), got
+
+def test_schema_edges():
+  def fits(schema): return serve.formatted({"type": "json_schema", "json_schema": {"schema": schema}})
+  for schema in ({"$ref": "#/$defs/loop", "$defs": {"loop": {"$ref": "#/$defs/loop"}}},
+                 {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}},
+                 {"type": 3}, {"type": []}, {"anyOf": []}, {"items": 3}, {"maxItems": -1}):
+    with pytest.raises(ValueError): fits(schema)
+  assert fits(False)("null") == 0 and fits(True)("null") == 2
+  assert fits({"type": "object", "properties": {"x": False}})('{"x": 1}') == 0
+  assert fits({"type": "string", "anyOf": [True, False]})("null") == 0
+  assert fits({"anyOf": [{"const": 1}, {"const": 10}]})("10") == 2
+  one = fits({"oneOf": [{"type": "number"}, {"type": "integer"}]})
+  assert one("1") == 1 and one("1.5") == 2 and one("1 ") == 0
+  assert fits({"oneOf": [{"type": "boolean"}, {"enum": [True]}]})("true") == 0
 
 def test_serve(chip, tmp_path):
   # The serve.py engine, against numpy's greedy tokens. Three requests on two slots decode together. When two run
@@ -1335,6 +1419,14 @@ def test_cost(tmp_path):
   # a chunk of 2,048 reads its activations again for each group of columns. 256 doesn't, since the accumulators fit
   assert cost.regroups(c, 256) == 0 < cost.regroups(c, 2048), cost.regroups(c, 2048)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")
+  for keys in ({"contex": 32}, {"context": 0}, {"context": 1.5}, {"bandwidth": 0}, {"reach": 2}, {"reserve": card["dram"]}, {"kv": "fp64"}):
+    with pytest.raises(ValueError): cost.report(str(tmp_path / "llama"), **keys)
+  with pytest.raises(ValueError, match="precision"): llama.precision(c, "bpf8")
+  windowed = llama.model(dim=128, heads=4, kv=2, layers=2, sliding=32, layer_types=["sliding_attention", "full_attention"])
+  assert cost.session(windowed, use | {"context": 1024}).kv == 2 * 1024 * 2 * 2 * 32 * 2, "reserve full KV rows, even with a sliding window"
+  held = cost.shape(l8).bytes
+  result = cost.report(str(tmp_path / "llama"), dram=held + card["reserve"] + 1)
+  assert "0 sessions fit" in result and "no room for a session" in result and "tok/s" not in result
 
 def test_fetch(tmp_path, monkeypatch):
   # serve.fetch from a local server standing in for Hugging Face (HF_ENDPOINT). It gets the shards the index names and
@@ -1352,6 +1444,16 @@ def test_fetch(tmp_path, monkeypatch):
   monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{hf.server_address[1]}")
   folder = serve.fetch("org/model", str(tmp_path / "cache"))
   assert sorted(os.listdir(folder)) == sorted([*files, ".done"]) and all((pathlib.Path(folder) / n).read_text() == t for n, t in files.items())
+  for model in ("../escape", "/missing-model", "org/../escape"):
+    with pytest.raises(ValueError, match="model"): serve.fetch(model, str(tmp_path / "cache"))
+  (pathlib.Path(folder) / ".done").unlink()
+  index = pathlib.Path(folder) / "model.safetensors.index.json"
+  for shard in ("../escape.safetensors", "/tmp/escape.safetensors", "config.json"):
+    index.write_text(json.dumps({"weight_map": {"x": shard}}))
+    with pytest.raises(ValueError, match="path|shard"): serve.fetch("org/model", str(tmp_path / "cache"))
+    assert not (pathlib.Path(folder) / ".done").exists()
+  index.write_text(files[index.name])
+  assert serve.fetch("org/model", str(tmp_path / "cache")) == folder
   hf.shutdown()
   assert serve.fetch("org/model", str(tmp_path / "cache")) == folder and serve.fetch(folder) == folder, "fetches once, and uses a folder as is"
 

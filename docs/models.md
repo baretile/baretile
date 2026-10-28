@@ -16,6 +16,8 @@ so one disagreement won't make the rest of the comparison useless.
 handles dense Llama-family models, several mixtures of experts, and the text
 models of Qwen3.5 and Qwen3.6. The tokenizer reads byte-level BPE data from
 `tokenizer.json`. The standalone GPT-2 command also needs `tiktoken`.
+From Python in a checkout, import these helpers with `from models import llama`
+or `from models import serve`. Models and adapters are outside the PyPI package.
 
 Choose the precision as the fourth argument after the script name:
 
@@ -84,11 +86,17 @@ curl http://localhost:8000/v1/completions \
 Set `stream` to true in the request to receive tokens as they're generated.
 You can set temperature, top_k, top_p, min_p, seed, stop strings and repetition
 penalties. Defaults come from the model's `generation_config.json` when present.
+Prompts must contain at least one token. `max_tokens` must be a positive integer;
+`top_k=0` keeps all tokens. Temperature must be nonnegative, `top_p` in `(0, 1]`,
+`min_p` in `[0, 1]`, and repetition penalties positive. Invalid requests get
+HTTP 400 before they take a slot.
 
 The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request
 gets HTTP 429 when no slot is free. A non-streaming request that receives no text
 for 600 seconds gets HTTP 504. A stream that times out releases its slot.
+If the engine fails, pending requests end with an error and new requests get
+HTTP 503.
 
 ## Reusing a conversation
 
@@ -114,6 +122,10 @@ code in `serve.py`. Qwen tool calls are returned in `tool_calls`, and reasoning
 goes in `reasoning_content`. `tool_choice` and JSON response formats constrain
 which tokens can be sampled. `test_chat_tools` and `test_serve` have example
 requests to start from when adding a model or client.
+JSON schemas support types, properties, required fields, additional properties,
+arrays, enums, constants, alternatives and nonrecursive local references.
+`serve.formatted` documents the supported subset; string patterns, formats and
+numeric bounds are not enforced.
 
 ## tinygrad and PyTorch
 
@@ -149,6 +161,9 @@ python3 models/cost.py /path/to/Qwen3.6-35B-A3B experts context=16384 accept=0.5
 Add `probe=probe.json` once you've measured a card. Until then, the model assumes
 that decode gets 70% of the specified 512 GB/s DRAM bandwidth and that a launch
 takes one microsecond. Those two assumptions are guesses.
+Memory estimates reserve the full context for each attention cache, including
+sliding attention, matching the current allocator. If the weights leave no room
+for a session, the report says so and omits throughput estimates.
 
 The model counts the weights, caches, states and activations that a step reads.
 It estimates how long those reads and the matrix operations take, uses the

@@ -5,10 +5,10 @@
 import math, os, pathlib, sys, time
 from types import SimpleNamespace
 import numpy as np
-sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import tensor
 from baretile.tensor import Tensor
-import gpt2
+from models import gpt2
 
 def text():  # README.md, then the pages in docs/ by name
   root = pathlib.Path(__file__).parent.parent
