@@ -18,7 +18,8 @@ def bench(chip, m, k, n, weights="bf16", repeat=3):
   rt = Runtime(chip)
   a, b = (Tensor.frombytes(rt, r, c, b"\x80\x3f" * (r * c)) for r, c in ((m, k), (k, n)))  # bf16 1.0
   b = b.cast(weights).realize().columns()
-  if (got := (a @ b).tolist()[0][0]) != k: raise RuntimeError(f"the matmul gave {got} where every entry should be {k}")  # and compiles it
+  # compiles it, and checks it: the bf16 result rounds k to 8 significant bits
+  if abs((got := (a @ b).tolist()[0][0]) - k) > k / 256: raise RuntimeError(f"the matmul gave {got} where every entry should be {k}")
   since, start = rt.launches, chip.pci.now()
   for _ in range(repeat): (a @ b).realize()  # queued back to back
   rt.wait()
