@@ -155,6 +155,7 @@ def indices(view):  # the tensor index of each element of the view, masked ones 
                            for k, (n, s) in enumerate(zip(view.shape, view.strides)))
 
 def download(v):  # bf16 as raw bits
+  note_host_work()
   a = np.frombuffer(v.t.tobytes(), NP[v.t.dtype])
   view = v.view
   out = np.asarray(a[np.clip(indices(view), 0, a.size - 1)])  # asarray: a 0-d array for an empty shape, not a scalar
@@ -215,9 +216,9 @@ def reduce(x, n, op):
 DTYPES = {dtypes.float32: "fp32", dtypes.bfloat16: "bf16", dtypes.int32: "int32", dtypes.bool: None}  # a bool is 0 or 1 in any dtype
 def npdtype(dt): return np.uint16 if dt is dtypes.bfloat16 else _to_np_dtype(dt)
 
-def cpu(a):  # bf16 as raw bits
+def cpu(a, dtype):  # only logical bf16 values use uint16 storage as raw bits
   t = Tensor(np.ascontiguousarray(a), device="CPU")
-  return t.bitcast(dtypes.bfloat16) if a.dtype == np.uint16 else t
+  return t.bitcast(dtype) if dtype is dtypes.bfloat16 else t.cast(dtype)
 def array(t):  # bf16 as raw bits
   t = t.realize()
   return t.bitcast(dtypes.uint16).numpy() if t.dtype is dtypes.bfloat16 else t.numpy()
@@ -228,7 +229,7 @@ def flat(a, n, npd):  # the bytes of n values, broadcasting a scalar
   a = np.asarray(a)
   return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
 
-# While TinyJit records a call, recording has [holder, value before, stored into] for each buffer it changes, and
+# While TinyJit records a call, recording maps each holder it reads or changes to [value before, stored into], and
 # hosted counts the host work it does on the values it reads, which a replay wouldn't redo.
 recording, hosted = None, 0
 def note_host_work():
@@ -294,7 +295,7 @@ class Evaluator:
     if u.op in (Ops.AND, Ops.OR) and u.dtype is not dtypes.bool: return None  # bitwise, on the host
     shape = tuple(u.shape)
     groups = common_groups(shape, srcs)
-    as_u = lambda t: t.cast(DTYPES[u.dtype]) if DTYPES[u.dtype] else t  # baretile returns some int32 ops in fp32, like a product
+    as_u = lambda t: t.ne(0) if u.dtype is dtypes.bool else t.cast(DTYPES[u.dtype])  # baretile returns some int32 ops in fp32, like a product
     whole = lambda t: Value(spread(as_u(t), shape, groups), View(shape), u.dtype)
     if u.op in UNARY: return whole(UNARY[u.op](self.operand(srcs[0], shape, groups)))
     if u.op in BINARY: return whole(BINARY[u.op](*(self.operand(s, shape, groups) for s in srcs)))
@@ -313,7 +314,8 @@ class Evaluator:
     return None
 
   def reduce(self, u, x):  # REDUCE(op, n) reduces the first n axes of x
-    return Value(reduce(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max"), View(tuple(u.shape)), u.dtype)
+    t = reduce(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max")
+    return Value(t.ne(0) if u.dtype is dtypes.bool else t, View(tuple(u.shape)), u.dtype)
 
   def matmul(self, u):
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
@@ -369,7 +371,7 @@ class Evaluator:
     doesn't materialize."""
     def there(s, v):  # a source for tinygrad: a chip value is downloaded (host work), a host value stays
       if not isinstance(v, (Value, Tensor)): return s
-      return (note_host_work() or cpu(download(v)) if isinstance(v, Value) else v).cast(s.dtype).uop
+      return (cpu(download(v), v.dtype) if isinstance(v, Value) else v).cast(s.dtype).uop
     return Tensor(u.replace(src=tuple(there(s, v) for s, v in zip(u.src, srcs))))
 
   def eval(self, u, defer=True):
@@ -427,14 +429,15 @@ class Evaluator:
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_baretile(v):
       h = buf.ensure_allocated()._buf
+      if recording is not None and isinstance(h, Holder): recording.setdefault(h, [h.value, False])
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if (data := h.bytes) is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
       # up to 32 values, like an optimizer's scalars, are uploaded now
       if isinstance(h, Holder) and v.dtype in DTYPES and len(data) <= 32 * v.dtype.itemsize:
         h.set(value=Value(upload(np.frombuffer(data, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype))
         return Value(h.value.t, h.value.view, h.value.dtype)
-      return cpu(np.frombuffer(data, npdtype(v.dtype)))  # on the host until a use gives it a shape
-    return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape))
+      return cpu(np.frombuffer(data, npdtype(v.dtype)), v.dtype)  # on the host until a use gives it a shape
+    return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape), v.dtype)
 
   def store(self, target, value):
     """Store value into target, reshaping if needed. Writes through a view update part of the buffer on the
@@ -471,10 +474,11 @@ class Evaluator:
 
 # tinygrad's side: the BARETILE device, its buffers, and the graphs it hands over
 class Holder:  # contents of a BARETILE buffer: bytes from the host, or a chip Value
-  def __init__(self): self.bytes, self.value = None, None
+  def __init__(self): self.bytes, self.value, self.version = None, None, 0
   # new contents, noted while TinyJit records a call. stored is False when the same value is laid out again
   def set(self, bytes=None, value=None, stored=True):
-    if recording is not None: recording.setdefault(id(self), [self, self.value, False])[2] |= stored
+    if recording is not None: recording.setdefault(self, [self.value, False])[1] |= stored
+    self.version += 1
     if bytes is not None: note_host_work()
     self.bytes, self.value = bytes, value
 
@@ -486,7 +490,6 @@ def host(v, dtype):  # numpy in tinygrad's layout for dtype: bf16 as raw bits, a
 
 def contents(h):  # a holder's bytes in tinygrad's layout, or None
   if h.value is None: return h.bytes
-  note_host_work()  # downloading a chip value
   return np.ascontiguousarray(host(h.value, h.value.dtype)).tobytes()
 
 class Part:  # a BARETILE buffer at an offset, as tinygrad views one. it's read-only, and reads go to its base each time
@@ -507,7 +510,7 @@ class BaretileAllocator(Allocator):
 class BaretileDevice(Compiled):
   def __init__(self, device): super().__init__(device, BaretileAllocator(self), [], None)
   def synchronize(self, timeout=None):
-    if RT is not None: RT.wait(60 if timeout is None else timeout / 1000)  # tinygrad's timeouts are in milliseconds
+    if RT is not None and RT.resources.active: RT.wait(60 if timeout is None else timeout / 1000)  # tinygrad's timeouts are in milliseconds
 
 # inline a tinygrad function as its body, which stores its outputs. precompiled functions too, since tinygrad would
 # cache their program, and baretile runs the graph
@@ -544,52 +547,74 @@ def on_chip(t):  # the holder of a BARETILE tensor that spans its buffer, with i
     h.set(value=Value(upload(np.frombuffer(h.bytes, npdtype(t.dtype)).reshape(t.shape), DTYPES[t.dtype]), View((t.numel(),)), t.dtype))
   return h
 
+_tinyreset = tinygrad.engine.jit._TinyJit.reset
+def tinyreset(self):
+  if getattr(self, "replay", None): self.replay[0].close()
+  if hasattr(self, "replay"): self.replay = None
+  _tinyreset(self)
+tinygrad.engine.jit._TinyJit.reset = tinyreset
+
 _tinyjit = tinygrad.engine.jit._TinyJit.__call__
 def tinyjit(self, *args, **kwargs):
-  """Record the second TinyJit call that runs on BARETILE, or a later call if the second can't be recorded. For
-  replay, copy inputs into the recorded buffers and submit the recorded launches as a block. Copy updated
-  buffers back to the addresses that the recording reads.
-
-  Run the function normally if it downloads data, generates random numbers using the host counter, binds a
-  symbolic variable, or uses inputs outside BARETILE. Also skip replay for partial-buffer inputs and stores
-  into inputs or differently laid-out buffers. A recording that can't be replayed retains its DRAM
-  allocations."""
+  """Record eligible BARETILE calls with private input buffers. Replay skips Python and overwrites the returned
+  buffers. Host work and unsupported inputs run normally; changing a captured holder invalidates its recording."""
   global recording, hosted
-  given = [*args, *(v for _, v in sorted(kwargs.items()))]  # inputs as tinygrad finds them: tensors, and tensors in containers
+  given = [*args, *(v for _, v in sorted(kwargs.items()))]  # tensors, and tensors in shallow containers
   ins = [t for t in given if t.__class__ is Tensor]
   ins += [t for x in given if isinstance(x, (tuple, list, dict)) for t in (x.values() if isinstance(x, dict) else x)
           if t.__class__ is Tensor and not any(t is u for u in ins)]
-  if not JIT or Device.DEFAULT != "BARETILE" and not any(on_baretile(t.uop) for t in ins): return _tinyjit(self, *args, **kwargs)
-  _, var_vals, names, info = _prepare_jit_inputs(args, kwargs)  # tinygrad checks the inputs and realizes them
-  holders, self.cnt = [on_chip(t) for t in ins], self.cnt + 1
+  if not hasattr(self, "replay"):
+    if not JIT or Device.DEFAULT != "BARETILE" and not any(on_baretile(t.uop) for t in ins): return _tinyjit(self, *args, **kwargs)
+    self.reset()  # a previous CPU call may have initialized tinygrad's own JIT
+    self.replay = None
   if recording is not None: raise RuntimeError("nested TinyJit calls are not supported")
-  if self.cnt == 1 or getattr(self, "replay", None) is False or None in holders or var_vals:
+  def discard():
+    if self.replay: self.replay[0].close()
+    self.replay = None
+  # Upstream rejects repeated buffers. Execute these calls normally, keeping their aliasing and stores intact.
+  if ins: Tensor.realize(*ins)
+  repeated = len({t.uop.base for t in ins}) != len(ins)
+  _, var_vals, names, info = (None, {}, None, None) if repeated else _prepare_jit_inputs(args, kwargs)
+  holders = [on_chip(t) for t in ins]
+  eligible = JIT and not repeated and None not in holders and not var_vals
+  if self.cnt == 0 or not eligible or self.replay and any(h.version != version for h, version in self.replay[3]): discard()
+  self.cnt += 1
+  if self.cnt == 1 or not eligible or self.replay is False:
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
-  if self.cnt == 2 or not hasattr(self, "replay"):  # the second call, or a later one if the second couldn't be recorded
-    values, recording, hosted, self.inputs = [h.value for h in holders], {}, 0, (names, info)
+  if self.replay is None:
+    original = [h.value for h in holders]
+    values = [Value(tensor.Tensor(v.t.rt, v.t.rows, v.t.cols, batch=v.t.batch, dtype=v.t.dtype).assign(v.t), v.view, v.dtype)
+              for v in original]
+    # Bind the caller's graph to private storage only while capturing. Neither capture nor replay overwrites inputs.
+    for h, v in zip(holders, values): h.value = v
+    recording, hosted, self.inputs = {}, 0, (names, info)
+    rec = tensor.Recording(runtime())
     try:
-      with tensor.Recording(runtime()) as rec:
+      with rec:
         ret = self.fxn(*args, **kwargs)
         if params := get_parameters(ret): Tensor.realize(*params)
         _check_no_non_tensor_return(ret)
-        # Copy updated buffers back to the addresses read by the recording. Skip inputs: replay copies them in first
-        # and reapplies any layout changes.
-        back = [(h, old) for h, old, _ in recording.values() if old is not None and h not in holders]
+        back = [(h, old) for h, (old, _) in recording.items() if old is not None and h not in holders]
         same = lambda h, old: isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
-        into_input = any(stored and h in holders for h, _, stored in recording.values())  # a replay would lose that store
-        self.replay = hosted == 0 and not into_input and all(same(h, old) for h, old in back) and (rec, values, ret)
-        for h, old in back if self.replay else ():
+        into_input = any(stored and h in holders for h, (_, stored) in recording.items())
+        replayable = hosted == 0 and not into_input and all(same(h, old) for h, old in back)
+        for h, old in back if replayable else ():
           if h.value.t is not old.t: old.t.assign(h.value.t)
           h.value = Value(old.t, h.value.view, h.value.dtype)
-    finally: recording = None
-    if not rec.launches: raise JitError("no launches were recorded")
+      self.replay = bool(rec.launches) and replayable and (rec, values, ret, [(h, h.version) for h in recording if h not in holders])
+      if not self.replay: rec.close()
+    finally:
+      for h, v in zip(holders, original):
+        if not recording.get(h, (None, False))[1]: h.value = v
+      recording = None
     return ret
-  rec, values, ret = self.replay
+  rec, values, ret, _ = self.replay
   if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")
-  for h, v in zip(holders, values):  # copy each input into the recording's, reshaped if needed
-    if h.value.t is not v.t: v.t.assign(h.value.t if h.value.t.shape == v.t.shape else h.value.t.reshape(*v.t.shape))
+  sources, addresses = [h.value.t for h in holders], {v.t.addr for v in values}
+  sources = [tensor.Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t) if t.addr in addresses else t for t in sources]
+  for t, v in zip(sources, values): v.t.assign(t if t.shape == v.t.shape else t.reshape(*v.t.shape))
   rec.send()
   return ret
 tinygrad.engine.jit._TinyJit.__call__ = tinyjit

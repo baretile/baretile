@@ -50,6 +50,104 @@ def test_tinygrad_jit_unrecorded(chip):
   Device["BARETILE"].synchronize()
   assert rt.read_status(1) == rt.launches % 2**32 and pending.tolist() == [[5]], "synchronize completes queued chip work"
 
+def test_tinygrad_jit_inputs(chip):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  adapter.RT = adapter.RT or Runtime(chip)
+  calls, pins = [], dict(adapter.RT.pinned)
+  @TinyJit
+  def combine(x, y):
+    calls.append(1)
+    return (x * 10 + y).realize()
+  x, y = (Tensor(a, device="BARETILE").realize() for a in ([1.0, 2.0], [3.0, 4.0]))
+  for _ in range(2): assert combine(x, y).tolist() == [13, 24]
+  assert combine(y, x).tolist() == [31, 42] and len(calls) == 2
+  assert x.tolist() == [1, 2] and y.tolist() == [3, 4], "capture and replay preserve caller inputs"
+  assert combine(x, x).tolist() == [11, 22], "repeated input buffers execute with their original aliasing"
+  assert combine(x, y).tolist() == [13, 24] and combine(y, x).tolist() == [31, 42]
+  combine.reset()
+  assert dict(adapter.RT.pinned) == pins, "reset releases the capture immediately"
+  assert combine(y, x).tolist() == [31, 42] and len(calls) == 5
+
+
+def test_tinygrad_jit_changed_state(chip):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  from tinygrad.helpers import Context
+  adapter.RT = adapter.RT or Runtime(chip)
+  weight, calls = Tensor([2.0], device="BARETILE").realize(), []
+  @TinyJit
+  def product(x):
+    calls.append(1)
+    return (x.to("BARETILE") * weight).realize()
+  for i in range(1, 4): assert product(Tensor([float(i)], device="BARETILE")).item() == i * 2
+  assert len(calls) == 2
+  weight.assign(Tensor([10.0], device="BARETILE")).realize()
+  assert product(Tensor([3.0], device="BARETILE")).item() == 30 and len(calls) == 3
+  assert product(Tensor([4.0], device="BARETILE")).item() == 40 and len(calls) == 3
+  # Leaving the BARETILE device context must not dispatch to tinygrad's uninitialized native JIT state.
+  assert product(Tensor([5.0], device="CPU")).item() == 50
+  assert product(Tensor([6.0], device="BARETILE")).item() == 60
+  state = Tensor.zeros(1, device="BARETILE").contiguous().realize()
+  @TinyJit
+  def accumulate(x):
+    state.assign(state + x.to("BARETILE")).realize()
+    return state
+  with Context(DEV="BARETILE"):
+    for n, device, want in [(1, "BARETILE", 1), (1, "BARETILE", 2), (10, "CPU", 12), (1, "BARETILE", 13), (1, "BARETILE", 14)]:
+      assert accumulate(Tensor([float(n)], device=device)).item() == want
+    @TinyJit
+    def tick():
+      state.assign(state + 1).realize()
+      return state
+    for want in (15, 16, 17): assert tick().item() == want
+
+
+def test_tinygrad_host_materialize(chip):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  adapter.RT = adapter.RT or Runtime(chip)
+  calls, pins = [], dict(adapter.RT.pinned)
+  @TinyJit
+  def padded(x):
+    calls.append(1)
+    return (x.pad(((1, 0), (1, 0), (0, 0))) * 2).realize()
+  for n in (1, 2, 3, 4):
+    got = padded(Tensor(np.full((2, 3, 4), n, np.float32), device="BARETILE")).numpy()
+    assert np.array_equal(got, np.pad(np.full((2, 3, 4), n * 2), ((1, 0), (1, 0), (0, 0))))
+  assert len(calls) == 4, "host-dependent materialization cannot replay a frozen upload"
+  assert dict(adapter.RT.pinned) == pins, "discarded recordings release their pins"
+
+
+def test_tinygrad_fallback_dtypes(chip):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, dtypes
+  adapter.RT = adapter.RT or Runtime(chip)
+  x = Tensor([1, 256, 65535], dtype=dtypes.uint16, device="BARETILE")
+  assert (x + x).tolist() == [2, 512, 65534] and x.max().item() == 65535
+  y = Tensor([1.0, 2.5, -3.0], dtype=dtypes.bfloat16, device="BARETILE")
+  assert y.cast(dtypes.float64).tolist() == [1, 2.5, -3]
+  b = Tensor([True, False, True], device="BARETILE")
+  assert (b + b).cast(dtypes.float32).tolist() == [1, 0, 1]
+  assert ((b + b) == b).tolist() == [True, True, True]
+  assert ((b + b) & b).cast(dtypes.int32).tolist() == [1, 0, 1]
+
+
+def test_tinygrad_closed_synchronize(monkeypatch):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Device
+  class Closed:
+    resources = SimpleNamespace(active=False)
+    def wait(self, timeout): raise AssertionError("closed runtime must not be synchronized during interpreter shutdown")
+  monkeypatch.setattr(adapter, "RT", Closed())
+  Device["BARETILE"].synchronize()
+
+
 def test_tinygrad(chip):
   # tinygrad builds the graph and baretile runs it, checked against tinygrad's CPU device. Each case must launch on the
   # chip, so we know the host didn't compute it.
