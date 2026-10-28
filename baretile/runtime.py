@@ -1,6 +1,6 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import atexit, collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time
+import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -321,11 +321,48 @@ void loop(void) {{
 }}
 """
 
+def _merge_holes(holes):
+  holes.sort()
+  for i in range(len(holes) - 1, 0, -1):
+    (a, n), (b, m) = holes[i - 1], holes[i]
+    if a + n == b: holes[i - 1:i + 1] = [(a, n + m)]
+
+# A failed halt must not let Python release memory that the card can still reach. Keep its resources until a
+# later close or takeover can stop the rectangle. A finalizer's callback otherwise disappears even if it raises.
+_stranded = set()
+
+class _Resources:
+  """Own a rectangle, its host DMA views and its DRAM without retaining the Runtime that uses them."""
+  def __init__(self, rt, views):
+    self.chip, self.start, self.end, self.cores = rt.chip, rt.start, rt.end, {*rt.cores, rt.dispatcher}
+    self.owner, self.views, self.used = weakref.ref(rt), views, rt.used
+    self.active, self.closed = True, False
+  def close(self):
+    if self.closed: return
+    self.active = False
+    try:
+      self.chip.halt(*self.end, self.start)
+      # Read reset back before polling the NoC: requests issued before the cores stopped can still be in flight.
+      for x, y in self.cores: self.chip.read32(x, y, bh.SOFT_RESET)
+      self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS["OUTSTANDING"]) == 0 for x, y in self.cores),
+                     "drain the stopped runtime's NoC requests")
+    except BaseException:
+      _stranded.add(self)
+      raise
+    self.chip.dram_holes.extend(self.used.items())
+    _merge_holes(self.chip.dram_holes)
+    self.used.clear()
+    for view in self.views: view.release()
+    self.views = ()
+    del self.chip.taken[self.start, self.end]
+    self.closed = True
+    _stranded.discard(self)
+
 class Runtime:
   """Run kernels on the Tensix rectangle from start to end, using the available tiles by default. The last tile
   dispatches work to the others. Kernels stay in L1 until the kernel area fills. The dispatcher reads
   commands from host memory and executes them in order. A new Runtime halts any older runtime that overlaps
-  its rectangle."""
+  its rectangle. Close a runtime to stop its workers and release its memory; a closed runtime cannot be reused."""
   def __init__(self, chip, start=None, end=None, ring=1 << 20):
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
     if ring < 64 or ring & (ring - 1): raise ValueError("ring size must be a power of two, at least 64 bytes")
@@ -339,7 +376,7 @@ class Runtime:
     self.queued = collections.deque()  # (launch, workers) for each launch that may not be done yet
     # DRAM: holes lists free (address, size) ranges; used maps address to size.
     # freed pairs an address with the last queued launch that could use it.
-    self.holes, self.used, self.freed = [(0, bh.DRAM_BANK_SIZE)], {}, []
+    self.holes, self.used, self.freed = chip.dram_holes, {}, []
     # loaded maps each kernel image in L1 to its address, and room is where the next one goes
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS
     # how many times the loaded kernels were evicted. A recorded command names its kernels by address, so a replay
@@ -364,44 +401,61 @@ class Runtime:
       if readers[i] is None and count[b] < n // len(bh.DRAM) + (b < n % len(bh.DRAM)) and count[port] < -(-n // len(ports)):
         readers[i], count[b], count[port] = (b, port), count[b] + 1, count[port] + 1
     self.readers = tuple(readers)  # (bank, translated (x, y) of the port) for each grid worker, in grid order
-    # Halt all the cores of an older runtime that overlaps this one, including those we don't take. Idle cores cost
-    # nothing on a card, but ttsim simulates the cores that are running, so they slow it down.
-    for (s, e), theirs in list(chip.taken.items()):
-      if theirs & set(cores): chip.halt(*e, s); del chip.taken[s, e]
-    chip.taken[start, end] = set(cores)
-    # Halt the rectangle now, and again at exit. A dispatcher that's still running would read and write its hugepage
-    # after the process that owned it is gone, and the next process may get the same page.
+    self.counts = chip.pci.counts  # whether profile knows the bytes each launch read
+    worker, dispatcher = compile_rv32("#define COUNTED\n" * self.counts + FIRMWARE), compile_rv32(DISPATCHER)
+    assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
+    # Close the whole old rectangle, including workers we don't take. The old object stays invalid even if a
+    # later runtime uses exactly the same rectangle. Disjoint rectangles keep running and share the DRAM holes.
+    for theirs in list(chip.taken.values()):
+      if theirs.cores & set(cores): theirs.close()
     chip.halt(*end, start)
-    atexit.register(chip.halt, *end, start)
-    buf, bus = chip.pci.alloc(1 << 21)  # a hugepage for the status, the ring, the times, then staging for uploads and readback
+    buf, bus = chip.pci.alloc(1 << 21)  # status, command ring, times, then transfer staging
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
+    self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))
+    chip.taken[start, end] = self.resources
+    self.finalizer = weakref.finalize(self, self.resources.close)
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
     self.log, self.pinned, self.pinned_freed = None, set(), set()
-    self.counts = chip.pci.counts  # whether profile knows the bytes each launch read
-    worker, dispatcher = compile_rv32("#define COUNTED\n" * self.counts + FIRMWARE), compile_rv32(DISPATCHER)
-    assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
-    (dx, dy), n = self.dispatcher, len(self.cores)
-    chip.write(*end, 0, worker, start)
-    chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
-    # zero the mailbox, the TRISCs' go and done, SYNC and FLAGS, except whom to report to and the worker's index
-    for i, (x, y) in enumerate(self.cores):
-      chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, bh.noc_xy(dx, dy), 0, i).ljust(ARGS - MAILBOX, b"\0"))
-    chip.write(dx, dy, 0, dispatcher)
-    rect = bh.noc_rect(start, end)
-    chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
-    chip.write(dx, dy, DONE, bytes(8))
-    chip.write(dx, dy, OUTBOX, bytes(64))  # clear completion status left by the previous dispatcher
-    self.doorbell = chip.map(dx, dy, DISPATCH)  # its own TLB, so ringing the doorbell doesn't have to move a window first
-    for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
-    chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
-    chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go, and NCRISC stays in reset
+    try:
+      (dx, dy), n = self.dispatcher, len(self.cores)
+      chip.write(*end, 0, worker, start)
+      chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
+      # zero the mailbox, the TRISCs' go and done, SYNC and FLAGS, except whom to report to and the worker's index
+      for i, (x, y) in enumerate(self.cores):
+        chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, bh.noc_xy(dx, dy), 0, i).ljust(ARGS - MAILBOX, b"\0"))
+      chip.write(dx, dy, 0, dispatcher)
+      rect = bh.noc_rect(start, end)
+      chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
+      chip.write(dx, dy, DONE, bytes(8))
+      chip.write(dx, dy, OUTBOX, bytes(64))  # clear completion status left by the previous dispatcher
+      self.doorbell = chip.map(dx, dy, DISPATCH)  # its own TLB, so ringing the doorbell doesn't have to move a window first
+      for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
+      chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
+      chip.write32(*end, bh.SOFT_RESET, bh.NCRISC, start)  # BRISC and the TRISCs go, and NCRISC stays in reset
+    except BaseException:
+      self.close()
+      raise
+
+  def check(self):
+    """Reject work after explicit shutdown or takeover by another runtime."""
+    if not self.resources.active: raise RuntimeError("runtime is closed or was replaced by an overlapping runtime")
+
+  def close(self):
+    """Stop all workers, cancel queued work and release memory. Call wait() first to finish queued work.
+    Closing twice is harmless; tensors and recordings from this runtime can no longer run."""
+    self.resources.close()
+    self.finalizer.detach()
+
+  def __enter__(self): self.check(); return self
+  def __exit__(self, *_): self.close()
 
   def load(self, kernel):
     """Load a kernel into the workers' L1 and return its address, reusing an existing copy if present. Loading
     multicasts over the rectangle, including the dispatcher. If space runs out, wait for queued work before
     evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
+    self.check()
     if kernel not in self.loaded:
       if len(kernel) > ZEROS - KERNELS: raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}")
       if self.evicts(kernel): self.evict()
@@ -409,7 +463,7 @@ class Runtime:
       self.loaded[kernel], self.room = self.room, self.room + len(kernel)  # compile_kernel makes it a multiple of 16
     return self.loaded[kernel]
   # whether loading kernel would evict the others
-  def evicts(self, kernel): return kernel not in self.loaded and self.room + len(kernel) > ZEROS
+  def evicts(self, kernel): self.check(); return kernel not in self.loaded and self.room + len(kernel) > ZEROS
 
   def evict(self):  # forget the loaded kernels, once the launches that use them are done
     self.wait()
@@ -419,6 +473,7 @@ class Runtime:
     """Queue a compiled kernel, loading it if needed. Divide units between workers in order; the default is one
     unit per worker. Workers receive [first unit, unit count, *args]. name identifies the launch in
     profiles."""
+    self.check()
     if self.log is not None: self.log.append((kernel, args, units, name))
     self.send(*self.block([(kernel, args, units, name)]))
 
@@ -426,6 +481,7 @@ class Runtime:
     """Convert [(kernel, args, units, name)] to commands for send, plus (name, worker count, kernel) per launch. Load
     the kernels first, since commands contain their L1 addresses. Commands can be replayed until a kernel is
     evicted. If loading requires eviction, send the commands built so far before waiting for space."""
+    self.check()
     cmds, sent = [], []
     for kernel, args, units, name in launches:
       if cmds and self.evicts(kernel): self.send(b"".join(cmds), sent); cmds, sent = [], []
@@ -434,6 +490,7 @@ class Runtime:
     return b"".join(cmds), sent
 
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
+    self.check()
     units = len(self.cores) if units is None else units
     if units <= 0: raise ValueError("a launch needs at least one unit")
     n = min(units, len(self.cores))
@@ -446,6 +503,7 @@ class Runtime:
   def send(self, cmds, launches):
     """Write commands back to back into the ring, then ring the doorbell. A block uses one PCIe write when it fits
     with any wrap padding; larger blocks are sent in pieces. launches has (name, workers, kernel) for each."""
+    self.check()
     size, at, length = len(self.ring), self.wptr % len(self.ring), len(cmds)
     skip = size - at if at + length > size else 0  # commands don't wrap, so mark the tail unused and start over
     if not length: return
@@ -493,11 +551,13 @@ class Runtime:
     return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()), key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are on each of its workers. some kernels write results there
+    self.check()
     return ARGS + self.launches % 2 * ARGS_SIZE
 
   def dram_alloc(self, size):
     """Allocate size bytes in each of the 8 DRAM banks, at the same address, from the first free hole that's big
     enough."""
+    self.check()
     size = max(64, -(-size // 64) * 64)  # NoC transfers to DRAM want 64-byte alignment
     for i, (addr, room) in enumerate(self.holes):
       if room >= size:
@@ -505,14 +565,16 @@ class Runtime:
         self.used[addr] = size
         if self.log is not None: self.pinned.add(addr)
         return addr
-    if self.freed:  # what queued launches still hold may be enough once they finish
-      self.wait()
-      return self.dram_alloc(size)
+    for resources in self.chip.taken.values():  # another runtime's completed launches can free shared space too
+      if (rt := resources.owner()) is not None and rt.freed:
+        rt.wait()
+        return self.dram_alloc(size)
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):
     """Release an allocation after the launches queued so far have finished, then merge adjacent free ranges.
     Keep allocations made during recording, since replay uses the same addresses."""
+    if not self.resources.active: return  # shutdown already released all allocations after stopping the workers
     if addr in self.pinned: self.pinned_freed.add(addr); return
     self.freed.append((self.launches, addr))
     self.reclaim()
@@ -524,12 +586,10 @@ class Runtime:
     while self.queued and self.queued[0][0] <= done: self.queued.popleft()
     for launches, addr in [f for f in self.freed if f[0] <= done]:
       self.freed.remove((launches, addr))
-      self.holes = sorted(self.holes + [(addr, self.used.pop(addr))])
-      for i in range(len(self.holes) - 1, 0, -1):
-        (a, n), (b, m) = self.holes[i - 1], self.holes[i]
-        if a + n == b: self.holes[i - 1:i + 1] = [(a, n + m)]
+      self.holes.append((addr, self.used.pop(addr)))
+      _merge_holes(self.holes)
 
-  def read_status(self, i): return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
+  def read_status(self, i): self.check(); return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 
   def until(self, cond, what, timeout=60):
     """Poll until cond() is true. Raise TimeoutError if no launch completes within timeout seconds.
@@ -556,6 +616,7 @@ class Runtime:
   def report(self, core, launch):
     """Describe an unfinished worker: active cores, SYNC and FLAGS, and outstanding NoC requests by transaction
     ID. On hardware, include each core's program counter."""
+    self.check()
     x, y = core
     words = lambda addr, n: struct.unpack(f"<{n}I", self.chip.read(x, y, addr, 4 * n))
     niu = lambda off: self.chip.read32(x, y, bh.NIU + off)

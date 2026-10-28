@@ -1,6 +1,6 @@
 # PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
 # BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, gc, mmap, os, pathlib, time
+import array, ctypes, gc, mmap, os, pathlib, time, weakref
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
@@ -12,7 +12,7 @@ class Sim:
   one library, clock and set of DMA buffers per process. counts is true when the library implements
   NIU_MST_RD_DATA_WORD_RECEIVED for profiling. ttsim-chaos implements it; released ttsim stops if you read
   it."""
-  lib, dma, clocks, counts = None, [], 0, False  # dma: (bus address, size, host address, buffer). clocks: chip cycles so far
+  lib, dma, clocks, counts = None, [], 0, False  # dma: (bus address, size, host address, weak buffer reference). clocks: chip cycles so far
   def __init__(self, path, bdf=0):
     Sim.load(path)
     self.lib, self.bdf = Sim.lib, bdf
@@ -48,17 +48,21 @@ class Sim:
     return buf.raw
   def write(self, off, data): self.lib.libttsim_pci_mem_wr_bytes(self.bar0 + off, bytes(data), len(data))
 
+  next_bus = 1 << 32
   def alloc(self, size):
     """Allocate host memory that the device can reach. Returns (memoryview, bus address). Sim makes up the bus
-    addresses, 4 GiB apart."""
-    buf, bus = mmap.mmap(-1, size), (len(Sim.dma) + 1) << 32
-    Sim.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), buf))
+    addresses, 4 GiB apart. The last memoryview releases the mapping, as it does on a card."""
+    buf, bus = mmap.mmap(-1, size), Sim.next_bus
+    Sim.next_bus += 1 << 32
+    def release(_): Sim.dma[:] = [entry for entry in Sim.dma if entry[0] != bus]
+    Sim.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), weakref.ref(buf, release)))
     return memoryview(buf), bus
   fault = None  # an error in a DMA callback, which ctypes can't raise through C. tick raises it
   @staticmethod
   def dma_copy(bus, p, n, to_host):  # a device reads (to_host False) or writes host memory at bus
-    for base, size, addr, _ in Sim.dma:
-      if base <= bus and bus + n <= base + size:
+    for base, size, addr, ref in Sim.dma:
+      buf = ref()  # keep the mapping alive through memmove
+      if buf is not None and base <= bus and bus + n <= base + size:
         at = addr + bus - base
         ctypes.memmove(*((at, p) if to_host else (p, at)), n)
         return

@@ -1,5 +1,5 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
-import ast, collections, ctypes, os, pathlib, random, struct, sys, threading, time, pytest
+import ast, collections, ctypes, gc, mmap, os, pathlib, random, struct, sys, threading, time, weakref, pytest
 from baretile import bh, pci
 from baretile.hello import hello
 from baretile.runtime import DATA, KERNELS, Runtime, compile_kernel
@@ -260,6 +260,112 @@ def test_takeover(chip):
   for rt in (first, beside):
     rt.launch(me), rt.wait()
     assert [chip.read32(x, y, rt.args()) for x, y in rt.cores] == [x | y << 6 for x, y in rt.cores]
+
+def test_runtime_shared_dram(chip):
+  a = Runtime(chip, end=chip.tensix[1])
+  b = Runtime(chip, start=chip.tensix[2], end=chip.tensix[3])
+  first, second = a.dram_alloc(64), b.dram_alloc(128)
+  assert first != second and a.holes is b.holes
+  for xy in bh.DRAM:
+    chip.write(*xy, first, bytes([11]) * 64)
+    chip.write(*xy, second, bytes([22]) * 128)
+    assert chip.read(*xy, first, 64) == bytes([11]) * 64
+  a.close()
+  assert not a.used and b.used == {second: 128}
+  c = Runtime(chip, end=chip.tensix[1])
+  assert c.dram_alloc(64) == first, "a stopped runtime's allocations can be reused"
+  a.dram_free(first)  # a late tensor finalizer must not release c's allocation
+  a.close()  # old cleanup must not halt c, even when its rectangle is identical
+  c.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = 111; }"))
+  c.wait()
+  assert chip.read32(*c.cores[0], c.args()) == 111
+  assert chip.read(*bh.DRAM[0], second, 128) == bytes([22]) * 128
+  c.close(), b.close()
+  assert a.holes == [(0, bh.DRAM_BANK_SIZE)]
+
+def test_displaced_runtime_rejects_work(chip):
+  a = Runtime(chip, end=chip.tensix[1])
+  original = compile_kernel("void kmain(volatile unsigned *a) { a[0] = 111; }")
+  overwritten = compile_kernel("void kmain(volatile unsigned *a) { a[0] = 222; }")
+  block = a.block([(original, (), 1, "old")])
+  b = Runtime(chip, end=chip.tensix[1])
+  b.load(original)
+  for work in (lambda a=a: a.load(overwritten), lambda a=a: a.launch(original), lambda a=a: a.send(*block),
+               lambda a=a: a.dram_alloc(64), a.wait):
+    with pytest.raises(RuntimeError, match="closed"): work()
+  a.close()
+  del work, a
+  gc.collect()
+  b.launch(original)
+  b.wait()
+  assert chip.read32(*b.cores[0], b.args()) == 111
+  b.close()
+
+def test_runtime_finalizer_keeps_dma_until_halt(chip, monkeypatch):
+  # A Card-like allocator owns no references to its mmap. No simulator tick is needed: the queued command is
+  # deliberately unfinished when the runtime and its reference cycle are collected.
+  pages, halted, halt = [], [], chip.halt
+  def alloc(size):
+    page = mmap.mmap(-1, size)
+    pages.append(weakref.ref(page))
+    return memoryview(page), 1 << 48
+  def stop(*args):
+    if pages: halted.append(pages[-1]() is not None)
+    halt(*args)
+  monkeypatch.setattr(chip.pci, "alloc", alloc)
+  monkeypatch.setattr(chip.pci, "tick", lambda: pytest.fail("this command must stay queued"))
+  monkeypatch.setattr(chip, "halt", stop)
+  rt = Runtime(chip, end=chip.tensix[1])
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))
+  rt.cycle = rt
+  assert rt.launches == 1 and rt.finished() == 0
+  assert chip.read32(*rt.dispatcher, bh.SOFT_RESET) == bh.NCRISC
+  ref, cores = weakref.ref(rt), [*rt.cores, rt.dispatcher]
+  del rt
+  gc.collect()
+  assert ref() is None and pages[0]() is None and halted == [True]
+  assert all(chip.read32(*xy, bh.SOFT_RESET) == bh.ALL_CORES for xy in cores)
+
+def test_runtime_startup_and_shutdown_failures(chip, monkeypatch):
+  # Failed startup releases the new DMA page. Failed shutdown keeps its page and allocations until a retry.
+  old = Runtime(chip, end=chip.tensix[1])
+  old.close()
+  write = chip.write
+  def fail_start(x, y, addr, data, start=None):
+    if addr == 0: raise RuntimeError("startup failed")
+    return write(x, y, addr, data, start)
+  with monkeypatch.context() as patch:
+    patch.setattr(chip, "write", fail_start)
+    with pytest.raises(RuntimeError, match="startup failed"): Runtime(chip, end=chip.tensix[1])
+  assert not chip.taken
+  rt = Runtime(chip, end=chip.tensix[1])
+  addr, page = rt.dram_alloc(64), weakref.ref(rt.status.obj)
+  with monkeypatch.context() as patch:
+    def fail_stop(*_): raise RuntimeError("halt failed")
+    patch.setattr(chip, "halt", fail_stop)
+    with pytest.raises(RuntimeError, match="halt failed"): rt.close()
+    assert page() is not None and rt.used == {addr: 64}
+    with pytest.raises(RuntimeError, match="closed"): rt.launch(bytes(16))
+  rt.close()
+  assert page() is None and not rt.used and not chip.taken
+  with Runtime(chip, end=chip.tensix[1]) as rt:
+    rt.dram_alloc(64)
+  assert not rt.used
+
+def test_sim_dma_pages_are_released(chip):
+  if not isinstance(chip.pci, pci.Sim): pytest.skip("ttsim's DMA registry")
+  before = len(pci.Sim.dma)
+  page, bus = chip.pci.alloc(4096)
+  view = page[128:256]
+  assert len(pci.Sim.dma) == before + 1
+  del page
+  gc.collect()
+  assert len(pci.Sim.dma) == before + 1, "a derived view still owns the mapping"
+  del view
+  gc.collect()
+  assert len(pci.Sim.dma) == before
+  page, next_bus = chip.pci.alloc(4096)
+  assert next_bus > bus, "released DMA addresses must not alias a later page"
 
 def test_readers(chip):
   # Grid workers read their bank through one of its three ports. The banks split the grid evenly, and no port serves
