@@ -188,8 +188,11 @@ class Tensor:
     if self.rep != 1: raise ValueError("put requires a tensor with rep=1")
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
+    self.realize()
+    if x.addr == self.addr: x = Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
+    if ids.addr == self.addr: ids = Tensor(self.rt, ids.rows, ids.cols, dtype=ids.dtype).assign(ids)
     return self.realize().run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
-                              ids.offset, x.rows, tc, tr, units=self.batch * x.rows * tc, name="put")
+                              ids.offset, x.rows, tc, tr, self.rows, units=self.batch * x.rows * tc, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, runs=None):
     if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
@@ -340,6 +343,12 @@ class Tensor:
     _fit(self)
     inputs = []
     e, dtype = _tree(self, inputs)
+    if into is not None and any(t.addr == into.addr and (_layout(t) != _layout(into) or "matmul" in _name(e).split()) for t in inputs):
+      into.assign(self.realize())  # finish every source read before any destination tile is overwritten
+      self.rt.dram_free(self.addr)
+      self.addr, self.owner = into.addr, into.owner or into
+      self.bstride, self.stride, self.offset = into.bstride, into.stride, into.offset
+      return self
     shapes = tuple(u.shape for u in inputs)
     # when only the result's rows matter, round the inputs' rows up to tiles, so the same kernel serves any row count
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
@@ -362,8 +371,7 @@ class Tensor:
       raise ValueError("assign requires a realized tensor with rep=1 and an x of the same shape and dtype")
     if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     reads = [x] if x.op is None else [s for t in _lazy(x, set()) for s in t.srcs]
-    layout = lambda t: (t.shape, t.bstride, t.stride, t.offset, t.rep)
-    if any(t.addr == self.addr and layout(t) != layout(self) for t in reads):
+    if any(t.addr == self.addr and _layout(t) != _layout(self) for t in reads):
       x = x.realize() if x.op is not None else Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
     if x.op is not None: x.realize(self); return self
     x = _plain(x)
@@ -625,7 +633,8 @@ class Tensor:
   def gradient(self, *targets, gradient=None):
     """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that
     self doesn't depend on. self must be scalar unless gradient supplies the derivative of the desired
-    output with respect to self."""
+    output with respect to self. Realize all returned gradients before changing any forward operand;
+    backward() does this automatically."""
     if gradient is None and self.shape != (1, 1, 1): raise ValueError("self must be a single value, or pass gradient")
     if gradient is not None and gradient.shape != self.shape: raise ValueError("gradient must have the output's shape")
     if gradient is not None: self._same_runtime(gradient)
@@ -648,7 +657,8 @@ class Tensor:
     return [_full(grads[id(t)], t.shape) if id(t) in grads else None for t in targets]
   def backward(self, gradient=None):
     """Accumulate gradients in .grad for leaves that require them, and return self. Existing gradients are
-    added to, as in PyTorch and tinygrad."""
+    added to, as in PyTorch and tinygrad. Queue the forward value and all gradients before returning, so
+    later parameter updates cannot change the values used by another parameter's gradient."""
     leaves, seen = [], set()
     def visit(t):
       if id(t) in seen: return
@@ -657,8 +667,10 @@ class Tensor:
       for s in t._ctx[1] if t._ctx else ():
         if s.requires_grad: visit(s)
     visit(self)
-    for t, g in zip(leaves, self.gradient(*leaves, gradient=gradient)):
-      if g is not None: t.grad = g if t.grad is None else t.grad + g
+    grads = self.gradient(*leaves, gradient=gradient)
+    self.realize()
+    for t, g in zip(leaves, grads):
+      if g is not None: t.grad = (g if t.grad is None else t.grad + g).realize()
     return self
 
 def _shape(shape):
@@ -672,6 +684,7 @@ def _unbroadcast(g, shape):  # the gradient of a broadcast operand: g summed ove
     if shape[ax] == 1 and g.shape[ax] > 1: g = g.sum(ax)
   return g
 def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for ops that can't take g broadcast
+def _layout(t): return t.shape, t.bstride, t.stride, t.offset, t.rep, t.runs
 
 def _backward(t, g):
   """The gradients of t's operands, given t's gradient g. A condition or a comparison has none, and gets None."""
