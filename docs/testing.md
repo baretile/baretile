@@ -66,9 +66,10 @@ token. Top-5 counts how often its pick is among the reference's five best tokens
 
 ## Where ttsim differs from a card
 
-Tensix instructions take no time in ttsim. NoC requests complete immediately,
-and some `STALLWAIT` conditions are ignored. Most of the cycles you see come
-from the RISC-V code that controls the kernel. A lower count can show that
+Tensix instructions take no time in ttsim. NoC requests complete immediately.
+`STALLWAIT` and `SEMWAIT` hold up the whole thread, whatever their block masks
+name, so a wait that names too few units still works there. Most of the cycles
+you see come from the RISC-V code that controls the kernel. A lower count can show that
 you've reduced that work, but it won't tell you how fast the kernel is on a card.
 
 ttsim also decodes an unexpected `XMOV` in very long loops of inline Tensix
@@ -87,7 +88,7 @@ the kernels wait for their data:
 
 ```sh
 TTSIM=/path/to/ttsim-chaos/src/_out/release_bh/libttsim.so \
-  TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 \
+  TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40 \
   python3 -m pytest -s test
 ```
 
@@ -95,6 +96,16 @@ TTSIM=/path/to/ttsim-chaos/src/_out/release_bh/libttsim.so \
 range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
+
+`TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
+runs a random lo to hi clocks after it leaves its thread, and the thread goes on
+meanwhile. `STALLWAIT` and `SEMWAIT` then block only the instructions their
+block masks name, as the ISA's `STALLWAIT.md` describes. A configuration write,
+a `SEMPOST` or a pack that should wait for the math finds it unfinished unless a
+`STALLWAIT` holds it back. FPU and SFPU instructions keep their order, and each
+one uses the address modes it saw when it left its thread, since tt-llk relies on
+both. The unpackers, the packer and the configuration unit still finish at once,
+so this doesn't check the waits for them.
 
 The patch also implements the NIU counter for bytes received by reads.
 `pci.Sim.counts` detects the patched library. Released ttsim doesn't support that
