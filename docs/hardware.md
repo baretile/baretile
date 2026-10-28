@@ -97,7 +97,8 @@ those addresses without translation.
 Host memory is reached through the PCIe tile. Addresses below `2**58` use the
 direct bus-address path. Bit 60 selects the outbound iATU path used by kmd and
 UMD. baretile uses the direct path and doesn't program iATU windows. We still
-need to check whether firmware sets that up after boot.
+need to check whether firmware sets that up after boot. The dispatcher's command
+reads, readback and uploads all depend on it.
 
 If it doesn't, we'll need to program the iATU. The definitions are in kmd's
 `blackhole.c`. Region r starts at BAR2 `0x1000 + 0x200*r`: base at `+0x08/0x0C`,

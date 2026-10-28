@@ -7,8 +7,8 @@ from baretile.tensor import Tensor
 from baretile.runtime import TIMES, Runtime, compile_kernel
 from conftest import bf16, value
 
-def kernels(rt, since):  # counts launches after launch `since`, leaving out readbacks such as tobytes
-  return sum(rt.sent[n % TIMES][0] != "readback" for n in range(since + 1, rt.launches + 1))
+def kernels(rt, since):  # counts launches after launch `since`, leaving out the transfers of tobytes and frombytes
+  return sum(rt.sent[n % TIMES][0] not in ("readback", "upload") for n in range(since + 1, rt.launches + 1))
 
 def row_end(chip):  # where a Runtime ends so that its grid is one row of 12, however the chip is harvested
   return chip.tensix[len(chip.tensix) // len(bh.TENSIX_Y) + 11]
@@ -151,6 +151,49 @@ def test_jit_formats(chip):
     for n in (1, 2, 3, 4):
       x = Tensor.full(rt, 32, 32, n).cast(dtype).realize()
       assert step(x).tolist() == [[32 * n] * 32] * 32
+
+def test_upload(chip, monkeypatch):
+  # frombytes writes through the BAR below tensor.DMA_UPLOAD bytes, and through upload_kernel from there, in chunks
+  # staged in Runtime.back. Both leave the same tiles in every bank, also when the tiles don't fill the banks evenly.
+  # 1100 x 1024 takes several chunks. A recording leaves the upload's launches out: they'd read whatever the host
+  # staged since, and the uploaded tensor keeps its values.
+  rt, rng = Runtime(chip), np.random.default_rng(11)
+  def banks(t):  # the tiles of t in each bank, read through the BAR
+    tb = tensix.tile_bytes(t.dtype)
+    return [chip.read(*bh.DRAM[b], t.addr, len(range(b, t.tiles, len(bh.DRAM))) * tb) for b in range(len(bh.DRAM))]
+  for shape, dtype, chunks in (((1, 1), "bf16", 1), ((3, 40, 40), "int32", 1), ((70, 100), "fp32", 1), ((1100, 1024), "bf16", 5)):
+    a = rng.integers(-2**31, 2**31, shape, np.int32) if dtype == "int32" else rng.standard_normal(shape).astype(np.float32)
+    data, made = (a.view(np.uint32) >> 16).astype(np.uint16).tobytes() if dtype == "bf16" else a.tobytes(), []
+    for dma in (False, True):
+      monkeypatch.setattr(tensor, "DMA_UPLOAD", 0 if dma else 1 << 62)
+      since = rt.launches
+      made.append(Tensor.frombytes(rt, *shape[-2:], data, shape[0] if len(shape) == 3 else 1, dtype))
+      assert rt.launches - since == dma * chunks and kernels(rt, since) == 0, (shape, dma)
+    assert banks(made[0]) == banks(made[1]) and made[1].tobytes() == data, (shape, dtype)
+  ones = struct.pack("<1024H", *[0x3F80] * 1024)  # 1.0 in bf16
+  step, x = tensor.jit(lambda x: x + Tensor.frombytes(rt, 32, 32, ones)), Tensor.of(rt, [[1.0] * 32] * 32)
+  for call in range(4):
+    Tensor.frombytes(rt, 32, 32, bytes(2048))  # stages zeros where the call before staged ones
+    assert step(x).tolist() == [[2.0] * 32] * 32, call
+
+def test_zeros(chip):
+  # Tensor.zeros writes every byte of a tensor's storage from the zero tile in the workers' L1, in one launch and
+  # with nothing over PCIe. All-zero bytes are zeros in each format, block floats included, so it's the same storage
+  # as casting uploaded zeros. It works on freed memory that still holds another tensor's values.
+  rt = Runtime(chip)
+  for dtype in ("bf16", "fp32", "int32", "bfp8", "bfp4"):
+    junk = Tensor.of(rt, np.random.default_rng(3).integers(1, 9, (2, 70, 100)).tolist(), "int32")
+    at = junk.addr
+    del junk
+    rt.wait()
+    since, z = rt.launches, Tensor.zeros(rt, 70, 100, 2, dtype)
+    assert z.addr == at, dtype  # where the integers were
+    cast = Tensor.frombytes(rt, 70, 100, bytes(2 * 2 * 70 * 100), 2).cast(dtype).realize()
+    rt.wait()
+    each = -(-z.tiles // len(bh.DRAM)) * tensix.tile_bytes(dtype)
+    raw = lambda t: [chip.read(*bh.DRAM[b], t.addr, each) for b in range(len(bh.DRAM))]
+    assert rt.sent[(since + 1) % TIMES][0] == "zeros" and raw(z) == raw(cast) == [bytes(each)] * len(bh.DRAM), dtype
+    assert not np.array(z.tolist()).any(), dtype
 
 def test_tensor_inputs(chip):
   # Reject malformed inputs before allocating DRAM. Ragged rows can have the right total byte count.

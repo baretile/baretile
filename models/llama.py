@@ -487,8 +487,7 @@ def arrays(weights, prec=None):
 def logits(f_out): return gpt2.values(f_out)[0]  # a baretile row of logits, as a numpy vector
 
 def zeros(rt, dtype="bf16"):  # kv_cache's zeros on the chip in dtype, like bfp8 for a bfp8 KV cache. "float32" gives fp32
-  bf16 = lambda shape: Tensor.frombytes(rt, shape[1], shape[2], bytes(2 * math.prod(shape)), shape[0])
-  return lambda shape, d=None: bf16(shape).cast({"float32": "fp32"}.get(d, dtype)).realize()
+  return lambda shape, d=None: Tensor.zeros(rt, shape[1], shape[2], shape[0], {"float32": "fp32"}.get(d, dtype))
 
 def reference(path):
   """Read a Tenstorrent .refpt file from tt_transformers/tests/reference_outputs. The file, produced by

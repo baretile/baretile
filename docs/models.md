@@ -36,7 +36,8 @@ with a bfp4 KV cache.
 
 The loader fuses q, k and v projections, and gate and up projections, where
 appropriate. Matmul weights are stored by tile columns. The KV cache is
-allocated once, and each token writes its keys and values at its position.
+allocated once and zeroed on the chip, and each token writes its keys and values
+at its position.
 
 ## Experts and Gated DeltaNet
 
