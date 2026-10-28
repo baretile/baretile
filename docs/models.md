@@ -71,8 +71,9 @@ multiple of 32 for that size, and leave room for the answer as well as the
 prompt. The engine also reserves positions at the end for inactive slots.
 
 Downloads go to `~/.cache/baretile/hub`. `HF_TOKEN` supplies access to a gated
-model, and `HF_ENDPOINT` changes the download endpoint. Completed downloads are
-reused. The server binds to all interfaces on the selected port and has no API
+model, and `HF_ENDPOINT` changes the download endpoint. Redirects retain that
+credential only within the same origin, including its scheme and port. Completed
+downloads are reused. The server binds to all interfaces on the selected port and has no API
 key check.
 
 It serves `GET /v1/models`, `POST /v1/completions` and
@@ -89,15 +90,25 @@ You can set temperature, top_k, top_p, min_p, seed, stop strings and repetition
 penalties. Defaults come from the model's `generation_config.json` when present.
 Prompts must contain at least one token. `max_tokens` must be a positive integer;
 `top_k=0` keeps all tokens. Temperature must be nonnegative, `top_p` in `(0, 1]`,
-`min_p` in `[0, 1]`, and repetition penalties positive. Invalid requests get
-HTTP 400 before they take a slot.
+`min_p` in `[0, 1]`, and repetition penalties positive. Nonzero temperatures
+must have an inverse representable as a normal fp32 value. Penalties must fit
+fp32, and repetition penalties must also be normal. Invalid requests get HTTP
+400 before they take a slot.
+
+Each connection has 10 seconds to send its headers and body. Bodies require one
+nonnegative `Content-Length`, may contain at most 8 MiB, and cannot use chunked
+transfer encoding. Expired bodies get HTTP 408; oversized bodies get HTTP 413.
+At most 32 connections have active handlers; additional connections get HTTP
+503. `serve.server` exposes these limits as `input_wait`, `body_limit` and
+`connections`.
 
 The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request
 gets HTTP 429 when no slot is free. A non-streaming request that receives no text
 for 600 seconds gets HTTP 504. A stream that times out releases its slot.
-If the engine fails, pending requests end with an error and new requests get
-HTTP 503.
+A sampling failure ends the affected request with an error and frees its slot;
+other requests continue. If the engine fails, pending requests end with an error
+and new requests get HTTP 503.
 
 ## Reusing a conversation
 
