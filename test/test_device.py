@@ -317,6 +317,40 @@ def test_runtime_shared_dram(chip):
   c.close(), b.close()
   assert a.holes == [(0, bh.DRAM_BANK_SIZE)]
 
+def test_takeover_during_collection(chip, monkeypatch):
+  # Takeover owns only the old resources. Collecting the Runtime cycle during its drain must not run its
+  # finalizer in the middle of the same close, release allocations twice, or remove the rectangle twice.
+  collecting = gc.isenabled()
+  gc.disable()
+  try:
+    old = Runtime(chip, end=chip.tensix[1])
+    addr = old.dram_alloc(64)
+    old.cycle = old
+    owner, resources = weakref.ref(old), old.resources
+    del old
+    wait, halt, collected, stopped = chip.wait, chip.halt, False, 0
+    def poll(cond, what, timeout=2.0):
+      nonlocal collected
+      if not collected:
+        collected = True
+        gc.collect()
+      return wait(cond, what, timeout)
+    def stop(*args):
+      nonlocal stopped
+      if not resources.closed: stopped += 1
+      return halt(*args)
+    with monkeypatch.context() as patch:
+      patch.setattr(chip, "wait", poll)
+      patch.setattr(chip, "halt", stop)
+      replacement = Runtime(chip, end=chip.tensix[1])
+    gc.collect()
+    assert collected and stopped == 1 and owner() is None and resources.closed
+    assert replacement.dram_alloc(64) == addr
+    replacement.close()
+    assert chip.dram_holes == [(0, bh.DRAM_BANK_SIZE)]
+  finally:
+    if collecting: gc.enable()
+
 def test_displaced_runtime_rejects_work(chip):
   a = Runtime(chip, end=chip.tensix[1])
   original = compile_kernel("void kmain(volatile unsigned *a) { a[0] = 111; }")

@@ -361,6 +361,9 @@ class _Resources:
     self.active, self.closed = True, False
   def close(self):
     if self.closed: return
+    # Takeover holds only resources. Keep the Runtime alive until cleanup finishes so cyclic collection
+    # during a drain cannot invoke its finalizer and reenter this close. Failed cleanup remains retryable.
+    owner = self.owner()
     self.active = False
     try:
       self.chip.halt(*self.end, self.start)
@@ -383,6 +386,7 @@ class _Resources:
     del self.chip.taken[self.start, self.end]
     self.closed = True
     _stranded.discard(self)
+    if owner is not None: owner.finalizer.detach()
 
 class Runtime:
   """Run kernels on the Tensix rectangle from start to end, using the available tiles by default. The last tile
