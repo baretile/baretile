@@ -173,9 +173,9 @@ def jumps(brisc, trisc0, trisc1, trisc2):
 # all four instruction caches because a different kernel may have occupied the same addresses. It then starts
 # the programs named in the kernel header. Each TRISC waits for its Tensix thread to finish before returning.
 # Once all four cores finish, BRISC records completion in its mailbox and increments the dispatcher's report
-# count with a posted NoC atomic. This sends no response and changes no request counter. With COUNTED enabled,
-# BRISC first adds the launch's read-data count, in 64-byte flits, to the dispatcher's sum. Both atomics use the
-# same static VC, so the byte count arrives before the completion report.
+# count with an acknowledged NoC atomic. Its transaction counter lets shutdown wait for completion after the
+# core stops. With COUNTED enabled, BRISC first adds the launch's read-data count, in 64-byte flits, to the
+# dispatcher's sum. Both atomics use the same static VC, so the byte count arrives before the completion report.
 FIRMWARE = f"""
 #define MAILBOX ((volatile unsigned *){MAILBOX:#x})
 #define TRISCS ((volatile unsigned *){TRISCS:#x})
@@ -245,8 +245,8 @@ void trisc_loop(unsigned i) {{
 # while the current launch runs. After completion, it captures the timing and read-data counts, then starts
 # the next launch before reporting to the host. Timing records use a TIMES-entry ring in host memory.
 # Each record holds [go, last report, flits read]; flits are the increase in the shared read-data count.
-# The dispatcher posts the record before [read pointer, launches done] on the same static VC, preserving their
-# arrival order. It waits only for the data to leave its outbox, without waiting for a PCIe acknowledgement.
+# The dispatcher writes the record before [read pointer, launches done] on the same static VC, preserving their
+# arrival order. Both writes are acknowledged, so shutdown can drain them before releasing the host DMA page.
 TIMES = 1024
 DISPATCHER = f"""
 #define CONFIG ((volatile unsigned *){DISPATCH:#x})
@@ -314,8 +314,9 @@ void loop(void) {{
       OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished; OUT[10] = read;
       l1_settle({OUTBOX + 16:#x});
       // its times, then the status that says it's done, in that order
-      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.noc_xy(*bh.PCIE)}, POST, 16);
-      noc_issue({OUTBOX + 16:#x}, me, status, {bh.noc_xy(*bh.PCIE)}, POST, 8);
+      noc_issue({OUTBOX + 32:#x}, me, times + done % {TIMES} * 16, {bh.noc_xy(*bh.PCIE)}, WRITE | STATIC, 16);
+      noc_issue({OUTBOX + 16:#x}, me, status, {bh.noc_xy(*bh.PCIE)}, WRITE | STATIC, 8);
+      noc_wait();  // a later multicast must not count these acknowledgements as worker acknowledgements
     }}
   }}
 }}
@@ -344,7 +345,11 @@ class _Resources:
       self.chip.halt(*self.end, self.start)
       # Read reset back before polling the NoC: requests issued before the cores stopped can still be in flight.
       for x, y in self.cores: self.chip.read32(x, y, bh.SOFT_RESET)
-      self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS["OUTSTANDING"]) == 0 for x, y in self.cores),
+      # Every initiator must finish accepting its command before the transaction counters can be trusted.
+      self.chip.wait(lambda: all(not self.chip.read32(x, y, bh.NIU + i * bh.NIU_REGS["INITIATOR"] + bh.NIU_REGS["CMD"]) & 1
+                                for x, y in self.cores for i in range(4)), "stop issuing the runtime's NoC requests")
+      self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS[kind] + 4 * i) == 0
+                                for x, y in self.cores for kind in ("OUTSTANDING", "OUTGOING") for i in range(16)),
                      "drain the stopped runtime's NoC requests")
     except BaseException:
       _stranded.add(self)

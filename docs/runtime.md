@@ -26,7 +26,13 @@ all workers and cancels queued work; call `rt.wait()` first if it must finish.
 It drains outstanding NoC requests before releasing host DMA and DRAM memory.
 Closing again is harmless. Collection and process exit perform the same cleanup,
 including runtimes in reference cycles. If stopping fails, memory stays reserved
-until a later close or takeover succeeds.
+until a later close or takeover succeeds. A runtime stopped during a multicast
+may retain memory if its acknowledgement count cannot prove completion; it does
+not reset another runtime's workers or reuse uncertain allocations.
+
+Custom kernels must use acknowledged reads, writes and atomics, and wait for
+completion before returning. Unacknowledged writes have no completion counter;
+shutdown cannot establish their destination memory's lifetime.
 
 Some kernels need a rectangular grid of workers. The dispatcher's row has a
 tile missing, so `Runtime.grid` leaves that row out. With 120 tiles, you get
@@ -72,7 +78,7 @@ launches in order and alternates argument buffers so it can prepare the next
 launch while workers run.
 
 Each worker reports completion with a NoC atomic increment. The dispatcher
-writes timing data before completion status, using ordered posted writes.
+writes timing data before completion status, using ordered acknowledged writes.
 `Runtime.wait()` polls that status in host memory. `Runtime.wait(launch=n)` waits
 only until launch `n` is done.
 
