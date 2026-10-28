@@ -42,7 +42,7 @@ class Tensor:
     self.requires_grad = on
     return self
   def _where(self, runs=False):  # the address and tile strides a kernel reads it by, or for a tensor by columns, its runs
-    if not (runs or not self.runs): raise ValueError("a tensor by columns can only be a matmul's B, or read back")
+    if self.runs and not runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
     return (self.addr, *self.runs) if self.runs else (self.addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
@@ -189,7 +189,7 @@ class Tensor:
 
   def _view(self, rows, cols, batch, offset, bstride=0, runs=None):
     if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
-    if not (not self.runs or runs): raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
+    if self.runs and not runs: raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, self.owner or self
     v.offset, v.bstride, v.stride, v.runs = self.offset + offset, bstride, self.stride, runs
@@ -478,7 +478,7 @@ class Tensor:
     cols = self.cols // parts
     if not (self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols):
       raise ValueError(f"topk needs bf16 or fp32, k up to 64 and a part's width, and equal parts: {self.dtype}, k={k}, {parts} parts of {self.cols}")
-    if not (labels is None or (labels.dtype == "int32" and labels.shape == self.shape and parts == 1)):
+    if labels is not None and not (labels.dtype == "int32" and labels.shape == self.shape and parts == 1):
       raise ValueError("topk's labels need int32, x's shape and parts=1")
     x, labels = _plain(self.realize()), None if labels is None else _plain(labels.realize())
     values = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype=x.dtype)
@@ -490,7 +490,7 @@ class Tensor:
     """Copy to rt's chip over Ethernet channel ch, with channel back at the peer (see Chip.links). Wait for
     queued launches on both chips before clearing the transfer flags. This can't be recorded because replay
     wouldn't clear those flags again."""
-    if not (rt is not self.rt and self.rt.log is None and rt.log is None):
+    if rt is self.rt or self.rt.log is not None or rt.log is not None:
       raise ValueError("to requires different runtimes with neither recording launches")
     x = self.realize()
     if x.runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
@@ -619,8 +619,8 @@ class Tensor:
     """Build d(self)/d(target) for each target as lazy tensor operations. Return None for a target that
     self doesn't depend on. self must be scalar unless gradient supplies the derivative of the desired
     output with respect to self."""
-    if not (gradient is not None or self.shape == (1, 1, 1)): raise ValueError("self must be a single value, or pass gradient")
-    if not (gradient is None or gradient.shape == self.shape): raise ValueError("gradient must have the output's shape")
+    if gradient is None and self.shape != (1, 1, 1): raise ValueError("self must be a single value, or pass gradient")
+    if gradient is not None and gradient.shape != self.shape: raise ValueError("gradient must have the output's shape")
     if gradient is not None: self._same_runtime(gradient)
     order, seen = [], set()
     def visit(t):  # what self was made of, operands first

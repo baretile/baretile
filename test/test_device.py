@@ -118,7 +118,7 @@ def test_cache_prune(tmp_path, monkeypatch):
 
 def test_compile_concurrent(tmp_path, monkeypatch):
   # Both threads finish compiling before either publishes the same cache entry. Temporary files must not collide.
-  import concurrent.futures, threading
+  import concurrent.futures
   import baretile.runtime as runtime
   monkeypatch.setattr(runtime, "CACHE", tmp_path)
   barrier, replace = threading.Barrier(2, timeout=10), os.replace
