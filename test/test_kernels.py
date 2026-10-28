@@ -204,6 +204,7 @@ def test_checks_without_asserts():
   code = """
 from baretile.tensor import Tensor
 class Runtime:
+  def check(self): pass
   def dram_alloc(self, size): return 0
   def dram_free(self, addr): pass
 rt = Runtime()
@@ -282,8 +283,8 @@ def test_jit_inputs_and_retry(chip):
   assert step(x, y).tolist() == [[5]] and len(calls) == 3
   for xs in ((), (x,), (x, y, x)):
     with pytest.raises(ValueError, match="inputs"): step(*xs)
-  # An overlapping runtime owns different allocations even when its addresses happen to match.
-  other = Runtime(chip, end=chip.tensix[1])
+  # Disjoint runtimes can run together, but their tensors still cannot mix in an expression.
+  other = Runtime(chip, start=chip.tensix[2], end=chip.tensix[3])
   z = Tensor.full(other, 1, 1, 7)
   with pytest.raises(ValueError, match="runtime"): step(z, z)
   with pytest.raises(ValueError, match="runtime"): x + z
@@ -305,6 +306,25 @@ def test_gradient_targets(chip):
   x.sum().backward()
   (x > 0).sum().backward()  # a nondifferentiable path leaves an existing gradient alone
   assert x.grad.tolist() == [[1, 1]]
+
+def test_disjoint_runtime_tensors(chip):
+  with Runtime(chip, end=chip.tensix[1]) as a, Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]) as b:
+    x, y = Tensor.of(a, [[1, 2]]), Tensor.of(b, [[7, 8]])
+    assert x.tolist() == [[1, 2]] and y.tolist() == [[7, 8]]
+    left, right = (x + 10).realize(), (y * 2).realize()
+    assert left.tolist() == [[11, 12]] and right.tolist() == [[14, 16]]
+
+def test_tensors_and_recordings_reject_closed_runtime(chip):
+  rt = Runtime(chip, end=chip.tensix[1])
+  x = Tensor.of(rt, [[1, 2]])
+  lazy = x + 1
+  with tensor.Recording(rt) as recording: (x * 2).realize()
+  replacement = Runtime(chip, end=chip.tensix[1])
+  for work in (x.tolist, x.realize, lazy.realize, lambda: x + 1, lambda: x.assign(x), recording.send,
+               lambda: Tensor.of(rt, [[3, 4]])):
+    with pytest.raises(RuntimeError, match="closed"): work()
+  assert Tensor.of(replacement, [[7, 8]]).tolist() == [[7, 8]]
+  replacement.close()
 
 def test_dram_is_freed(chip):
   # DRAM is allocated first fit, 64-byte aligned, and a freed block merges with the holes on both sides. A tensor gives

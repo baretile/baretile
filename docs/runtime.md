@@ -14,10 +14,19 @@ them and waits for their reports. The host sees completion in its own memory.
 
 `Runtime(chip)` uses the available Tensix tiles. You can restrict it with `start`
 and `end` coordinates. The last tile in that rectangle is the dispatcher. The
-others are workers. A new runtime stops any older runtime whose tiles overlap.
+others are workers. A new runtime closes any older runtime whose tiles overlap.
+The displaced runtime, its tensors and its recordings reject further work.
+Disjoint rectangles can run together and allocate from the same DRAM pool.
 Both endpoints must be available Tensix tiles. The runtime requires all eight
 DRAM banks. A custom command ring must be a power of two from 64 bytes through
 1 MiB, leaving room for status, timing records and tensor data in its hugepage.
+
+Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
+all workers and cancels queued work; call `rt.wait()` first if it must finish.
+It drains outstanding NoC requests before releasing host DMA and DRAM memory.
+Closing again is harmless. Collection and process exit perform the same cleanup,
+including runtimes in reference cycles. If stopping fails, memory stays reserved
+until a later close or takeover succeeds.
 
 Some kernels need a rectangular grid of workers. The dispatcher's row has a
 tile missing, so `Runtime.grid` leaves that row out. With 120 tiles, you get
@@ -77,9 +86,11 @@ those launches out, since their staged data is gone by the time it replays.
 `Tensor.zeros` sends nothing over PCIe: its workers write the 4 KiB tile of zeros
 in their L1 over the tensor's storage.
 
-The runtime allocates the same address range in eight DRAM banks. It uses the
-first hole that's big enough, rounded to 64 bytes. When you free a tensor,
-queued kernels may still be using its memory. The runtime waits for them to
+Runtimes on one `Chip` share the free ranges of its eight DRAM banks. An
+allocation uses the same address range in every bank, taking the first hole
+that's big enough and rounding to 64 bytes. `rt.holes` lists chip-wide free
+ranges; `rt.used` lists that runtime's live and deferred allocations. When you
+free a tensor, queued kernels may still be using its memory. The runtime waits for them to
 finish before reusing that space. A recording keeps its memory for later calls.
 
 ## Recording repeated work

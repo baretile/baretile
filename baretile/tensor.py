@@ -28,6 +28,7 @@ class Tensor:
     batch, rows, cols = _shape((batch, rows, cols))
     if dtype not in (*ITEMSIZE, *BFP): raise ValueError(f"unknown tensor dtype: {dtype}")
     if any(s.rt is not rt for s in srcs): raise ValueError("tensor operands must use the same runtime")
+    rt.check()
     self.rt, self.rows, self.cols, self.batch, self.op, self.srcs, self.dtype = rt, rows, cols, batch, op, srcs, dtype
     tr, tc = -(-rows // 32), -(-cols // 32)  # tile rows and columns
     self.tiles, self.bstride, self.stride, self.offset, self.owner, self.rep = batch * tr * tc, tr * tc, tc, 0, None, 1
@@ -49,6 +50,7 @@ class Tensor:
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
     if any(x.rt is not self.rt for x in xs): raise ValueError("tensor operands must use the same runtime")
+    self.rt.check()
 
   def __del__(self):  # free the DRAM. the runtime holds it until the launches queued so far are done
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
@@ -317,6 +319,7 @@ class Tensor:
   def realize(self, into=None):
     """Queue the computation and return this tensor. Allocate DRAM for the result, or write into the tensor or
     view passed as into. A tensor that's already realized has nothing to write; assign copies one."""
+    self.rt.check()
     if into is not None:
       self._same_runtime(into)
       if not (into.op is None and into.rep == 1 and not into.runs and (into.shape, into.dtype) == (self.shape, self.dtype)):

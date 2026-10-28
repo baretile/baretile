@@ -16,7 +16,8 @@ class Chip:
   def __init__(self, pci, boot=2.0):
     if (ids := pci.cfg_read(0)) != bh.VENDOR | bh.DEVICE << 16: raise RuntimeError(f"not a Blackhole: {ids:#x}")
     self.pci, self.target = pci, None  # TLB 0 is the shared window, and map hands out the others
-    self.taken = {}  # (start, end) -> the tiles of each rectangle that a Runtime has taken
+    self.taken = {}  # (start, end) -> runtime resources; these do not keep the Runtime alive
+    self.dram_holes = [(0, bh.DRAM_BANK_SIZE)]  # all runtimes on this chip share its DRAM
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
     if not (int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED):
