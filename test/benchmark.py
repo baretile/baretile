@@ -119,9 +119,9 @@ def load(url, agents, turns, text):
   for t in threads: t.start()
   for t in threads: t.join()
   assert not failed, failed
-  first = sorted(stamps[0] - start for start, stamps, _ in done)
-  each = statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if s[-1] > s[0])
-  made, span = sum(u["completion_tokens"] for *_, u in done), max(s[-1] for _, s, _ in done) - min(start for start, *_ in done)
+  first = sorted(stamps[0] - start for start, stamps, _ in done if stamps)  # a turn can end before its first text
+  each = statistics.median((u["completion_tokens"] - 1) / (s[-1] - s[0]) for _, s, u in done if len(s) > 1 and s[-1] > s[0])
+  made, span = sum(u["completion_tokens"] for *_, u in done), max(s[-1] for _, s, _ in done if s) - min(start for start, *_ in done)
   cached = sum(u["prompt_tokens_details"]["cached_tokens"] for *_, u in done) / sum(u["prompt_tokens"] for *_, u in done)
   return {"agents": agents, "turns": len(done), "tokens/s a user": each, "tokens/s": made / span, "seconds to first token": statistics.median(first),
           "seconds to first token, 90th percentile": first[int(0.9 * (len(first) - 1))], "prompt tokens cached": cached}
@@ -170,7 +170,7 @@ def baretile(folder, prompt, after, top5, book, s):
   from baretile.tensor import Tensor, jit
   chip = Chip(pci.open_device())
   rt, clock, on, sim = Runtime(chip), chip.pci.now, lambda row: Tensor.of(rt, [row], "int32"), isinstance(chip.pci, pci.Sim)
-  tables = lambda n: llama.upload(rt, {k: w for k, w in llama.load(folder, n)[1].items() if k in ("cos", "sin")})  # RoPE tables for n positions
+  tables = lambda n: llama.upload(rt, {k: w for k, w in llama.rope_weights(c, n).items() if k != "turn"})  # RoPE tables for n positions
   firmware = chip.telemetry().get(bh.TAG_FIRMWARE, 0)
   code = {d: lines(ROOT, lambda p: p.startswith(d + "/")) for d in ("baretile", "adapters")}
   versions = {"baretile": git(ROOT), "firmware": ".".join(str(firmware >> b & 255) for b in (24, 16, 8)), "card": card(sim),
@@ -181,7 +181,7 @@ def baretile(folder, prompt, after, top5, book, s):
     """tokens/s per user, with `users` decoding greedily together after the same prompt, ignoring end-of-sequence.
     The first two steps are warm-up (jit runs, then records). Each step is timed from the token ids on the host to the
     next ones there."""
-    n, size = len(short), -(-(len(short) + s.steps) // 32) * 32
+    n, size = len(short), -(-(len(short) + s.steps + 1) // 32) * 32  # a slot's last row is for idle slots
     kv, tokens = llama.kv_cache(c, size * users, llama.zeros(rt, llama.cache_format(c)), users), []
     for u in range(users):  # prefill each user's prompt into its part of the cache, and get its next token
       tokens.append(int(llama.logits(llama.forward(on(short), on(list(range(n))), t, c, llama.slot(c, kv, u, users))).argmax()))
@@ -195,8 +195,9 @@ def baretile(folder, prompt, after, top5, book, s):
 
   def prefill(t, c, ids):
     """Seconds from ids on the host to the first token, after a warm-up prefill, and the chunk size llama.prefill used.
-    The RoPE tables and the cache are sized for these ids. A chunk is as many tokens as keep attention's scores within
-    2 GiB, or all of them if they fit."""
+    The RoPE tables and the cache are sized for these ids. A chunk is (1 << 31) // (2 * heads * cache rows) tokens,
+    at least 32: a bound from when attention's scores went to DRAM. Tensor.attend keeps them in L1 now, so the chunk
+    size is for the card to tune."""
     t, size = t | tables(len(ids)), -(-len(ids) // 32) * 32
     kv, chunk = llama.kv_cache(c, size, llama.zeros(rt, llama.cache_format(c))), min(len(ids), max(32, (1 << 31) // (2 * c.heads * size) // 32 * 32))
     for _ in range(2):
