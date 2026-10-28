@@ -1,7 +1,7 @@
 # Use baretile as a tinygrad device. This adapter compiles tinygrad graphs before scheduling.
 # Movement operations remain views until an operation needs their data. Unsupported operations,
 # including random-number generation and other dtypes, run on tinygrad's CPU device.
-# TinyJit records and replays launches through tensor.jit.
+# TinyJit records and replays launches through tensor.Recording.
 #   import adapters.tinygrad_baretile, then DEV=BARETILE or Tensor(..., device="BARETILE")
 #   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_baretile.py script.py [args]
 # PyTorch uses tinygrad's torch frontend (extra/torch_backend, the "tiny" device).
@@ -21,9 +21,9 @@ from baretile import pci, tensor
 from baretile.chip import Chip
 from baretile.runtime import Runtime
 
-# A View is a small ShapeTracker over a baretile tensor's elements in row-major order. When an op needs the data, the
-# View becomes a tensor of three axes: the tensor as stored, a transpose that a matmul reads in place, one move, or
-# several moves that swap axes.
+# A View is a shape, strides, an offset and a mask over a baretile tensor's elements in row-major order. When an op
+# needs the data, the View becomes a tensor of three axes: the tensor as stored, a transpose that a matmul reads in
+# place, one move, or several moves that swap axes.
 NP = {"fp32": np.float32, "bf16": np.uint16, "int32": np.int32}  # bf16 as raw bits
 
 RT = None  # all workers of the chip, unless you set it first. a process can only open the simulator once
@@ -85,8 +85,8 @@ class Value:
   def covers(self):  # the view is the tensor's elements in some order, maybe broadcast
     return not self.view.mask and math.prod(n for n, s in zip(self.shape, self.view.strides) if s) == math.prod(self.t.shape)
 
-# A matmul reads a bf16 tensor cast to fp32 as the bf16 tensor, and skips the cast. baretile multiplies fp32 by bf16
-# exactly, since bf16 has no lo part, and it reads a bf16 transpose in place.
+# A matmul reads a bf16 tensor cast to fp32 as the bf16 tensor, and skips the cast. That loses nothing, since a bf16
+# value has no lo part, and it saves a product. The matmul also reads a bf16 transpose in place.
 def uncast(v):
   if isinstance(v, Value) and v.t.op == "cast" and v.t.dtype == "fp32" and v.t.srcs[0].dtype == "bf16":
     return Value(v.t.srcs[0], v.view, dtypes.bfloat16)
@@ -131,7 +131,7 @@ def materialize(v, groups=None):
   if m is not None:
     return t.move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
   if (p := transposes(v)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
-  return upload(download(v).reshape(shape3), v.t.dtype)
+  return upload(download(v), v.t.dtype, shape3)
 
 def transposes(v):
   """Convert an axis permutation, such as (B, T, H, D) to (B, H, T, D), into moves that swap two groups of
@@ -195,15 +195,15 @@ def spread(t, shape, groups):  # expand an elementwise result to shape when all 
   shape3 = tuple(math.prod(shape[k] for k in g) for g in groups)
   return t if t.shape == shape3 else t.expand(*shape3)
 
-def reduce(x, axes, op):
-  """Reduce x over axes using sum or max. Return a baretile tensor with the remaining axes in row-major order.
-  Reduce directly when axes covers the first or last one or two tensor dimensions; otherwise move the
-  reduced axes to the end first."""
-  kept = [k for k in range(len(x.shape)) if k not in axes]
+def reduce(x, n, op):
+  """Reduce x over its first n axes using sum or max, as tinygrad's REDUCE does. Return a baretile tensor with the
+  remaining axes in row-major order. Reduce directly when those axes are the tensor's first one or two dimensions
+  as stored, or its last one or two once they're moved to the end; otherwise move them to the end first."""
+  axes, kept = list(range(n)), list(range(n, len(x.shape)))
   w = x.view.permute(kept + list(axes))
   f = math.prod(x.shape[k] for k in axes)
   b, r, c = x.t.shape
-  w_whole, front = w.contiguous() and math.prod(w.shape) == b * r * c, x.whole() and list(axes) == list(range(len(axes)))
+  w_whole, front = w.contiguous() and math.prod(w.shape) == b * r * c, x.whole()
   if w_whole and c == f: t, along = x.t, [2]
   elif w_whole and r * c == f: t, along = x.t, [2, 1]
   elif front and b == f: t, along = x.t, [0]
@@ -313,7 +313,7 @@ class Evaluator:
     return None
 
   def reduce(self, u, x):  # REDUCE(op, n) reduces the first n axes of x
-    return Value(reduce(x, list(range(u.arg[1])), "sum" if u.arg[0] is Ops.ADD else "max"), View(tuple(u.shape)), u.dtype)
+    return Value(reduce(x, u.arg[1], "sum" if u.arg[0] is Ops.ADD else "max"), View(tuple(u.shape)), u.dtype)
 
   def matmul(self, u):
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
@@ -381,7 +381,7 @@ class Evaluator:
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a REDUCE may make a matmul of them
     if u.op is Ops.CONST: return u.arg
     if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape. else values, stacked on the host
-    if u.op in (Ops.BUFFER, Ops.ALLOC): return self.read(u)  # its contents before any STORE in this graph
+    if u.op is Ops.BUFFER: return self.read(u)  # its contents before any STORE in this graph
     if u.op is Ops.COPY and on_baretile(u) and isinstance(v := self.read(srcs[0]), Tensor) and u.dtype in DTYPES and v.ndim:
       return to_chip(v, u.dtype)
     if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return self.read(srcs[0])
@@ -414,7 +414,7 @@ class Evaluator:
     return Value(h.value.t, View(u.shape), u.dtype)
 
   def now(self, x):  # x, a buffer or a view of one, as the buffers hold it after the STOREs so far
-    if x.op in (Ops.BUFFER, Ops.ALLOC): return self.read(x)
+    if x.op is Ops.BUFFER: return self.read(x)
     if x.op is Ops.AFTER: return self.now(x.src[0])
     v = self.now(x.src[0])
     return self.movement(x, v) if isinstance(v, Value) else self.on_host(x, [v] + [self.values.get(s) for s in x.src[1:]])
@@ -422,7 +422,7 @@ class Evaluator:
   def read(self, v):
     """Return v, resolving buffers to their current contents. A BARETILE buffer contains a chip value or bytes;
     other devices supply bytes."""
-    if not (isinstance(v, UOp) and v.op in (Ops.BUFFER, Ops.ALLOC)): return v
+    if not (isinstance(v, UOp) and v.op is Ops.BUFFER): return v
     buf = v.buffer
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_baretile(v):
@@ -440,9 +440,9 @@ class Evaluator:
     """Store value into target, reshaping if needed. Writes through a view update part of the buffer on the
     host and replace its bytes. Values read before that write retain the old contents."""
     chain = []
-    while target.op not in (Ops.BUFFER, Ops.ALLOC):
+    while target.op is not Ops.BUFFER:
       ok = target.op in (Ops.RESHAPE, Ops.AFTER, Ops.DETACH, Ops.SHRINK, Ops.PERMUTE) or target.op is Ops.STAGE and target.arg is None
-      assert ok, f"can't store into {target.op}"
+      if not ok: raise NotImplementedError(f"can't store into {target.op}")
       chain, target = chain + [target], target.src[0]
     if target.buffer.nbytes == 0: return None
     buf = target.buffer.ensure_allocated()
@@ -452,14 +452,15 @@ class Evaluator:
       for u in reversed(chain):
         if view is None or u.op in (Ops.AFTER, Ops.DETACH, Ops.STAGE): continue  # a bare STAGE keeps its source's buffer
         view = view.reshape(tuple(u.shape)) if u.op is Ops.RESHAPE else view.permute(u.arg) if u.op is Ops.PERMUTE else view.shrink(self.marg(u))
-      assert view is not None and on_baretile(target) and isinstance(buf._buf, Holder), "a partial store needs a BARETILE buffer and a view"
+      if not (view is not None and on_baretile(target) and isinstance(buf._buf, Holder)):
+        raise NotImplementedError("a partial store needs a BARETILE buffer and a view")
       a = np.frombuffer(contents(buf._buf) or bytes(buf.nbytes), npd).copy()
       a[indices(view)] = np.broadcast_to(host(value, target.dtype), view.shape)
       buf._buf.set(a.tobytes())
       return None
     if isinstance(buf._buf, Part): raise NotImplementedError("storing into part of a BARETILE buffer is not supported")
     data = lambda: host(value, target.dtype)
-    if not on_baretile(target): note_host_work(); buf.copyin(memoryview(flat(data(), n, npd)))
+    if not on_baretile(target): note_host_work(); buf.allocator._copyin(buf._buf, memoryview(flat(data(), n, npd)))  # as tinygrad's _frompy
     elif isinstance(value, Value):
       # if the view is the tensor as stored, keep the tensor and its three axes. copy a tensor that's computed already,
       # since a replay writes over its tensors in place
@@ -506,7 +507,7 @@ class BaretileAllocator(Allocator):
 class BaretileDevice(Compiled):
   def __init__(self, device): super().__init__(device, BaretileAllocator(self), [], None)
   def synchronize(self, timeout=None):
-    if RT is not None: RT.wait(60 if timeout is None else timeout)
+    if RT is not None: RT.wait(60 if timeout is None else timeout / 1000)  # tinygrad's timeouts are in milliseconds
 
 # inline a tinygrad function as its body, which stores its outputs. precompiled functions too, since tinygrad would
 # cache their program, and baretile runs the graph
@@ -595,7 +596,7 @@ tinygrad.engine.jit._TinyJit.__call__ = tinyjit
 
 if __name__ == "__main__":  # run a tinygrad script on baretile, unchanged
   from tinygrad.helpers import DEV
-  assert len(sys.argv) > 1, "usage: python3 adapters/tinygrad_baretile.py script.py [its arguments]"
+  if len(sys.argv) < 2: sys.exit("usage: python3 adapters/tinygrad_baretile.py script.py [its arguments]")
   DEV.value = "BARETILE"
   sys.argv = sys.argv[1:]
   sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
