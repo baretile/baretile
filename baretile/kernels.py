@@ -672,7 +672,7 @@ def attention_store(ht, rows, wt, parts):
 def attention_parts(ht, rows, wt, kt, units, workers):
   """Choose how many workers share a unit's kt key tiles when Tensor.attend has no explicit parts argument.
 
-  Keep units with more than two tile rows of queries together. For one or two tile rows, use up to 8 parts
+  For query tensors with more than 64 rows, use one key part per unit. For smaller tensors, use up to 8 parts
   with at least 8 key tiles per part, limited by the available workers. Combining parts costs additional
   launches. If the keys still exceed attention_store's capacity, increase the number of parts, up to 8."""
   room = lambda P: attention_store(ht, rows, wt, P)[1]

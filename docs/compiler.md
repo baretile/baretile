@@ -29,7 +29,7 @@ matmul. Tile column `j` goes in bank `j % 8`, with consecutive tiles along the
 dimension K that the matmul sums over. A worker can then read several tiles in
 a single request. For block floats, exponents are stored together before the
 values. Use this layout for matmul's B. You can also read it back to the host.
-Other operations raise `ValueError`.
+Cast to bf16 to use ordinary operations on the result.
 
 | Format | Bytes per tile | Notes |
 | --- | ---: | --- |

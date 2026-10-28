@@ -687,8 +687,8 @@ def test_matmul_by_columns(chip):
   # in bank j % 8. Block floats store the run's exponents before its values.
   # The cases cover a token's row: bank-local, with K too long for the slots, and with K cut into a batch. They cover a
   # grid's blocks with K in one part and in several, passes over a row as in a softmax, blocks on one worker, A
-  # streamed beside B, and the experts that tokens pick with index=. B by columns reads back as it was, and any other
-  # use raises ValueError.
+  # streamed beside B, and the experts that tokens pick with index=. B by columns reads back as it was; ordinary
+  # arithmetic and movement require casting it back to ordinary tiles.
   rng = np.random.default_rng(43)
   cases = [(None, 1, 1024, 4096, how) for how in ("bf16", "bfp8", "bfp4")] + [
     (None, 1, 1024, 4000, "bf16"), ("row", 1, 9600, 512, "bfp4"), (None, 1, 2048, 1024, "bfp8"), (None, 320, 1024, 416, "bfp8"),

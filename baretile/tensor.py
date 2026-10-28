@@ -45,7 +45,7 @@ class Tensor:
     self.requires_grad = on
     return self
   def _where(self, runs=False):  # the address and tile strides a kernel reads it by, or for a tensor by columns, its runs
-    if self.runs and not runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
+    if self.runs and not runs: raise ValueError("cast a tensor by columns to bf16 for operations other than matmul's B or readback")
     return (self.addr, *self.runs) if self.runs else (self.addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
@@ -448,7 +448,7 @@ class Tensor:
   def columns(self):
     """Store each tile column of B together so matmul can read several tiles along K per request.
     Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
-    readback and use as matmul's B, including indexed selection and splits along K."""
+    readback and use as matmul's B, including indexed selection and splits along K. Cast to bf16 for ordinary operations."""
     if self.dtype not in ("bf16", *BFP): raise ValueError(f"columns lays out a matmul's B, which is bf16 or a block float, not {self.dtype}")
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
@@ -538,7 +538,7 @@ class Tensor:
     if rt is self.rt or self.rt.log is not None or rt.log is not None:
       raise ValueError("to requires different runtimes with neither recording launches")
     x = self.realize()
-    if x.runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
+    if x.runs: raise ValueError("cast a tensor by columns to bf16 before transferring it to another chip")
     if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # copy a view into a tensor of its own first
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
     x.rt.wait(), rt.wait()
@@ -875,7 +875,7 @@ def _expr(t, shape, inputs, kernel):
   or two reductions are already included."""
   if t.op is None:
     assert t.dtype == kernel[3], f"a {t.dtype} input to a {kernel[3]} kernel"
-    if t.runs: raise ValueError("a tensor by columns can only be a matmul's B, or read back")
+    if t.runs: raise ValueError("cast a tensor by columns to bf16 for operations other than matmul's B or readback")
     return _input(t, inputs)
   if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0], shape, inputs, kernel))
   if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
