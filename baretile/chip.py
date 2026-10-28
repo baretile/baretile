@@ -7,19 +7,20 @@ def tlb_config(**fields):
   cfg = 0
   for name, val in fields.items():
     first, width = bh.TLB_FIELDS[name]
-    assert 0 <= val < 1 << width, f"TLB {name}={val:#x} does not fit in {width} bits"
+    if not (0 <= val < 1 << width): raise ValueError(f"TLB {name}={val:#x} does not fit in {width} bits")
     cfg |= val << first
   return cfg
 
 class Chip:
   # boot is how long to wait for ARC firmware, in seconds. After a reset it takes minutes, and umd allows 300.
   def __init__(self, pci, boot=2.0):
-    assert (ids := pci.cfg_read(0)) == bh.VENDOR | bh.DEVICE << 16, f"not a Blackhole: {ids:#x}"
+    if (ids := pci.cfg_read(0)) != bh.VENDOR | bh.DEVICE << 16: raise RuntimeError(f"not a Blackhole: {ids:#x}")
     self.pci, self.target = pci, None  # TLB 0 is the shared window, and map hands out the others
     self.taken = {}  # (start, end) -> the cores of each rectangle that a Runtime has taken
     self.free_tlbs, self.kept = iter(range(1, bh.TLB_COUNT)), {}
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
-    assert int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED, "NoC coordinate translation is off, but bh.py assumes it"
+    if not (int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED):
+      raise RuntimeError("NoC coordinate translation is off, but bh.py assumes it")
     self.arc_msg(bh.ASIC_STATE0)  # leave the state that tt-kmd puts the chip in when it lets go of it
     self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_TELEMETRY[0]), "publish its telemetry", boot)
@@ -30,7 +31,7 @@ class Chip:
     while abs(self.telemetry().get(bh.TAG_AICLK, 0) - busy) > 0.05 * busy and time.monotonic() < end: self.pci.tick()
     t = self.telemetry()
     missing = {bh.TAG_AICLK, bh.TAG_GDDR_STATUS, bh.TAG_TENSIX_COLS, bh.TAG_GDDR_ENABLED} - t.keys()
-    assert not missing, f"ARC telemetry is missing tags {sorted(missing)}. Is the firmware too old?"
+    if missing: raise RuntimeError(f"ARC telemetry is missing tags {sorted(missing)}. Is the firmware too old?")
     self.aiclk = t[bh.TAG_AICLK]  # MHz, after asking for busy
     self.tensix = [(x, y) for y in bh.TENSIX_Y for x in bh.TENSIX_X[:t[bh.TAG_TENSIX_COLS].bit_count()]]
     table = lambda at: [int.from_bytes(pci.read(at + i // 6 * 4, 4), "little") >> i % 6 * 5 & 31 for i in range(32)]
@@ -41,7 +42,7 @@ class Chip:
     training = lambda: [self.telemetry()[bh.TAG_GDDR_STATUS] >> 2 * b & 3 for b in self.banks]
     self.wait(lambda: 0 not in training(), "finish GDDR training", 300)
     bad = [b for b, s in zip(self.banks, training()) if s != 1]
-    assert not bad, f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)"
+    if bad: raise RuntimeError(f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)")
 
   def raw(self, x, y): return (x if y < 2 else self.noc_x[x]), self.noc_y[y]  # tile (x, y) on the raw NoC0 grid, for bh.hops
 
@@ -101,14 +102,14 @@ class Chip:
     wptr, rptr = self.read32(x, y, req_w), self.read32(x, y, resp_r)
     # drop any response that nobody read, left by a client that died. kmd does the same
     if (left := self.read32(x, y, resp_w)) != rptr: self.write32(x, y, resp_r, rptr := left)
-    assert (wptr - self.read32(x, y, req_r)) % (2 * n) < n, "ARC message queue full"
+    if (wptr - self.read32(x, y, req_r)) % (2 * n) >= n: raise RuntimeError("ARC message queue full")
     self.write(x, y, q + entry + wptr % n * entry, struct.pack("<8I", header, *[0] * 7))
     self.write32(x, y, req_w, (wptr + 1) % (2 * n))
     self.write32(x, y, *bh.ARC_IRQ)
     self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", 1.0)
     resp = struct.unpack("<8I", self.read(x, y, q + entry * (1 + n + rptr % n), entry))
     self.write32(x, y, resp_r, (rptr + 1) % (2 * n))
-    assert resp[0] & 0xFF < bh.ARC_FAILED, f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}"
+    if resp[0] & 0xFF >= bh.ARC_FAILED: raise RuntimeError(f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}")
     return resp
 
   def telemetry(self):
@@ -138,8 +139,8 @@ class Chip:
     still be reading src when this returns. Leave src unchanged until the queue is free; the next send waits
     for it."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
-    assert min(src, dst) >= 0 and n > 0 and src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE, \
-      "Ethernet addresses and size must be 16-byte aligned and stay below firmware L1"
+    if not (min(src, dst) >= 0 and n > 0 and src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE):
+      raise ValueError("Ethernet addresses and size must be 16-byte aligned and stay below firmware L1")
     def free():  # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)
       self.read32(x, y, reg("CMD"))
       return not self.read32(x, y, reg("STATUS")) & bh.ETH_BUSY
