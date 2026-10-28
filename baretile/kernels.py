@@ -175,7 +175,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   assert not (dst and matmuls), "only bf16 kernels have matmuls"
   base = FRAMES + 2 * frame + len(ops)  # the first slot past the frames and the narrow ops
   rows_at, top = [], base  # where each matmul keeps its row of A in L1, or None if it doesn't fit and A streams too
-  if not (top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS and len(matmuls) <= 16):
+  if not (top <= UNPACKABLE and slot_base(dtype) + top * tile_bytes(dtype) <= OUTS):
     raise ValueError("too many tiles in a kernel")
   for j in matmuls:
     fits = top + ops[j]["kt"] <= UNPACKABLE
@@ -741,7 +741,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
     for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ & 1; {pass1} }}
     {end}
   }}"""
-  part = "(!empty && (kt < f0 || kt >= f1))"  # a key tile that some row sees part of. BRISC builds its mask tiles
+  partial = "(!empty && (kt < f0 || kt >= f1))"  # a key tile that some row sees part of. BRISC builds its mask tiles
   ob = f"e * {parts} + part" if parts > 1 else "e"  # the result's batch entry
   # For each unit, BRISC reads the places and works out the key tiles from them: k0 to k1, and the unmasked ones from f0
   # up to f1. With parts, it takes this part's share. It tells the TRISCs as if a frame were fetched.
@@ -766,7 +766,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
                      f"noc_get(BANK(t), at + 64, store[n / {rows_a}] + {64 * rows_a * ht} + {BFP[wt]} * z, {BFP[wt]}); }}")
   else: stored = f"for (unsigned m = 0; m < {ht}; m++) get(a[10], {tile_of(10, f'e / {rep}', 'kt', 'm')}, {store} + (kt - k0) * {ht} + m);"
   keys = lambda values: f"if (!{kept}) {{ {framed} }}" + (f" else {{ {stored} }}" if not values else "")  # the first sweep fills the store
-  fetch = lambda values: (f"reached(frame_done[fr]); if {part} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " + keys(values) +
+  fetch = lambda values: (f"reached(frame_done[fr]); if {partial} {{ " + each(f"masked({mask('r')}, r, kt);") + " } " + keys(values) +
                           (f" for (unsigned j = 0; j < {ht}; j++) "
                            f"{getk}(a[14], {tile_of(14, f'e / {rep}', 'kt', 'j')}, {into(val('j'))});" if values else "") +
                           f" l1_settle(SLOT({mask(0)})); ready(); frame_done[fr] = ++events;")
@@ -784,7 +784,7 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
   on_v, off_v = (region(lambda f: bfp_b(wt, 2 * ht, f)), tt(bfp_b(wt, 0))) if wt else ("", "")
   # row r's queries and a tile row of keys, in pairs: a key tile into SrcA, a query tile into SrcB
   walk_k = f"{on_k} {tt([setadc(bh.UNPACK1, f'{q_row} + r * {ht}'), setadc(bh.UNPACK0, first_key)])} {tt([Loop(ht, PAIR)])} {off_k}"
-  the_mask = f"empty ? {none} : {part} ? {mask('r')} : {ZERO_SLOT}"
+  the_mask = f"empty ? {none} : {partial} ? {mask('r')} : {ZERO_SLOT}"
   largest = f"{m_slot} + r"
   drain_upto = f"for (; drained < upto; drained++) {{ {tt(TAKE_L1)} }}"  # until the last tile's largests are packed
   unpacker = units(f"fetched(); {read} {tt(REPORT)}",

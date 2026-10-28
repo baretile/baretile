@@ -180,15 +180,15 @@ def preflight(bdf):
   else: found.append(("ok", "no driver has the card"))
   return found
 
-def release(bdf, driver=DRIVER):
-  """Bind the card to its kernel driver again, tt-kmd's by default, so TT-NN and tt-smi can use it after Card
-  unbound it. Run it once no process has the card open through baretile. A card that a driver has is left alone.
-  Return the name of the driver that has the card."""
+def release(bdf):
+  """Bind the card to tt-kmd's driver again, so TT-NN and tt-smi can use it after Card unbound it. Run it once no
+  process has the card open through baretile. A card that a driver has is left alone. Return the name of the driver
+  that has the card."""
   if os.geteuid() != 0: raise PermissionError("release needs root to bind a driver through sysfs")
   if os.path.exists(at := f"{SYS}/devices/{bdf}/driver"): return pathlib.Path(os.path.realpath(at)).name
-  if not os.path.exists(f"{SYS}/drivers/{driver}"): raise RuntimeError(f"no {driver} driver is loaded. Load tt-kmd: modprobe {driver}")
-  _write(f"{SYS}/drivers/{driver}/bind", bdf)
-  return driver
+  if not os.path.exists(f"{SYS}/drivers/{DRIVER}"): raise RuntimeError(f"no {DRIVER} driver is loaded. Load tt-kmd: modprobe {DRIVER}")
+  _write(f"{SYS}/drivers/{DRIVER}/bind", bdf)
+  return DRIVER
 
 def open_device(n=0):
   """Open chip n. With TTSIM=/path/to/libttsim.so that's chip n of the simulator, which has several in a multi-chip

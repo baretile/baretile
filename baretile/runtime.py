@@ -332,7 +332,7 @@ class Runtime:
     back = 64 + ring + 16 * TIMES
     if back + 4096 > 1 << 21: raise ValueError("the ring leaves no room in the hugepage to read a tile back")
     if start not in chip.tensix or end not in chip.tensix: raise ValueError("runtime endpoints must be available Tensix tiles")
-    if chip.banks != list(range(len(bh.DRAM))): raise ValueError("the runtime needs all eight DRAM banks")
+    if chip.banks != list(range(len(bh.DRAM))): raise RuntimeError(f"the runtime needs all eight DRAM banks, and the card has {chip.banks}")
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     if len(cores) < 2: raise ValueError("a rectangle needs a dispatcher and at least one worker")
     self.chip, self.launches, self.wptr = chip, 0, 0
