@@ -1044,13 +1044,13 @@ def test_softmax_and_layernorm(chip):
       assert all(abs(gv - ((v - mean) / sd * gm + bt)) <= 0.05 + 0.02 * abs(v) for gv, v, gm, bt in zip(g, row, gamma, beta))
 
 def test_attend(chip):
-  # Tensor.attend computes softmax(q k^T + mask) v, checked against numpy within 1%. The attention kernel produces
+  # Tensor.attend computes softmax(q k^T + mask) v, checked against numpy within 1.1%. FPU product alignment and
+  # rounding probabilities to bf16 contribute error even though maxima and subtraction stay fp32. The kernel produces
   # weighted sums; a separate division normalizes them. The mask excludes future keys and, with a window, keys
   # at least window positions before the query.
   # The cases cover several tile rows of queries, and a key and value head serving two query heads, with the repeat
   # read in place. They cover 256-wide heads that share their positions, a KV cache in bfp8, and keys that end partway
-  # through a tile, with three tile rows of queries. Then come a sliding window, and ten tile rows in units of eight
-  # and of two.
+  # through a tile, with three tile rows of queries. Then come a sliding window, and ten tile rows in units of two.
   # After those, the keys of each unit are shared out among parts, like a decode step does. Its rows share a position,
   # and a 1,024-key bfp8 cache goes in four parts of 8 key tiles, the fewest that attention_parts gives a part. Some
   # rows see none of a part's keys, and with positions below 32, some parts have no keys at all.
@@ -1083,12 +1083,44 @@ def test_attend(chip):
     read, got = reads() - before, value(out)
     s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
     p = np.exp(s - s.max(-1, keepdims=True))
-    close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.01)
+    close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.011)
     assert parts != 1 or kernels(rt, launches) == 2
     # 2 units of 1 + 2 + 8 x 2 + 8 x 2 tiles. Then the division has 4 result tiles, each reading a tile of p v and
     # one of the sums.
     if lo == 200:
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
+
+def test_attention_extremes(chip):
+  rt = Runtime(chip)
+  # Both signs exceed the old bf16 maximum's precision. Empty parts and masked keys must contribute no weight,
+  # including when a finite score exceeds the old -1e9 mask.
+  for rows, query, key, parts in ((1, 100, 100, 1), (1, 100, 100, 2), (1, 100, -100, 2), (70, 10000, 10000, 1), (40, 10000, -10000, 4)):
+    q = Tensor.of(rt, [[query] * 64] * rows)
+    k = Tensor.of(rt, [[key] * 64] * 64)
+    v = Tensor.of(rt, [[1] * 64] * 32 + [[5] * 64] * 32)
+    pos = Tensor.of(rt, [[31]] * rows, "int32")
+    assert np.array_equal(value(q.attend(k, v, pos, parts=parts)), np.ones((1, rows, 64)))
+  q = Tensor.of(rt, [[100] * 64])
+  k = Tensor.of(rt, [[100] * 64] * 32 + [[101] * 64] * 32)
+  v = Tensor.of(rt, [[1] * 64] * 32 + [[2] * 64] * 32)
+  for parts in (1, 2):
+    assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[63]], "int32"), parts=parts)), np.full((1, 1, 64), 2))
+
+def test_attention_capacity(chip):
+  from baretile.kernels import attention_parts, attention_store
+  rt = Runtime(chip)
+  for fmt in ("bf16", "bfp8", "bfp4"):
+    q, k, v = Tensor(rt, 1, 1536), Tensor(rt, 32, 1536, dtype=fmt), Tensor(rt, 32, 1536, dtype=fmt)
+    pos = Tensor.of(rt, [[31]], "int32")
+    before, used = rt.launches, dict(rt.used)
+    for parts in (None, 1, 2):
+      with pytest.raises(ValueError, match="fit in L1"): q.attend(k, v, pos, parts=parts)
+    assert rt.launches == before and rt.used == used, "reject before allocating or submitting an output"
+  assert attention_store(42, 1, None, 1)[1] == 0
+  assert attention_parts(42, 1, None, 2, 1, len(rt.cores)) >= 1
+  q, k = Tensor.of(rt, [[0] * 1344]), Tensor.of(rt, [[0] * 1344] * 32)
+  v = Tensor.of(rt, [[1] * 1344] * 32)
+  assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[31]], "int32"))), np.ones((1, 1, 1344)))
 
 def test_reduce_axes(chip):
   # sum and max run down the rows, through the batch and along each row, and each is one launch. The padding past the

@@ -420,8 +420,7 @@ SFPU |= {
                 ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0),
                 ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, mod0=RAW)]),
   "one": ([], [sfp_store(ONE)]),  # 1.0 everywhere (a tile of ones)
-  "none": (sfp_const(1, -1e9), [sfp_store(1)]),  # -1e9 everywhere (a mask that hides all keys)
-  "floor": (sfp_const(3, -1e4), [sfp_load(), ins("SFPMOV", vd=1, vc=3), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0)]),  # max(x, -1e4)
+  "none": (sfp_const(1, -math.inf), [sfp_store(1)]),  # -inf everywhere (a mask that hides all keys)
   # rounds an fp32 value to bf16 the way the packer does, half up: add 2^15 to the bits and clear the low 16. the
   # result stays fp32
   "ftob": ([ins("SFPLOADI", vd=2, mod0=2, imm16=0x8000), *sfp_bits(3, 0xFFFF0000)],

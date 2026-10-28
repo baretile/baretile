@@ -3,7 +3,7 @@
 import array, collections, functools, math, operator
 from baretile import bh
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
-from baretile.kernels import attention_parts, attention_store, link_flags
+from baretile.kernels import attention_l1, attention_parts, attention_store, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
                              put_kernel, readback_kernel, storage_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
 
@@ -625,7 +625,9 @@ class Tensor:
       raise ValueError(f"attend needs heads of one width, 64 or more in steps of 32, and a value for each key: {self.shape} {k.shape} {v.shape}")
     if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32"):
       raise ValueError(f"attend needs places as an int32 column with a row for each query: {places.shape} {places.dtype} for {self.shape}")
-    units, wt = self.batch * -(-ra // 8), k.dtype if k.dtype in BFP else None
+    wt = k.dtype if k.dtype in BFP else None
+    unit_rows = attention_l1(ht, self.rows, wt, parts or 1)[0]
+    units = self.batch * -(-ra // unit_rows)
     P = parts or attention_parts(ht, self.rows, wt, kt, units, len(self.rt.cores))
     q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
