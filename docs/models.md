@@ -17,7 +17,10 @@ handles dense Llama-family models, several mixtures of experts, and the text
 models of Qwen3.5 and Qwen3.6. The tokenizer reads byte-level BPE data from
 `tokenizer.json`. It uses the supplied merge order and `ignore_merges` setting;
 files without a merge list use token IDs as ranks, as in tiktoken. Unsupported
-BPE dropout, subword affixes and byte fallback are rejected when loading.
+BPE dropout, subword affixes, byte fallback and unknown-token replacement are
+rejected when loading. With no unknown token, missing alphabet bytes are skipped
+before merging. Split, Digits and ByteLevel stages run in their configured order;
+ByteLevel prefix-space insertion is unsupported.
 The standalone GPT-2 command also needs `tiktoken`.
 From Python in a checkout, import these helpers with `from models import llama`
 or `from models import serve`. Models and adapters are outside the PyPI package.
