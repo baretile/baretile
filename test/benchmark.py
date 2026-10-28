@@ -35,9 +35,9 @@
 import bz2, glob, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
 from types import SimpleNamespace
 import numpy as np
-sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.join(os.path.dirname(__file__), "..", "models")]
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh, pci
-import cost, gpt2, llama
+from models import cost, gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500, users=32, lengths=(4096, 32768), blocks=None,
@@ -227,7 +227,7 @@ def baretile(folder, prompt, after, top5, book, s):
       out[f"B3 prefill, {n} tokens"] = {"seconds to first token": seconds, "chunk": chunk,
                                         "roofline": roofline(prefill_flops(c, n), seconds, cost.CARD["phases"])}
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run": f"{type(e).__name__}: {e}"}
-  import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
+  from models import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
   places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
   engine = serve.Engine(rt, t | tables(places), c, llama.Tokenizer(folder), s.users, places)
   threading.Thread(target=engine.run, daemon=True).start()

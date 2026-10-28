@@ -9,7 +9,7 @@ from baretile.tensix import (ACROSS, BANKS, DST_FREE, DST_HALF, FILLED, FOLDS, M
                             SFPU_START, SYNC_WORDS, UNPACKABLE, ZERO, Loop, aim, fill, ins, kernel_config, mad, mask_columns, mask_rows, math_program,
                             mul, pack, pack_program, sfp_const, sfp_load, sfp_store, sfpu, slot_base, tile_of, tt, unpack_program)
 from baretile.tensor import Tensor
-import gpt2, llama
+from models import gpt2, llama
 
 def deltanet(h, p, c, state, phases, live=None, accept=None):
   """Apply Qwen3.5/3.6's Gated DeltaNet to this call's tokens and update recurrent state in place.

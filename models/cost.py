@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh
 from baretile.kernels import attention_parts, attention_store, grid_parts
 from baretile.tensix import CHUNKS, tile_bytes
-import llama
+from models import llama
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
 # Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
@@ -49,7 +49,7 @@ CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 
 USE = dict(context=32768, kv="bf16", accept=0.0)
 
 def probed(card, path):  # the card with the probe's numbers in place of the spec's (python3 -m baretile.probe 8 path)
-  p = json.load(open(path))
+  with open(path) as f: p = json.load(f)
   chunks = [p[f"DRAM reads of {f} chunks, {CHUNKS} in flight: grid workers, own banks"] for f in ("bfp8", "bfp4")]  # how decode reads weights
   return card | dict(bandwidth=min(chunks) * 1e9, reach=1.0,
                      tflops=2 * 32**3 / p["matmul step, 1 phase, unpacks included"] * WORKERS * bh.AICLK,
@@ -90,10 +90,10 @@ def shape(c, mode="bf16"):
 
 def session(c, use, speculative=False):
   """Bytes reserved per session for KV caches and DeltaNet states, including the prediction layer. Sliding
-  windows cap the attention rows. Speculative decoding keeps state before and after the draft."""
+  attention still reserves the full context, as llama.kv_cache does. Speculative decoding keeps state
+  before and after the draft."""
   row = 2 * c.kv * llama.head(c) * BYTES[use["kv"]]
-  window = lambda l: c.sliding if c.sliding and llama.windowed(c, l) else use["context"]
-  kv = sum(row * min(use["context"], window(l)) for l in range(c.layers) if not llama.linear(c, l))
+  kv = sum(row * use["context"] for l in range(c.layers) if not llama.linear(c, l))
   draft = c.mtp * row * use["context"]
   linear = sum(llama.linear(c, l) for l in range(c.layers))
   state = (1 + speculative) * linear * 4 * (c.vh * c.kd * c.vd + (c.conv - 1) * (2 * c.kh * c.kd + c.vh * c.vd)) if linear else 0
@@ -181,11 +181,19 @@ def report(folder, mode="bf16", **keys):
   """Estimate memory use, throughput and cost from folder's config.json. mode selects formats;
   keyword arguments override CARD and USE settings."""
   card, use = dict(CARD), dict(USE)
+  if unknown := keys.keys() - (card.keys() | use.keys() | {"probe"}): raise ValueError(f"unknown cost settings: {', '.join(sorted(unknown))}")
   for k, v in keys.items():
     if k != "probe": (card if k in card else use)[k] = v if k == "kv" else float(v)
   if "probe" in keys: card = probed(card, keys["probe"])
+  for k, v in (card | use).items():
+    if k != "kv" and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
+  for k in ("bandwidth", "reach", "tflops", "phases", "years", "pcie"):
+    if card[k] == 0: raise ValueError(f"{k} must be positive")
+  if card["reserve"] >= card["dram"]: raise ValueError("reserve must be smaller than dram")
+  if card["reach"] > 1 or use["accept"] > 1: raise ValueError("reach and accept must be at most one")
+  if use["context"] < 1 or not float(use["context"]).is_integer(): raise ValueError("context must be a positive integer")
   c, name = llama.config(folder), os.path.basename(os.path.normpath(folder))
-  use["context"], use["kv"] = int(use["context"]), keys.get("kv") or llama.precision(c, mode)["kv", None][0]
+  use["context"], use["kv"] = int(use["context"]), llama.precision(c, mode, keys.get("kv"))["kv", None][0]
   s = shape(c, mode)
   cards = math.ceil(s.bytes / (card["dram"] - card["reserve"]))
   room, hour = cards * (card["dram"] - card["reserve"]) - s.bytes, hourly(card) * cards
@@ -193,10 +201,13 @@ def report(folder, mode="bf16", **keys):
          f"{s.bytes / 1e9:.1f} GB on {cards} card{'s' * (cards > 1)}, {room / 1e9:.1f} GB free, ${hour:.3f} an hour"]
   for speculative in (False, True) if c.mtp else (False,):
     one = session(c, use, speculative)
-    most = max(int(room // one.bytes), 1)
+    most = int(room // one.bytes)
     states = f" and {one.state / 1e6:.0f} MB of Gated DeltaNet states" if one.state else ""
     out.append(f"  a session of {use['context']} tokens holds {one.kv / 1e9:.2f} GB of KV cache ({one.kv / use['context'] / 1e3:.1f} KB per token, "
                f"{use['kv']}){states}. {most} sessions fit on the card{'s' * (cards > 1)}")
+    if not most:
+      if not speculative: return "\n".join(out + ["  no room for a session; reduce context or reserve, or increase dram"])
+      continue
     taken = f", {use['accept']:.0%} of drafts accepted" if speculative else ""
     out.append(f"  decode, {'a token and a draft' if speculative else 'one token'} per user per step{taken}:")
     out.append("     users     GB read   step, ms   launches    RISC-V, ms    tok/s per user    total    $/M tokens out"

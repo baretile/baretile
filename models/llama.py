@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile.tensor import Tensor, jit
-import gpt2, qwen
+from models import gpt2, qwen
 
 def fns(x):
   """Adapt NumPy and baretile operations to the same model code. mm accepts fidelity phases for the chip; NumPy
@@ -67,6 +67,8 @@ def precision(c, mode="bf16", kv=None):
                  of a bfp4 value. They're the gate, up and down of the experts and of the shared expert. The rest and
                  the output layer are bfp8 at two phases.
   Outside tt's decode, attention takes four phases."""
+  if mode not in ("bf16", "bfp8", "bfp4", "tt", "experts"): raise ValueError(f"unknown precision mode: {mode}")
+  if kv is not None and kv not in ("bf16", "bfp8", "bfp4"): raise ValueError(f"unknown KV cache format: {kv}")
   four = {"bfp4": ("gate_up",), "tt": ("gate_up",), "experts": ("gate_up", "down")}.get(mode, ())  # the ops in bfp4
   fast = mode in ("tt", "experts")  # one phase for a bfp4 B and two for bfp8, else four
   def entry(op):
@@ -578,7 +580,7 @@ class Tokenizer:
       self.pieces[piece] = [self.ranks[p] for p in parts]
     return self.pieces[piece]
   def encode(self, text, special=False):  # with special, a special token's text becomes that token, as in a chat template
-    if special:
+    if special and self.special:
       return [i for part in self.specials.split(text) if part for i in ([self.special[part]] if part in self.special else self.encode(part))]
     return [i for piece in self.split.findall(unicodedata.normalize("NFC", text) if self.nfc else text) for i in self.bpe(piece.encode())]
   def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")

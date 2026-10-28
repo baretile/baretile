@@ -505,7 +505,8 @@ class BaretileAllocator(Allocator):
 
 class BaretileDevice(Compiled):
   def __init__(self, device): super().__init__(device, BaretileAllocator(self), [], None)
-  def synchronize(self, timeout=None): pass  # reading a chip value back waits for what it needs
+  def synchronize(self, timeout=None):
+    if RT is not None: RT.wait(60 if timeout is None else timeout)
 
 # inline a tinygrad function as its body, which stores its outputs. precompiled functions too, since tinygrad would
 # cache their program, and baretile runs the graph
@@ -597,4 +598,5 @@ if __name__ == "__main__":  # run a tinygrad script on baretile, unchanged
   assert len(sys.argv) > 1, "usage: python3 adapters/tinygrad_baretile.py script.py [its arguments]"
   DEV.value = "BARETILE"
   sys.argv = sys.argv[1:]
+  sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
   runpy.run_path(sys.argv[0], run_name="__main__")
