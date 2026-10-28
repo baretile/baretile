@@ -329,6 +329,37 @@ def test_llama_load(tmp_path):
   out = llama.forward([3, 7], [0, 1], llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros))
   assert out.shape == (1, vocab) and np.isfinite(out).all()
 
+def test_bpe_merge_order(tmp_path):
+  # Vocabulary IDs need not order BPE merges. The whole piece only bypasses merges with ignore_merges; an explicit
+  # empty list means no merges. Test both tokenizer.json encodings of a pair and the tie's leftmost occurrence.
+  vocab = {"a": 0, "b": 1, "c": 2, "ab": 3, "bc": 4, "abc": 5}
+  for pairs, want in (([("b", "c"), ("a", "b"), ("ab", "c")], [0, 4]),
+                      ([("a", "b"), ("b", "c"), ("ab", "c")], [5]), ([], [0, 1, 2])):
+    for strings in (False, True):
+      for ignore in (False, True):
+        model = dict(type="BPE", vocab=vocab, merges=[" ".join(p) if strings else p for p in pairs], ignore_merges=ignore)
+        (tmp_path / "tokenizer.json").write_text(json.dumps({"model": model}))
+        tok = llama.Tokenizer(str(tmp_path))
+        assert tok.encode("abc") == ([5] if ignore else want)
+        assert tok.encode("abcabc") == want * 2
+        assert tok.decode(tok.encode("abcabc")) == "abcabc"
+  for settings in (dict(type="Unigram"), dict(dropout=0.1), dict(continuing_subword_prefix="##"),
+                   dict(merges=["a c"]), dict(merges=[None]), dict(merges=None)):
+    (tmp_path / "tokenizer.json").write_text(json.dumps({"model": dict(type="BPE", vocab=vocab) | settings}))
+    with pytest.raises(ValueError, match="Tokenizer"): llama.Tokenizer(str(tmp_path))
+
+
+def test_generation_defaults():
+  # A nonempty generation config without EOS inherits the selected text model's token, even in a multimodal config.
+  model = dict(eos_token_id=1, temperature=0.8, text_config=dict(eos_token_id=2, top_k=30))
+  assert serve.generation_defaults(model, {"temperature": 0.5}) == ([2], dict(temperature=0.5, top_k=30))
+  assert serve.generation_defaults(model, {"eos_token_id": [3, 4]})[0] == [3, 4]
+  assert serve.generation_defaults(model, {"eos_token_id": None})[0] == []
+  assert serve.generation_defaults({"eos_token_id": 1, "text_config": {"top_p": 0.9}}, {"temperature": 0.5}) == \
+    ([1], dict(top_p=0.9, temperature=0.5))
+  assert serve.generation_defaults({}, {}) == ([], {})
+
+
 def test_tokenizer(tmp_path):
   # llama.Tokenizer must encode like tiktoken over the same tokenizer.json, and decode back, with the pre-tokenizers of
   # Llama 3, SmolLM, Qwen (NFC first) and gpt-oss. It spells out \p{L}, \p{N} and \s for Python's re, whose \s also

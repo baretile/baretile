@@ -15,7 +15,10 @@ so one disagreement won't make the rest of the comparison useless.
 `llama.load` reads a local Hugging Face config and safetensors weights. It
 handles dense Llama-family models, several mixtures of experts, and the text
 models of Qwen3.5 and Qwen3.6. The tokenizer reads byte-level BPE data from
-`tokenizer.json`. The standalone GPT-2 command also needs `tiktoken`.
+`tokenizer.json`. It uses the supplied merge order and `ignore_merges` setting;
+files without a merge list use token IDs as ranks, as in tiktoken. Unsupported
+BPE dropout, subword affixes and byte fallback are rejected when loading.
+The standalone GPT-2 command also needs `tiktoken`.
 From Python in a checkout, import these helpers with `from models import llama`
 or `from models import serve`. Models and adapters are outside the PyPI package.
 
@@ -109,6 +112,10 @@ transfer encoding. Expired bodies get HTTP 408; oversized bodies get HTTP 413.
 At most 32 connections have active handlers; additional connections get HTTP
 503. `serve.server` exposes these limits as `input_wait`, `body_limit` and
 `connections`.
+
+EOS tokens and sampling defaults are resolved per field from the generation
+config, then the selected text-model config, then the outer model config. An
+explicit null EOS disables automatic end tokens.
 
 The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request

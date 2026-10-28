@@ -564,16 +564,33 @@ def python_regex(pat):
 
 class Tokenizer:
   """Encode and decode byte-level BPE using tokenizer.json, without a tokenizer library.
-  Split text with the tokenizer's regular expression. Keep a piece that's already in the vocabulary;
-  otherwise merge byte pairs in rank order. Token IDs supply the merge ranks. Special-token spellings
-  are ordinary text unless encode is called with special=True."""
+  Split text with the tokenizer's regular expression and apply its ordered merges. ignore_merges keeps
+  whole vocabulary pieces; files without a merges list use token IDs as ranks, like tiktoken. Special-token
+  spellings are ordinary text unless encode is called with special=True."""
   def __init__(self, folder):
     t = read_json(os.path.join(folder, "tokenizer.json"))
+    model = t["model"]
+    if model.get("type", "BPE") != "BPE": raise ValueError("Tokenizer needs a byte-level BPE model")
+    if model.get("dropout") or model.get("continuing_subword_prefix") or model.get("end_of_word_suffix") or model.get("byte_fallback"):
+      raise ValueError("Tokenizer needs deterministic byte-level BPE without subword affixes or byte fallback")
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
     byte = dict(zip(map(chr, bs + [256 + i for i in range(256 - len(bs))]), bs + [b for b in range(256) if b not in bs]))
-    special = {a["content"]: a["id"] for a in t["added_tokens"]}
-    self.ranks = {bytes(byte[ch] for ch in tok): i for tok, i in t["model"]["vocab"].items() if tok not in special}
-    self.bytes = {i: b for b, i in self.ranks.items()} | {i: s.encode() for s, i in special.items()}
+    special = {a["content"]: a["id"] for a in t.get("added_tokens", [])}
+    encoded = lambda tok: bytes(byte[ch] for ch in tok)
+    self.vocab = {encoded(tok): i for tok, i in model["vocab"].items() if tok not in special}
+    self.merges = None
+    if "merges" in model:
+      if not isinstance(model["merges"], list): raise ValueError("Tokenizer needs BPE merges as a list")
+      self.merges = {}
+      for rank, pair in enumerate(model["merges"]):
+        pair = pair.split(" ") if isinstance(pair, str) else pair
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(part, str) for part in pair):
+          raise ValueError(f"Tokenizer needs BPE merges of two strings: {pair}")
+        if any(part not in model["vocab"] for part in (*pair, "".join(pair))):
+          raise ValueError(f"Tokenizer needs BPE merges of two vocabulary pieces: {pair}")
+        self.merges[tuple(map(encoded, pair))] = rank
+    self.ignore_merges = model.get("ignore_merges", self.merges is None)
+    self.bytes = {i: b for b, i in self.vocab.items()} | {i: s.encode() for s, i in special.items()}
     self.special, self.specials = special, re.compile("(" + "|".join(map(re.escape, sorted(special, key=len, reverse=True))) + ")")
     pre = t.get("pre_tokenizer") or {}  # the split before BPE. Llama 3's tokenizer.json has its own, else we use SmolLM's
     split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
@@ -582,12 +599,14 @@ class Tokenizer:
 
   def bpe(self, piece):  # a piece's bytes as ids
     if piece not in self.pieces:
-      parts = [piece] if piece in self.ranks else [piece[i:i + 1] for i in range(len(piece))]
+      parts = [piece] if self.ignore_merges and piece in self.vocab else [piece[i:i + 1] for i in range(len(piece))]
       while len(parts) > 1:
-        rank, i = min((self.ranks.get(a + b, math.inf), i) for i, (a, b) in enumerate(zip(parts, parts[1:])))
+        ranks = (self.vocab.get(a + b, math.inf) if self.merges is None else self.merges.get((a, b), math.inf)
+                 for a, b in zip(parts, parts[1:]))
+        rank, i = min((rank, i) for i, rank in enumerate(ranks))
         if rank == math.inf: break
         parts[i:i + 2] = [parts[i] + parts[i + 1]]
-      self.pieces[piece] = [self.ranks[p] for p in parts]
+      self.pieces[piece] = [self.vocab[p] for p in parts]
     return self.pieces[piece]
   def encode(self, text, special=False):  # with special, a special token's text becomes that token, as in a chat template
     if special and self.special:
