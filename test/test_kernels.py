@@ -243,6 +243,16 @@ def test_tensor_inputs(chip):
     with pytest.raises(ValueError, match="positive"): x.topk(k, parts)
   for op in (lambda: x.sum(1.5), lambda: x.cat(x, axis=1.5), lambda: x.split(1.5), lambda: x.topk(1.5)):
     with pytest.raises(TypeError): op()
+  # realize writes into a plain destination only from an unrealized tensor, and a block float moves only as a matmul's
+  # B. merge needs whole tiles, and a matmul by index has no gradient.
+  b, w = Tensor.of(rt, [[1.0] * 32] * 32), Tensor.zeros(rt, 32, 32, 2)
+  with pytest.raises(ValueError, match="unrealized"): b.realize(Tensor.zeros(rt, 32, 32))
+  with pytest.raises(ValueError, match="repeat"): (Tensor.zeros(rt, 32, 32, 4) + 1).realize(Tensor.zeros(rt, 32, 32).repeat_interleave(4))
+  with pytest.raises(ValueError, match="block float"): b.cast("bfp8").T.realize()
+  with pytest.raises(ValueError, match="tiles wide"): Tensor.zeros(rt, 2, 3, 2).merge()
+  with pytest.raises(ValueError, match="block-float B"): b.matmul(w.float(), index=Tensor.of(rt, [[1]], "int32"))
+  picked = b.requires_grad_().matmul(w, index=Tensor.of(rt, [[1]], "int32"))
+  with pytest.raises(NotImplementedError, match="by index"): picked.sum().backward()
 
 def test_bf16_special_values(chip):
   # Host conversion must keep NaNs as NaNs, including payloads that would round to infinity or overflow 16 bits.
