@@ -498,7 +498,8 @@ def test_matmul_parts(chip):
     reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in rt.cores)
     kp, q, _ = grid_parts(-(-m // 32), -(-n // 32), k // 32, rt.grid, base, 2)  # this case goes in parts
     w = -(-n // 32)
-    groups = -(-(-(-w // min(len(rt.grid[0]), w))) // q)  # groups of columns in each worker's block
+    bq = -(-w // min(len(rt.grid[0]), w))  # columns of result tiles in each worker's block, as in grid_parts
+    groups = -(-bq // q)  # and the groups they're taken in
     a, b = bf16(rng.uniform(-1, 1, (m, k))), bf16(rng.uniform(-1, 1, (k, n)))
     tb = Tensor.of(rt, b.T.tolist()).T if how == "T" else Tensor.of(rt, b.tolist()).cast(how).realize()
     x = Tensor.of(rt, a.tolist())
