@@ -156,13 +156,22 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
   for name, j in (("neighbours", 1), ("far apart", workers - 1)):
     cycles = timed(k["ping"], (0, j, bh.noc_xy(*first), bh.noc_xy(*rt.cores[j]), rounds, rt.launches << 16), workers, at=8)
     rows.append((f"NoC round trip, {name}", cycles / rounds, None, "cycles"))
-  # PCIe: upload into DRAM through the BAR, and read back by the chip writing into host memory
+  # PCIe: upload into DRAM as frombytes does, by the chip reading host memory from tensor.DMA_UPLOAD bytes on; the same
+  # bytes written through the BAR, as frombytes does below that; and read back by the chip writing into host memory.
+  # Then zeros written by the chip, as Tensor.zeros makes a model's caches.
   start = time.perf_counter()
   t = Tensor.frombytes(rt, upload // 4096, 2048, bytes(upload))
   rows.append(("upload over PCIe", upload / (time.perf_counter() - start) / 1e9, None, "GB/s"))
   start = time.perf_counter()
+  for b in range(len(bh.DRAM)): chip.write(*bh.DRAM[b], t.addr, bytes(upload // len(bh.DRAM)))
+  rows.append(("upload over PCIe, through the BAR", upload / (time.perf_counter() - start) / 1e9, None, "GB/s"))
+  start = time.perf_counter()
   t.tobytes()
   rows.append(("read back over PCIe", upload / (time.perf_counter() - start) / 1e9, None, "GB/s"))
+  start = time.perf_counter()
+  Tensor.zeros(rt, upload // 4096, 2048)
+  rt.wait()
+  rows.append(("zeros written to DRAM on the chip", upload / (time.perf_counter() - start) / 1e9, None, "GB/s"))
   # Launch cost by the size of the rectangle. The launches above used all the workers, and these use one worker, then
   # a row. A launch is one multicast and one count for any rectangle.
   for end in (chip.tensix[1], chip.tensix[len(chip.tensix) // len(bh.TENSIX_Y) - 1]):
