@@ -95,3 +95,7 @@ upload it:
 uv build
 uv publish
 ```
+
+CI builds a wheel from the source distribution and checks its imports and
+visualization template on Python 3.12, 3.13 and 3.14. Before publishing, test the
+built wheel in a clean environment so imports cannot fall back to the checkout.
