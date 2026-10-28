@@ -81,10 +81,12 @@ def test_l1(chip):
   with pytest.raises(ValueError, match="nonnegative"): chip.read(x, y, addr, -4)
 
 def test_dram(chip):
-  addr, data = bh.TLB_WINDOW - 2048, [random.randbytes(4096) for _ in bh.DRAM]  # straddles two 2 MiB windows
-  for (x, y), d in zip(bh.DRAM, data): chip.write(x, y, addr, d)
-  for bank, ((x, y), d) in enumerate(zip(bh.DRAM, data)):
-    for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port}"
+  # Every bank through each of its three ports: across two 2 MiB windows, and at the top of what the allocator uses
+  for addr in (bh.TLB_WINDOW - 2048, bh.DRAM_BANK_SIZE - 4096):
+    data = [random.randbytes(4096) for _ in bh.DRAM]
+    for (x, y), d in zip(bh.DRAM, data): chip.write(x, y, addr, d)
+    for bank, ((x, y), d) in enumerate(zip(bh.DRAM, data)):
+      for port in range(3): assert chip.read(x, y + port, addr, len(d)) == d, f"bank {bank} port {port} at {addr:#x}"
 
 def test_raw_places(chip):
   # Each Tensix is where the translation tables of the PCIe tile put it, as its NIU reports. The DRAM ports are raw
@@ -279,6 +281,21 @@ def test_relaunch_without_reset(chip):
     rt.launch(image)
     rt.wait()
     assert rt.loaded == {image: KERNELS} and all(chip.read32(x, y, rt.args() + 4) == i + k % 2 + 1 for i, (x, y) in enumerate(cores))
+
+def test_host_memory(chip):
+  # A worker reads 64 KiB of host memory through the PCIe tile and writes it back to another part of the hugepage, as
+  # the dispatcher's command reads, uploads and readback do. That's several NoC packets and PCIe requests each way.
+  rt, n = Runtime(chip, end=chip.tensix[1]), 64 * 1024
+  rt.back[:n], rt.back[n:2 * n] = (data := random.randbytes(n)), bytes(n)
+  src, dst = rt.back_bus, rt.back_bus + n
+  rt.launch(compile_kernel("""
+void kmain(volatile unsigned *a) {  // a: [index, 1, PCIe x, y, source low, high, destination low, high, bytes]
+  noc_read(a[2], a[3], a[4] | (unsigned long long)a[5] << 32, L1_DATA, a[8]);
+  noc_wait();
+  noc_write(L1_DATA, a[2], a[3], a[6] | (unsigned long long)a[7] << 32, a[8]);
+}"""), (*bh.PCIE, src & 0xFFFFFFFF, src >> 32, dst & 0xFFFFFFFF, dst >> 32, n))
+  rt.wait()
+  assert bytes(rt.back[n:2 * n]) == data
 
 def test_kernel_moves_data(chip):
   # Cores pull their 40 KiB slice of DRAM into L1 in 3 NoC packets, add their index to each word, and write the slice
