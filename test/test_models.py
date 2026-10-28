@@ -71,6 +71,61 @@ def test_tinygrad_jit_inputs(chip):
   assert combine(y, x).tolist() == [31, 42] and len(calls) == 5
 
 
+@pytest.mark.parametrize("kind", ["direct", "slice", "reshape", "nested"])
+def test_tinygrad_jit_returned_inputs(chip, kind):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  from tinygrad.nn.state import get_parameters
+  adapter.RT = adapter.RT or Runtime(chip)
+  calls, pins = [], dict(adapter.RT.pinned)
+  @TinyJit
+  def aliases(x):
+    calls.append(1)
+    computed = (x + 1).realize()  # a nonempty capture, even when the only result is an input alias
+    if kind == "direct": return x
+    if kind == "slice": return x[1:]
+    if kind == "reshape": return x.reshape(2, 2)
+    return {"input": x, "nested": [x[1:], (x.reshape(2, 2),)], "computed": computed}
+  for n in (1, 2, 3, 4):
+    values = [float(n + i) for i in range(4)]
+    x = Tensor(values, device="BARETILE").realize()
+    got = [t.tolist() for t in get_parameters(aliases(x))]
+    shaped = [values[:2], values[2:]]
+    want = {"direct": [values], "slice": [values[1:]], "reshape": [shaped],
+            "nested": [values, values[1:], shaped, [v + 1 for v in values]]}[kind]
+    assert got == want and x.tolist() == values, (kind, got, want)
+    assert dict(adapter.RT.pinned) == pins, "returning an input alias releases its discarded capture"
+  assert len(calls) == 4 and aliases.replay is False
+  aliases.reset()
+  assert dict(adapter.RT.pinned) == pins
+
+@pytest.mark.parametrize("store", [False, True])
+def test_tinygrad_jit_failed_capture(chip, store):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  adapter.RT = adapter.RT or Runtime(chip)
+  calls, pins = [], dict(adapter.RT.pinned)
+  @TinyJit
+  def fails_once(x):
+    calls.append(1)
+    out = (x + 1).realize()
+    if store: x.assign(out).realize()
+    if len(calls) == 2: raise RuntimeError("capture failed after launching work")
+    return out
+  x = Tensor([1.0, 2.0], device="BARETILE").realize()
+  assert fails_once(x).tolist() == [2, 3]
+  holder, original = adapter.on_chip(x), adapter.on_chip(x).value
+  with pytest.raises(RuntimeError, match="capture failed"): fails_once(x)
+  assert adapter.recording is None and fails_once.replay is None and dict(adapter.RT.pinned) == pins
+  if store: assert x.tolist() == [3, 4], "stores completed before the exception remain visible"
+  else: assert holder.value is original and x.tolist() == [1, 2], "failed capture restores the caller's input binding"
+  assert fails_once(x).tolist() == ([4, 5] if store else [2, 3])
+  fails_once.reset()
+  assert dict(adapter.RT.pinned) == pins
+
+
 def test_tinygrad_jit_changed_state(chip):
   need_tinygrad()
   from adapters import tinygrad_baretile as adapter
