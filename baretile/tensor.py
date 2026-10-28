@@ -865,23 +865,27 @@ def _input(t, inputs):  # the index of a realized tensor among a kernel's inputs
 class Recording:
   """Record launches and keep their DRAM allocations for replay. Rebuild commands when a kernel has been
   evicted from L1. If the kernels don't fit together, replay reloads them in batches."""
-  def __init__(self, rt): self.rt, self.launches, self.block = rt, [], None
+  def __init__(self, rt): self.rt, self.launches, self.block, self.pins, self.active = rt, None, None, set(), False
+  def close(self):
+    """Release this recording's allocations after queued replays finish. Live tensors keep their storage."""
+    if self.active: raise RuntimeError("cannot close an active recording")
+    self.rt.unpin(self.pins)
+    self.launches, self.block, self.pins = None, None, set()
+  def __del__(self):
+    if not self.active: self.close()
   def __enter__(self):
     if self.rt.log is not None: raise RuntimeError("cannot nest recordings on the same runtime")
-    self.pinned = self.rt.pinned.copy()
-    self.rt.log = []
+    self.close()
+    self.rt.log, self.rt.recorded, self.rt.recorded_bases = [], self.pins, sorted(self.rt.used)
+    self.active = True
     return self
   def __exit__(self, kind, *_):
     self.launches, self.rt.log = self.rt.log, None
-    if kind is not None:  # failed recordings never replay; keep live tensors and release abandoned allocations
-      new = self.rt.pinned - self.pinned
-      self.rt.pinned -= new
-      freed = self.rt.pinned_freed & new
-      self.rt.pinned_freed -= new
-      for addr in freed: self.rt.dram_free(addr)
-      self.launches = []
-    del self.pinned
+    self.rt.recorded, self.rt.recorded_bases, self.active = None, [], False
+    if kind is not None: self.close()
   def send(self):
+    if self.active or self.launches is None: raise RuntimeError("recording is not ready for replay")
+    if self.rt.log is not None: raise RuntimeError("cannot replay while recording on the same runtime")
     if self.block is None or self.block[2] != self.rt.evictions:
       evictions = self.rt.evictions
       self.block = (*self.rt.block(self.launches), evictions)
@@ -910,11 +914,15 @@ def jit(f):
       if x.rt is not runtime: raise ValueError("jit inputs must use the recorded runtime")
       if (x.shape, x.dtype) != (shape, dtype): raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
     if rec is None:
-      inputs = [x.realize() for x in xs]
-      with Recording(rt) as recording: result = f(*inputs).realize()
-      rec, out = recording, result
+      canonical = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x).requires_grad_(x.requires_grad) for x in xs]
+      with Recording(rt) as recording: result = f(*canonical).realize()
+      inputs, rec, out = canonical, recording, result
       return out
-    for x, to in zip(xs, inputs):
+    sources = [x.realize() if x.op is not None else x for x in xs]
+    addresses = {x.addr for x in inputs}
+    # A prior result can expose a canonical input. Snapshot every such source before copying any inputs.
+    sources = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x) if x.addr in addresses else x for x in sources]
+    for x, to in zip(sources, inputs):
       if x is not to: to.assign(x)
     rec.send()
     return out

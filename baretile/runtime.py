@@ -1,6 +1,6 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
+import bisect, collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -422,7 +422,8 @@ class Runtime:
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
-    self.log, self.pinned, self.pinned_freed = None, set(), set()
+    self.log, self.pinned, self.pinned_freed = None, collections.Counter(), set()
+    self.recorded, self.recorded_bases = None, []  # active recording pins and existing allocation bases
     try:
       (dx, dy), n = self.dispatcher, len(self.cores)
       chip.write(*end, 0, worker, start)
@@ -479,7 +480,15 @@ class Runtime:
     unit per worker. Workers receive [first unit, unit count, *args]. name identifies the launch in
     profiles."""
     self.check()
-    if self.log is not None: self.log.append((kernel, args, units, name))
+    if self.log is not None:
+      self.log.append((kernel, args, units, name))
+      # Raw kernel arguments can contain pointers inside an allocation. Conservatively retain any allocation
+      # they address. New allocations are already retained by dram_alloc; only older ones need this lookup.
+      for value in args if self.recorded is not None else ():
+        i = bisect.bisect_right(self.recorded_bases, value) - 1
+        if i >= 0:
+          addr = self.recorded_bases[i]
+          if addr <= value < addr + self.used.get(addr, 0): self.pin(addr)
     self.send(*self.block([(kernel, args, units, name)]))
 
   def block(self, launches):
@@ -568,7 +577,7 @@ class Runtime:
       if room >= size:
         self.holes[i:i + 1] = [(addr + size, room - size)] if room > size else []
         self.used[addr] = size
-        if self.log is not None: self.pinned.add(addr)
+        self.pin(addr)
         return addr
     for resources in self.chip.taken.values():  # another runtime's completed launches can free shared space too
       if (rt := resources.owner()) is not None and rt.freed:
@@ -583,6 +592,23 @@ class Runtime:
     if addr in self.pinned: self.pinned_freed.add(addr); return
     self.freed.append((self.launches, addr))
     self.reclaim()
+
+  def pin(self, addr):
+    """Keep an allocation for the active recording, once per recording."""
+    if self.recorded is not None and addr not in self.recorded:
+      self.recorded.add(addr)
+      self.pinned[addr] += 1
+
+  def unpin(self, addresses):
+    """Release one recording's ownership, preserving live tensors and queued launches."""
+    for addr in addresses:
+      if addr not in self.pinned: continue  # runtime shutdown may have already released all of its allocations
+      self.pinned[addr] -= 1
+      if not self.pinned[addr]:
+        del self.pinned[addr]
+        if addr in self.pinned_freed:
+          self.pinned_freed.remove(addr)
+          self.dram_free(addr)
 
   def finished(self): return self.launches - (self.launches - self.read_status(1)) % 2**32  # launches done, from the status
 
