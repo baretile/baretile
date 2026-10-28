@@ -241,6 +241,7 @@ class Engine:
     self.linear = any(llama.linear(c, l) for l in range(c.layers))  # DeltaNet state can resume only from the exact prefix that produced it
     self.attends = llama.attends(c, t)  # attention in one kernel reads the rows up to each position, so a replay serves any length
     self.held, self.busy = [[] for _ in range(slots)], [None] * slots
+    self.coherent = [True] * slots  # prediction history matches held; an early EOS can leave its final update absent
     self.used = [0] * slots  # when each slot last took a request. Of slots that hold as much of a prompt, admit picks the least recently used
     # for each call and length it reads: its replay, what its last call made (the logits and their heads), and the
     # hidden states from check
@@ -292,6 +293,8 @@ class Engine:
   def admit(self, r):  # choose a free slot or saved session with the longest reusable prompt prefix
     if r.gone: return r.end()
     free = [u for u, b in enumerate(self.busy) if b is None]
+    for u in free:
+      if not self.coherent[u]: self.restore(u)
     u = max(free, key=lambda u: (self.reach(self.held[u], r.ids), -self.used[u]))
     best = max(self.sessions, key=lambda k: self.reach(k, r.ids), default=())
     if self.reach(best, r.ids) > self.reach(self.held[u], r.ids): self.restore(u := min(free, key=lambda u: self.used[u]), best)
@@ -305,24 +308,51 @@ class Engine:
     self.held[u], r.cached = r.ids[:n], n
 
   def save(self, u):
-    """Save slot u's tokens, KV rows rounded to tiles, and recurrent state. After a rejected draft, save state
-    from before that draft. Copy to device DRAM first. Above park bytes, move the least recently used
-    sessions to the host; above keep bytes there, discard them."""
+    """Keep a coherent prefix in the session cache. Evict before allocating device copies; write directly to
+    the host when the device budget is too small. If a snapshot cannot fit, omit it without failing the request.
+    After a rejected draft, save the recurrent state from before that draft."""
     key, rows = tuple(self.held[u]), -(-len(self.held[u]) // 32) * 32
-    if not key or key in self.sessions or not self.park + self.keep: return
-    def copy(x):  # the row of a conv state is copied by a move
-      x = x.get() if isinstance(x, qwen.Row) else x
-      return Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
-    self.sessions[key] = [tuple(copy(x) for x in (s[:2] if self.taken[u] else s[2:])) if llama.linear(self.c, l) else copy(s[:, :rows, :])
-                          for l, s in enumerate(self.slot[u])]
-    each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]  # the tensors or bytes of a session
-    size = lambda v: sum(len(x) if isinstance(x, bytes) else x.batch * -(-x.rows // 32) * -(-x.cols // 32) * tile_bytes(x.dtype) for x in each(v))
-    for kind, room in ((Tensor, self.park), (bytes, self.keep)):
-      held = [k for k, v in self.sessions.items() if isinstance(each(v)[0], kind)]
-      while sum(size(self.sessions[k]) for k in held) > room:
-        k = held.pop(0)
-        if kind is bytes or not self.keep: del self.sessions[k]
-        else: self.sessions[k] = [tuple(x.tobytes() for x in part) if isinstance(part, tuple) else part.tobytes() for part in self.sessions[k]]
+    if not key or not self.coherent[u] or key in self.sessions or not self.park + self.keep: return
+    parts = [tuple(s[:2] if self.taken[u] else s[2:]) if llama.linear(self.c, l) else s[:, :rows, :]
+             for l, s in enumerate(self.slot[u])]
+    each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]
+    mapped = lambda f, v: [tuple(f(x) for x in part) if isinstance(part, tuple) else f(part) for part in v]
+    def size(x, host=False):
+      if isinstance(x, bytes): return len(x)
+      dtype = x.t.dtype if isinstance(x, qwen.Row) else x.dtype
+      if host: return x.batch * x.rows * x.cols * (4 if dtype in ("fp32", "int32") else 2)
+      tiles = x.batch * -(-x.rows // 32) * -(-x.cols // 32)
+      return -(-tiles // len(bh.DRAM)) * len(bh.DRAM) * tile_bytes(dtype)
+    def keys(kind): return [k for k, v in self.sessions.items() if isinstance(each(v)[0], kind)]
+    def tohost(x):
+      if not isinstance(x, qwen.Row): return x.tobytes()
+      # Download each stored matrix and select the row on the host. Row.get() would need another device allocation.
+      width = 4 * x.cols  # convolution history is fp32
+      return b"".join(x.t[b].tobytes()[x.u * width:(x.u + 1) * width] for b in range(x.batch))
+    def host(v):
+      need = sum(size(x, True) for x in each(v))
+      if need > self.keep: return None
+      held = keys(bytes)
+      while sum(sum(map(len, each(self.sessions[k]))) for k in held) + need > self.keep:
+        del self.sessions[held.pop(0)]
+      return mapped(tohost, v)
+    need, held = sum(size(x) for x in each(parts)), keys(Tensor)
+    try:
+      if need <= self.park:
+        while sum(sum(size(x) for x in each(self.sessions[k])) for k in held) + need > self.park:
+          k = held.pop(0)
+          old = self.sessions[k]
+          if kept := host(old): self.sessions[k] = kept
+          else: del self.sessions[k]
+          del old
+        def copy(x):
+          if isinstance(x, qwen.Row): return x.get().realize()
+          return Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
+        try: saved = mapped(copy, parts)
+        except MemoryError: saved = host(parts)  # fragmentation or other workloads can leave less than the cache budget
+      else: saved = host(parts)
+      if saved is not None: self.sessions[key] = saved
+    except MemoryError: pass  # caching is optional; no partially copied session is published
 
   def restore(self, u, key=()):  # puts a kept session into slot u, which then holds its tokens. With no key, the states are zeroed
     if key: self.sessions.move_to_end(key)
@@ -335,7 +365,7 @@ class Engine:
           else: x.assign(data[i] if isinstance(data[i], Tensor) else Tensor.frombytes(self.rt, x.rows, x.cols, data[i], x.batch, "fp32"))
       elif isinstance(data, Tensor): s[:, :rows, :].assign(data)
       elif data: s.put(self.on(list(range(rows))), Tensor.frombytes(self.rt, rows, s.cols, data, s.batch))
-    self.held[u], self.taken[u] = list(key), 1.0
+    self.held[u], self.taken[u], self.coherent[u] = list(key), 1.0, True
 
   def fill(self, u):
     """Prefill the next prompt chunk in slot u. The final chunk's last logits select the first new token.
@@ -348,11 +378,16 @@ class Engine:
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
-    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out)[0], 1 + self.spec)
-    if self.spec and self.busy[u] is r:  # the next token at each position: from the prompt, and past its end the one just taken
-      after = self.on((r.ids + r.made)[at + 1:at + len(ids) + 1])
-      drafts = gpt2.values(qwen.draft(after, places, h, self.t, self.c, self.slot[u], length=n, every=False))
+    final, self.coherent[u] = len(self.held[u]) == len(r.ids), not self.spec
+    done = final and self.take(u, gpt2.values(out)[0], 1 + self.spec, end=False)
+    after = (r.ids + r.made)[at + 1:at + len(ids) + 1]
+    if self.spec and r.finish != "error" and len(after) == len(ids):
+      drafts = gpt2.values(qwen.draft(self.on(after), places, h, self.t, self.c, self.slot[u], length=n, every=False))
+      self.coherent[u] = True
       if r.made: self.drafts[u], self.taken[u] = self.guess(u, int(drafts[-1].argmax())), 1.0
+    if final:
+      if done: self.finish(u)
+      else: self.save(u)
 
   def advance(self):  # decode one token for every occupied slot
     live = [r if r and r.made else None for r in self.busy]
@@ -367,16 +402,19 @@ class Engine:
 
   # The request in slot u takes its next token. A finished request leaves its slot, and its session is kept before
   # the request ends, so whoever waits on it finds the chip idle.
-  def take(self, u, head, room=1):
+  def take(self, u, head, room=1, end=True):
     r = self.busy[u]
     try: done = r.take(head, len(self.held[u]) + room < self.places)
     except (ValueError, ArithmeticError) as e:
       r.finish, r.error, done = "error", str(e), True
-    if done:
-      if r.finish != "error": self.save(u)
-      self.busy[u] = None
-      r.end()
-    return self.busy[u] is None
+    if done and end: self.finish(u)
+    return done
+
+  def finish(self, u):
+    r = self.busy[u]
+    if r.finish != "error": self.save(u)
+    self.busy[u] = None
+    r.end()
 
   def decode(self, ids, places, t, length):  # replayed: the next tokens of the slots, giving their logits and their heads at t
     logits = llama.forward(ids, places, self.t, self.c, self.kv, len(self.busy), length=length).realize()

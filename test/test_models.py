@@ -1449,6 +1449,67 @@ def test_serve_speculative(chip, tmp_path):
   agrees(r, w, c)
   assert engine.prefilled - before == 3, engine.prefilled - before
 
+def test_session_snapshot_without_device_space(chip):
+  import collections
+  from baretile import bh
+  rt, engine = Runtime(chip), object.__new__(serve.Engine)
+  conv = Tensor.of(rt, np.arange(3 * 2 * 32, dtype=np.float32).reshape(3, 2, 32).tolist(), "fp32")
+  state, kv = Tensor.full(rt, 32, 32, 3, "fp32"), Tensor.full(rt, 32, 32, 7)
+  engine.rt, engine.c = rt, llama.model(layer_types=["linear_attention", "full_attention"])
+  engine.slot, engine.held, engine.taken, engine.coherent = [[(qwen.Row(conv, 1), state), kv]], [[1, 2]], [1.0], [True]
+  engine.sessions, engine.park, engine.keep = collections.OrderedDict(), 0, 1 << 20
+  want = [tuple(x.tobytes() for x in engine.slot[0][0]), kv.tobytes()]
+  rt.wait()
+  # Leave only 64 bytes per bank. A Row.get() or a device snapshot cannot fit here.
+  reserved = [rt.dram_alloc(room - 64) for _, room in list(rt.holes) if room > 64]
+  try:
+    for park in (0, 1 << 20):  # direct host storage, then a failed device copy followed by host storage
+      engine.park = park
+      engine.save(0)
+      assert engine.sessions[(1, 2)] == want
+      engine.sessions.clear()
+    engine.keep = 1  # too small even on the host: dropping this optional snapshot is successful
+    engine.save(0)
+    assert not engine.sessions
+  finally:
+    for addr in reserved: rt.dram_free(addr)
+    rt.wait()
+  engine.keep, engine.park = 1 << 20, 1 << 20
+  engine.save(0)
+  assert isinstance(engine.sessions[(1, 2)][1], Tensor)
+  first = engine.sessions[(1, 2)]
+  engine.park = sum(rt.used[x.addr] * len(bh.DRAM) for part in first for x in (part if isinstance(part, tuple) else (part,)))
+  del first
+  engine.held[0] = [3, 4]
+  engine.save(0)
+  assert engine.sessions[(1, 2)] == want and isinstance(engine.sessions[(3, 4)][1], Tensor), "evict before copying"
+
+def test_prompt_snapshot_includes_prediction(chip, tmp_path):
+  rt, rng = Runtime(chip), np.random.default_rng(31)
+  c, weights = qwen35(rng)
+  tok, t = bytes_tokenizer(tmp_path), llama.upload(rt, weights)
+  for limit in (1, 3):
+    engine = serve.Engine(rt, t, c, tok, slots=1, places=64, chunk=16)
+    r = serve.Request(tok, [7, 200, 31, 64, 5], max_tokens=limit, temperature=0)
+    engine.admit(r)
+    engine.fill(0)
+    key = tuple(r.ids)
+    assert key in engine.sessions
+    saved, live = engine.sessions[key][-1], engine.slot[0][-1][:, :32, :]
+    assert saved.tobytes() == live.tobytes() and np.count_nonzero(value(saved)), "save after the final draft update"
+    wanted = saved.tobytes()
+    engine.restore(0, key)
+    assert engine.slot[0][-1][:, :32, :].tobytes() == wanted
+    if engine.busy[0] is not None: r.gone = True; engine.take(0, None)
+  # If the first prediction is EOS, there is no next embedding for the draft update. Do not reuse that prefix.
+  r = serve.Request(tok, [7, 200, 31, 64, 5], temperature=0, eos=range(256))
+  engine = serve.Engine(rt, t, c, tok, slots=1, places=64, chunk=16)
+  engine.admit(r); engine.fill(0)
+  assert r.finish == "stop" and not engine.sessions and not engine.coherent[0]
+  next_request = serve.Request(tok, r.ids + [1], temperature=0)
+  engine.admit(next_request)
+  assert next_request.cached == 0 and engine.coherent[0], "incomplete prediction history must be rebuilt"
+
 def test_chat_tools(tmp_path):
   # serve.qwen_chat must give the strings that Qwen3.6's chat_template.jinja makes through transformers'
   # apply_chat_template. Tool calls in an answer come out in OpenAI's format, typed by the tool's schema, and go back
