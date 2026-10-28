@@ -1242,6 +1242,46 @@ void kmain(volatile unsigned *a) {{
   noc_wait();
 }}""")
 
+def upload_kernel():
+  """Copy bytes staged in host memory (Runtime.back) into the 8 DRAM banks, for frombytes. Writing DRAM through the
+  BARs takes a PCIe write for each word, with the TLB's strict ordering.
+
+  args: [first unit, units, host address low and high, DRAM address, bytes for each bank, bytes a unit].
+
+  The host stages the banks back to back, the same number of bytes for each, and they go to the same address in every
+  bank. A unit is a piece of one bank. Pieces alternate between two L1 buffers, so a piece's read from the host
+  overlaps the previous piece's write to DRAM."""
+  return compile_kernel(f"""
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  unsigned long long host = a[2] | (unsigned long long)a[3] << 32;
+  unsigned each = a[5], piece = a[6], pieces = (each + piece - 1) / piece;
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned k = a[0] + u, b = k / pieces, at = k % pieces * piece, n = each - at < piece ? each - at : piece;
+    unsigned l1 = {DATA:#x} + u % 2 * {bh.MAX_PACKET};
+    noc_read({bh.PCIE[0]}, {bh.PCIE[1]}, host + (unsigned long long)b * each + at, l1, n);
+    noc_wait();  // this also waits for the write out of this buffer two pieces ago
+    noc_put(l1, BANK(b), a[4] + at, n);
+  }}
+  noc_wait();
+}}""")
+
+def zeros_kernel():
+  """Write zeros over a tensor's storage in all 8 DRAM banks from the tile of zeros in each worker's L1 (ZEROS), so
+  nothing crosses PCIe. All-zero bytes are zeros in every storage format, block floats included.
+
+  args: [first unit, units, address, bytes in each bank]. A unit is 4 KiB of one bank."""
+  return compile_kernel(f"""
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  unsigned pieces = (a[3] + 4095) / 4096;
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned k = a[0] + u, b = k / pieces, at = k % pieces * 4096;
+    noc_put({ZEROS:#x}, BANK(b), a[2] + at, a[3] - at < 4096 ? a[3] - at : 4096);
+  }}
+  noc_wait();
+}}""")
+
 def columns_kernel(dtype):
   """Store each tile column of a matrix or batch together, as used by Tensor.columns.
   BRISC copies one tile per work unit.

@@ -17,7 +17,7 @@ and `end` coordinates. The last tile in that rectangle is the dispatcher. The
 others are workers. A new runtime stops any older runtime whose tiles overlap.
 Both endpoints must be available Tensix tiles. The runtime requires all eight
 DRAM banks. A custom command ring must be a power of two from 64 bytes through
-1 MiB, leaving room for status, timing records and readback in its hugepage.
+1 MiB, leaving room for status, timing records and tensor data in its hugepage.
 
 Some kernels need a rectangular grid of workers. The dispatcher's row has a
 tile missing, so `Runtime.grid` leaves that row out. With 120 tiles, you get
@@ -64,7 +64,18 @@ launch while workers run.
 
 Each worker reports completion with a NoC atomic increment. The dispatcher
 writes timing data before completion status, using ordered posted writes.
-`Runtime.wait()` polls that status in host memory.
+`Runtime.wait()` polls that status in host memory. `Runtime.wait(launch=n)` waits
+only until launch `n` is done.
+
+The rest of the hugepage, `Runtime.back`, holds tensor data that crosses PCIe.
+`tobytes` launches workers that write a tensor's tiles there. `frombytes` writes
+small tensors into DRAM through the BAR, and from `tensor.DMA_UPLOAD` bytes on
+it stages each bank's share there for `upload_kernel`, whose workers read it
+through the PCIe tile. It stages in two halves, filling one while the chip reads
+the other, and waits for the last chunk before it returns. A recording leaves
+those launches out, since their staged data is gone by the time it replays.
+`Tensor.zeros` sends nothing over PCIe: its workers write the 4 KiB tile of zeros
+in their L1 over the tensor's storage.
 
 The runtime allocates the same address range in eight DRAM banks. It uses the
 first hole that's big enough, rounded to 64 bytes. When you free a tensor,

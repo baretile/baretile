@@ -174,7 +174,7 @@ def main():
   print(f"{sum(bits.size for bits, _ in weights.values()) / 1e6:.0f}M weights on the chip in {time.time() - start:.0f}s")
   ids, layers = enc.encode(prompt), 1 + max(int(k.split(".")[1]) for k in w if k.startswith("h."))
   size = -(-(len(ids) + steps) // 32) * 32  # rows for the positions the generation reaches, rounded up to a multiple of 32
-  kv, np_kv = kv_cache(layers, size, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), kv_cache(layers, size, np.zeros)
+  kv, np_kv = kv_cache(layers, size, lambda shape: Tensor.zeros(rt, shape[1], shape[2], shape[0])), kv_cache(layers, size, np.zeros)
   on = lambda row: Tensor.of(rt, [row], "int32")  # a row of ids or positions, on the chip
   run = lambda ids, places, w, kv: forward(ids, w, mask(places, size), places, kv)
   step, since = jit(lambda ids, places: run(ids, places, t, kv)), [0]  # a token per step, replayed from the third step on

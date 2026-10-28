@@ -5,9 +5,12 @@ from baretile import bh
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
 from baretile.kernels import attention_parts, attention_store, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
-                             put_kernel, readback_kernel, topk_kernel, transpose_kernel)
+                             put_kernel, readback_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
 
 FIDELITY = 4  # phases a bf16 matmul takes by default. 4 gives exact products, and tensix.matmul says what fewer drop
+# frombytes sends at least this many bytes through upload_kernel, and less through the BAR, which starts sooner but
+# takes a PCIe write for each word. A guess until the probe measures both on a card.
+DMA_UPLOAD = 1 << 16
 
 class Tensor:
   """Represent a batch of matrices with shape (batch, rows, cols). Supported storage formats are bf16,
@@ -52,6 +55,14 @@ class Tensor:
   def full(cls, rt, rows, cols, value, dtype="bf16"): return cls.of(rt, [[value] * cols for _ in range(rows)], dtype)
 
   @classmethod
+  def zeros(cls, rt, rows, cols, batch=1, dtype="bf16"):
+    """Make a tensor of zeros in any storage format, block floats included. The workers write them from the tile of
+    zeros in their L1, so nothing crosses PCIe. Model caches start this way."""
+    t = cls(rt, rows, cols, batch=batch, dtype=dtype)
+    each = -(-t.tiles // len(bh.DRAM)) * tile_bytes(dtype)  # the bytes it has in each bank
+    return t.run(("zeros",), zeros_kernel, t.addr, each, units=len(bh.DRAM) * -(-each // 4096), name="zeros")
+
+  @classmethod
   def of(cls, rt, data, dtype="bf16"):
     """Make a tensor from rows of numbers, or a list of those for a batch. bf16 rounds to nearest even."""
     if not len(data) or not len(data[0]): raise ValueError("tensor data must be nonempty")
@@ -66,7 +77,8 @@ class Tensor:
   @classmethod
   def frombytes(cls, rt, rows, cols, data, batch=1, dtype="bf16"):
     """Upload little-endian values in row-major order, with matrices stored consecutively. Convert to tile
-    layout in 8-byte chunks and write each bank once. Model weights use this path."""
+    layout in 8-byte chunks, then write each bank: through the BAR below DMA_UPLOAD bytes, and through
+    upload_kernel from there. Either way the values are in DRAM on return. Model weights use this path."""
     assert dtype not in BFP, "upload as bf16, then cast on the chip to a block-float format"
     if dtype not in ITEMSIZE: raise ValueError(f"unknown tensor dtype: {dtype}")
     batch, rows, cols = _shape((batch, rows, cols))
@@ -83,9 +95,33 @@ class Tensor:
         start = first + (r % 32 // 16 * 2 + half) * tb // 32 + q  # faces as in the tile layout at the top of tensix.py
         tiles[start:start + tc * tb // 8:tb // 8] = src[half * run + q::2 * run]
     tiles = tiles.cast("B")
-    for bank in range(len(bh.DRAM)):  # tile i is in bank i % 8 at addr + i // 8 tiles, so each bank's tiles are one write
-      t.rt.chip.write(*bh.DRAM[bank], t.addr, b"".join(tiles[i * tb:(i + 1) * tb] for i in range(bank, t.tiles, len(bh.DRAM))))
+    # tile i is in bank i % 8 at addr + i // 8 tiles, so each bank's tiles are one run
+    banks = [b"".join(tiles[i * tb:(i + 1) * tb] for i in range(bank, t.tiles, len(bh.DRAM))) for bank in range(len(bh.DRAM))]
+    if len(tiles) < DMA_UPLOAD:
+      for bank, run in enumerate(banks): t.rt.chip.write(*bh.DRAM[bank], t.addr, run)
+    else: t._upload(banks)
     return t
+
+  def _upload(self, banks):
+    """Write each bank's bytes at this tensor's address through upload_kernel. Chunks are staged in the two halves
+    of Runtime.back, so the host fills one half while the chip reads the other. The launches bypass a jit recording:
+    their staged data is gone by the time it would replay, and the tensor keeps what they wrote. The last one is
+    waited for, so the data is in DRAM on return."""
+    rt, n, d = self.rt, len(banks[0]), len(bh.DRAM)  # bank 0 has the most tiles, and the others pad up to it with zeros
+    half = len(rt.back) // 2 // d // 64 * 64  # each bank's bytes in a half
+    workers = max(1, len(rt.cores) // d)  # cut each bank's part into this many pieces, a unit for each worker
+    kernel, last = _cached(("upload",), upload_kernel), [0, 0]  # the launch that last read each half
+    for c, at in enumerate(range(0, n, half)):
+      k, h = min(half, n - at), c % 2
+      rt.wait(launch=last[h])
+      stage, bus = rt.back[h * d * half:], rt.back_bus + h * d * half
+      for b, run in enumerate(banks):
+        part = run[at:at + k]
+        stage[b * k:b * k + len(part)], stage[b * k + len(part):(b + 1) * k] = part, bytes(k - len(part))
+      piece = min(bh.MAX_PACKET, -(-k // (64 * workers)) * 64)
+      rt.send(*rt.block([(kernel, (bus & 0xFFFFFFFF, bus >> 32, self.addr + at, k, piece), d * -(-k // piece), "upload")]))
+      last[h] = rt.launches
+    rt.wait()
 
   def tobytes(self):
     """Return row-major bytes in the format accepted by frombytes. Convert block floats to bf16.
