@@ -33,14 +33,14 @@ def conv(x, w, padding=0):  # numpy convolution, a tap at a time. x is (channels
   return sum(np.einsum("oc,chw->ohw", w[:, :, ky * k + kx], x[:, ky:ky + ho, kx:kx + wo]) for ky in range(k) for kx in range(k))
 
 def test_probe(chip):
-  # The 48 probes run and report positive numbers. The sizes are small, and on ttsim the numbers mean nothing for
+  # The 50 probes run and report positive numbers. The sizes are small, and on ttsim the numbers mean nothing for
   # silicon. The NIU read counters should count at least as many reads as the DRAM probes say they made.
   from baretile import probe
   reads = lambda: sum(chip.read32(x, y, bh.NIU_READS) for x, y in chip.tensix)
   before = reads()
   rows = probe.probe(chip, n=4, rounds=2, upload=1 << 16)
   names = [what for what, *_ in rows]
-  assert len(names) == len(set(names)) == 48 and all(value > 0 for _, value, *_ in rows), rows
+  assert len(names) == len(set(names)) == 50 and all(value > 0 for _, value, *_ in rows), rows
   workers = len(chip.tensix) - 1
   assert reads() - before >= 2 * workers * 3 * (1 + 2 + 4 + 8 + 16), "fewer reads than the DRAM probes made, at three sizes on the workers"
 
