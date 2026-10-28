@@ -23,16 +23,23 @@ DRAM banks. A custom command ring must be a power of two from 64 bytes through
 
 Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
 all workers and cancels queued work; call `rt.wait()` first if it must finish.
-It drains outstanding NoC requests before releasing host DMA and DRAM memory.
+Closing first requests cancellation and lets active multicasts finish their
+acknowledgements. Multicast helpers check cancellation before issuing a new
+transfer. It then resets the cores and drains outstanding NoC requests before
+releasing host DMA and DRAM memory.
 Closing again is harmless. Collection and process exit perform the same cleanup,
 including runtimes in reference cycles. If stopping fails, memory stays reserved
-until a later close or takeover succeeds. A runtime stopped during a multicast
-may retain memory if its acknowledgement count cannot prove completion; it does
-not reset another runtime's workers or reuse uncertain allocations.
+until a later close or takeover succeeds. Cleanup only stops its own rectangle
+and retains allocations when transfer completion cannot be established.
 
 Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
-shutdown cannot establish their destination memory's lifetime.
+shutdown cannot establish their destination memory's lifetime. Custom multicast
+code must drain earlier requests, call `mcast_begin()` before issuing any packets,
+and call `mcast_done(expected_acks)` after issuing all packets. Only one core per
+tile may issue requests during that region. The dispatcher and generated kernels
+already use these helpers. Raw custom multicasts bypass cancellation tracking and
+can leave cleanup unable to establish completion.
 
 Some kernels need a rectangular grid of workers. `Runtime.grid` keeps rows that
 contain every x coordinate still present among workers. In a multi-row runtime,
@@ -51,6 +58,7 @@ We divide a worker's L1 like this. The constants are in `runtime.py`.
 | `0x00000` | Firmware and entry jumps for BRISC and the three TRISCs |
 | `0x01000` | Mailbox: launch, kernel, arguments, worker count, completion and worker identity |
 | `0x01020` | TRISC go and completion phases, alternating per worker |
+| `0x01030` | Cancellation request and multicast-active flag, also used by the dispatcher |
 | `0x01040` | `SYNC`, 64 bytes shared by a kernel's cores |
 | `0x01080` | `FLAGS`, 32 words used between workers |
 | `0x01100` | Two buffers for kernel arguments |
