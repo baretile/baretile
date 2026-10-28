@@ -1,13 +1,13 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import bisect, collections, functools, hashlib, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
+import bisect, collections, functools, hashlib, operator, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
 # TRISC i's at 4 + 4i. A worker has, in order:
 # - MAILBOX: [go, kernel, arguments, workers] [done, dispatcher's x | y << 6, scratch, index]. The dispatcher
 #   multicasts the first half.
-# - TRISCS: [go, done 0, 1, 2] for the TRISCs
+# - TRISCS: [go phase, done 0, 1, 2], alternating 0/1 for each launch that this worker runs
 # - SYNC: words that the cores of a kernel talk through. Its counters are zeroed before each launch.
 # - FLAGS: 32 words that the workers of a kernel use to signal each other over the NoC. Each word is written by one
 #   worker, and zeroed by the worker that holds it at the end.
@@ -96,7 +96,7 @@ static inline void tensix_idle(void) {{
 """
 
 CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax", "-fno-jump-tables",
-         "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld"]
+         "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld", "-Wl,--emit-relocs,-e,0"]
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "baretile")  # compiled images, by what made them
 
 @functools.cache
@@ -111,10 +111,27 @@ def _prune():
       if f.is_file() and f.stat().st_mtime < time.time() - 7 * 86400: f.unlink()
     except FileNotFoundError: pass  # another process deleted it first
 
+def _position_independent_image(elf):
+  # Keep only the linked image, but inspect its ELF relocations first. PC-relative code does not make absolute
+  # pointer initializers relocatable. ELF32 little-endian is fixed by our rv32 target and linker script.
+  shoff = struct.unpack_from("<I", elf, 32)[0]
+  shsize, count = struct.unpack_from("<2H", elf, 46)
+  sections = [struct.unpack_from("<10I", elf, shoff + i * shsize) for i in range(count)]
+  image = bytearray(max((s[3] + s[5] for s in sections if s[2] & 2), default=0))  # SHF_ALLOC
+  for _, kind, flags, addr, off, size, _, target, _, entry in sections:
+    if flags & 2 and kind != 8: image[addr:addr + size] = elf[off:off + size]  # SHT_NOBITS stays zero
+    if kind != 4 or not sections[target][2] & 2: continue  # SHT_RELA against an allocated section
+    for at in range(off, off + size, entry):
+      relocation = struct.unpack_from("<I", elf, at + 4)[0] & 255
+      if relocation not in (0, 16, 17, 18, 19, 23, 24, 25):  # NONE, branches/calls and PC-relative HI20/LO12
+        raise ValueError(f"kernel relocation {relocation} is not position-independent; use offsets instead of static pointers")
+  return bytes(image)
+
 def compile_rv32(src):
   """Prepend DEVICE to C source, compile for rv32, and link a flat image at address 0. Put .start first if
   present, otherwise kmain. PC-relative addressing lets the image run wherever it's loaded; this requires
-  medany, no linker relaxation and no jump tables. Cache images by compiler version, flags, linker script
+  medany, no linker relaxation and no jump tables. Reject absolute relocations, including static pointer
+  initializers; use offsets into a const array instead. Cache images by compiler version, flags, linker script
   and source. Entries expire after a week without use."""
   link = ("SECTIONS { .text 0 : { *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
           ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
@@ -127,9 +144,9 @@ def compile_rv32(src):
   if not shutil.which("ld.lld"): raise RuntimeError("clang links with lld, and ld.lld is not on PATH: install lld")
   with tempfile.TemporaryDirectory() as d:
     (ld := pathlib.Path(d, "link.ld")).write_text(link)
-    out = pathlib.Path(d, "prog.bin")
-    subprocess.run(CLANG + [f"-Wl,-T,{ld},--oformat=binary", "-x", "c", "-", "-o", str(out)], input=(DEVICE + src).encode(), check=True)
-    image = out.read_bytes()
+    out = pathlib.Path(d, "prog.elf")
+    subprocess.run(CLANG + [f"-Wl,-T,{ld}", "-x", "c", "-", "-o", str(out)], input=(DEVICE + src).encode(), check=True)
+    image = _position_independent_image(out.read_bytes())
   CACHE.mkdir(parents=True, exist_ok=True)
   with tempfile.NamedTemporaryFile(dir=CACHE, prefix=cached.name + ".", delete=False) as f:
     part = pathlib.Path(f.name)
@@ -154,7 +171,8 @@ __attribute__((section(".start"))) void kentry(volatile unsigned *args) {
 def compile_kernel(*programs):
   """Build an image from C programs for BRISC and TRISC0-2, in that order. Each program defines void
   kmain(volatile unsigned *args). Omitted or None programs leave that core idle. The header gives four entry
-  offsets, with 0 for an absent program, followed by the programs. The image can run at any load address."""
+  offsets, with 0 for an absent program, followed by the programs. The image can run at any load address;
+  absolute address initializers are rejected during compilation."""
   if len(programs) > 4: raise ValueError("a kernel has at most four programs: BRISC and TRISC0-2")
   image, entry = b"", []
   for src in programs + (None,) * (4 - len(programs)):
@@ -191,7 +209,7 @@ static void run(unsigned core) {{  // runs the kernel's program for this core, i
 }}
 void brisc_loop(void) {{
   noc_setup();
-  for (unsigned seen = 0;;) {{
+  for (unsigned seen = 0, phase = 0;;) {{
     while (MAILBOX[0] == seen) asm volatile("fence" ::: "memory");  // the L0 data cache misses NoC writes, and fence drops it
     seen = MAILBOX[0];
     asm volatile("fence" ::: "memory");  // the rest of the mailbox and the arguments came over the NoC before go
@@ -202,15 +220,17 @@ void brisc_loop(void) {{
 #endif
     volatile unsigned *a = (volatile unsigned *)MAILBOX[2];
     unsigned units = a[0];
-    a[0] = me * units / n; a[1] = (me + 1) * units / n - a[0];
+    unsigned q = units / n, r = units % n;
+    a[0] = me * q + me * r / n;
+    a[1] = q + (me + 1) * r / n - me * r / n;  // products stay in range even when units is UINT32_MAX
     for (unsigned i = 0; i < {SYNC_COUNTS}; i++) ((volatile unsigned *){SYNC:#x})[i] = 0;
     CFG[{bh.CFG_IC_INVALIDATE}] = 0xF;  // drop the cached instructions of BRISC and the TRISCs
     l1_settle({bh.TENSIX_CFG:#x});
     l1_settle({SYNC:#x});  // the SYNC counters are zero before any core of the kernel looks at them
-    TRISCS[0] = seen;
+    TRISCS[0] = phase ^= 1;  // a worker can first participate at launch zero, or skip a whole launch-number cycle
     run(0);
     noc_wait();  // what the kernel sent has landed before we report done
-    for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != seen) asm volatile("fence" ::: "memory");
+    for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != phase) asm volatile("fence" ::: "memory");
     MAILBOX[4] = seen;
 #ifdef COUNTED
     while (NIU(CMD) & 1) {{}}
@@ -267,9 +287,9 @@ static void go(void) {{ unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1;
 void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
-  unsigned ready = 0, ready_n = 0, ready_end = 0;  // a launch whose arguments and go are in place, or 0
+  unsigned ready = 0, ready_n = 0, ready_end = 0, prepared = 0;  // the next launch, and whether its arguments are ready
   // the launch the workers are on, the ring pointer past it, the report count once it's done, and when its go went
-  unsigned running = 0, running_end = 0, reports = 0, began = 0;
+  unsigned running = 0, running_end = 0, reports = 0, began = 0, active = 0;
   unsigned long long times = ring + size;  // launch n's [go, last report, flits read] at times + n % TIMES * 16
   unsigned words = 0;  // the flits the workers read, up to the last launch done
   unsigned staged = 0, first = 0;  // the ring's bytes [first, staged) are in STAGING
@@ -277,7 +297,7 @@ void loop(void) {{
   NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
   for (;;) {{
     asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
-    if (!ready && CONFIG[0] != rptr) {{  // the next command, while the last launch runs
+    if (!prepared && CONFIG[0] != rptr) {{  // the next command, while the last launch runs
       if (rptr == staged) {{  // read everything new in the ring, up to its end and at most STAGE bytes
         unsigned n = CONFIG[0] - rptr, left = size - rptr % size;
         n = n < left ? n : left;
@@ -296,20 +316,21 @@ void loop(void) {{
       // write its go now, since the go of the running launch has already gone out
       OUT[0] = ready; OUT[1] = cmd[1]; OUT[2] = args; OUT[3] = ready_n;
       l1_settle({OUTBOX:#x});
+      prepared = 1;
     }}
-    if (ready && running)  // the next launch is ready, so spin on DONE until the last report of this one
+    if (prepared && active)  // the next launch is ready, so spin on DONE until the last report of this one
       while (*(volatile unsigned *){DONE:#x} != reports) asm volatile("fence" ::: "memory");
     asm volatile("fence" ::: "memory");
-    unsigned done = running && *(volatile unsigned *){DONE:#x} == reports ? running : 0, end = running_end;
-    unsigned took = began, finished = done ? CLOCK : 0, read = done ? *(volatile unsigned *){DONE + 4:#x} - words : 0;
+    unsigned complete = active && *(volatile unsigned *){DONE:#x} == reports, done = running, end = running_end;
+    unsigned took = began, finished = complete ? CLOCK : 0, read = complete ? *(volatile unsigned *){DONE + 4:#x} - words : 0;
     words += read;
-    if (done) running = 0;
-    if (ready && !running) {{  // the workers have finished the last launch
+    if (complete) active = 0;
+    if (prepared && !active) {{  // the workers have finished the last launch
       began = CLOCK;
       go();
-      running = ready; running_end = ready_end; reports += ready_n; ready = 0;
+      running = ready; running_end = ready_end; reports += ready_n; active = 1; prepared = 0;
     }}
-    if (done) {{  // after the next go: better the host hears late than the next launch starts late
+    if (complete) {{  // after the next go: better the host hears late than the next launch starts late
       while (NIU(OUTGOING)) {{}}  // wait until the last launch's times and status have left the outbox
       OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished; OUT[10] = read;
       l1_settle({OUTBOX + 16:#x});
@@ -506,7 +527,9 @@ class Runtime:
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
     self.check()
     units = len(self.cores) if units is None else units
-    if units <= 0: raise ValueError("a launch needs at least one unit")
+    try: units = operator.index(units)
+    except TypeError: raise ValueError("launch units must be an integer in [1, 2**32 - 1]") from None
+    if not 1 <= units < 2**32: raise ValueError("launch units must be in [1, 2**32 - 1]")
     n = min(units, len(self.cores))
     body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
     if len(body) > ARGS_SIZE: raise ValueError(f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}")
@@ -653,9 +676,9 @@ class Runtime:
     niu = lambda off: self.chip.read32(x, y, bh.NIU + off)
     mail, triscs, sync, flags = words(MAILBOX, 8), words(TRISCS, 4), words(SYNC, len(SYNC_NAMES)), words(FLAGS, 32)
     if mail[0] != launch: return f"{core}: never saw the go of launch {launch} (its last: {mail[0]})"
-    left = [name for name, done in (("BRISC", mail[4]), *zip(("TRISC0", "TRISC1", "TRISC2"), triscs[1:])) if done != launch]
-    lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none: its report to the dispatcher is lost'}"
-             + ("" if triscs[0] == launch else f" (BRISC never started the TRISCs: their go is {triscs[0]})"),
+    left = ["BRISC"] if mail[4] != launch else []
+    left += [name for name, done in zip(("TRISC0", "TRISC1", "TRISC2"), triscs[1:]) if done != triscs[0]]
+    lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none: its report to the dispatcher is lost'}",
              "SYNC " + ", ".join(f"{name} {v}" for name, v in zip(SYNC_NAMES, sync)) + "; FLAGS set: "
              + (", ".join(f"{i}={v}" for i, v in enumerate(flags) if v) or "none"),
              f"NoC requests in flight by id: {({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "

@@ -130,6 +130,40 @@ def test_compile_concurrent(tmp_path, monkeypatch):
     a, b = pool.map(runtime.compile_rv32, ["void kmain(volatile unsigned *a) { a[0] = 42; }"] * 2)
   assert a == b and len(list(tmp_path.iterdir())) == 1 and next(tmp_path.iterdir()).read_bytes() == a
 
+def test_kernel_pointer_initializers_are_rejected(tmp_path, monkeypatch):
+  import baretile.runtime as runtime
+  monkeypatch.setattr(runtime, "CACHE", tmp_path)
+  data = """
+static const unsigned table[] = {111, 222};
+static const unsigned * const pointers[] = {table, table + 1};
+void kmain(volatile unsigned *a) { a[0] = *pointers[a[2] & 1]; }
+"""
+  function = """
+static unsigned first(unsigned x) { return x + 111; }
+static unsigned second(unsigned x) { return x + 222; }
+static unsigned (* const pointers[])(unsigned) __attribute__((used)) = {first, second};
+void kmain(volatile unsigned *a) { a[0] = pointers[a[2] & 1](a[3]); }
+"""
+  for src in (data, function):
+    with pytest.raises(ValueError, match="position-independent"): compile_kernel(src)
+  assert not list(tmp_path.iterdir()), "unsupported code must not enter the image cache"
+
+def test_kernel_const_offsets_at_different_addresses(chip):
+  kernel = compile_kernel("""
+static const unsigned table[] = {111, 222};
+static const unsigned offsets[] = {1, 0};
+void kmain(volatile unsigned *a) { a[0] = table[offsets[a[2] & 1]]; }
+""")
+  with Runtime(chip, end=chip.tensix[1]) as rt:
+    for padding in (16, 4096):
+      rt.evict()
+      rt.load(bytes(padding))
+      assert rt.load(kernel) == KERNELS + padding
+      for index, expected in enumerate((222, 111)):
+        rt.launch(kernel, (index,))
+        rt.wait()
+        assert chip.read32(*rt.cores[0], rt.args()) == expected
+
 def test_card_copies():
   # A card's BARs are read and written a word at a time, since libc's memcpy may go byte by byte on uncached memory. A
   # word is 8 bytes, or 4 where the address and length don't allow 8, and a byte where neither fits. This test runs on
@@ -483,6 +517,42 @@ def test_queue_blocks(chip):
   rt.wait()
   assert rt.launches == 28 and chip.read32(*rt.cores[0], DATA) == 1 + 3 * sum(range(1, 10))
 
+@pytest.mark.parametrize("workers", [1, 3, 8])
+def test_large_work_partitions(chip, workers):
+  kernel = compile_kernel("void kmain(volatile unsigned *a) {}")
+  with Runtime(chip, end=chip.tensix[workers]) as rt:
+    for units in (1, workers, workers + 1, 2**31 - 1, 2**31, 2**31 + 1, 2**32 - 1):
+      rt.launch(kernel, units=units)
+      rt.wait()
+      n = min(workers, units)
+      got = [struct.unpack("<2I", chip.read(*xy, rt.args(), 8)) for xy in rt.cores[:n]]
+      expected = [(i * units // n, (i + 1) * units // n - i * units // n) for i in range(n)]
+      assert got == expected and sum(count for _, count in got) == units
+
+def test_launch_number_wrap(chip, monkeypatch):
+  import baretile.runtime as runtime
+  # Accelerate the real dispatcher's counter; the host keeps an unbounded count across its 32-bit status wrap.
+  start = 2**32 - 2
+  monkeypatch.setattr(runtime, "DISPATCHER", runtime.DISPATCHER.replace("launches = 0,", f"launches = {start}u,"))
+  with Runtime(chip, end=chip.tensix[2], ring=256) as rt:
+    rt.launches = start
+    rt.status[4:8] = start.to_bytes(4, "little")
+    for xy in rt.cores: chip.write32(*xy, DATA, 0)
+    kernel = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)L1_DATA += a[2]; }")
+    addr = rt.dram_alloc(64)
+    rt.launch(kernel, (1,), units=1, name="wrapped")
+    rt.dram_free(addr)
+    block = rt.block([(kernel, (i,), 1 if i == 2 else None, "wrapped") for i in range(2, 6)])
+    rt.send(*block)  # both command-ring wrap and launch-number wrap, including a ready launch numbered zero
+    rt.wait()
+    assert rt.launches == start + 5 and rt.finished() == start + 5 and not rt.queued and not rt.used
+    assert [chip.read32(*xy, DATA) for xy in rt.cores] == [15, 12], "the second worker first runs at launch zero"
+    profile = rt.profile(start)
+    assert len(profile) == 1 and profile[0][:2] == ("wrapped", 5)
+    rt.launch(kernel, (6,))
+    rt.wait()
+    assert [chip.read32(*xy, DATA) for xy in rt.cores] == [21, 18]
+
 def test_runtime_inputs(chip):
   taken = chip.taken.copy()
   for ring in (0, -64, 32, 192, 1 << 21):
@@ -491,7 +561,7 @@ def test_runtime_inputs(chip):
   assert chip.taken == taken, "reject invalid settings before stopping an existing runtime"
   with pytest.raises(ValueError, match="four programs"): compile_kernel(*[None] * 5)
   rt = Runtime(chip, end=chip.tensix[1], ring=64)
-  for units in (0, -1):
+  for units in (0, -1, 2**32, 1.5):
     with pytest.raises(ValueError, match="unit"): rt.launch(bytes(16), units=units)
   with pytest.raises(ValueError, match="command"): rt.launch(bytes(16), (0,) * 20)
   assert not rt.loaded and not rt.launches

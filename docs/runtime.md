@@ -48,7 +48,7 @@ We divide a worker's L1 like this. The constants are in `runtime.py`.
 | --- | --- |
 | `0x00000` | Firmware and entry jumps for BRISC and the three TRISCs |
 | `0x01000` | Mailbox: launch, kernel, arguments, worker count, completion and worker identity |
-| `0x01020` | TRISC launch and completion words |
+| `0x01020` | TRISC go and completion phases, alternating per worker |
 | `0x01040` | `SYNC`, 64 bytes shared by a kernel's cores |
 | `0x01080` | `FLAGS`, 32 words used between workers |
 | `0x01100` | Two buffers for kernel arguments |
@@ -63,7 +63,10 @@ It stages commands at `0x80040`, with room for 64 KiB.
 Kernel images start with four entry offsets. They can run at different L1
 addresses. The runtime loads an image once and reuses it until the kernel area
 fills. It then waits for queued work before evicting the loaded images. The
-worker firmware clears a kernel's `.bss` at launch.
+worker firmware clears a kernel's `.bss` at launch. Initialized statics must be
+const. A static pointer to data or a function still contains an absolute address,
+so the compiler rejects it: use constant integer offsets into an array instead.
+The compiler checks the linked ELF relocations before caching the flat image.
 
 ## Commands and memory
 
@@ -75,7 +78,9 @@ straddle the end of the host ring. A zero length marks unused space at the end.
 of recorded commands uses one doorbell write when it fits with any wrap padding.
 Larger blocks are sent in pieces, split between commands. The dispatcher executes
 launches in order and alternates argument buffers so it can prepare the next
-launch while workers run.
+launch while workers run. Work counts range from 1 through `2**32 - 1`; workers
+receive contiguous partitions whose total is exactly the requested count.
+Launch numbers wrap in the device status, while host launch numbers keep growing.
 
 Each worker reports completion with a NoC atomic increment. The dispatcher
 writes timing data before completion status, using ordered acknowledged writes.
