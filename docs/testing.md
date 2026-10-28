@@ -72,6 +72,25 @@ requires PyTorch. The usual reference procedure has a 512-token prompt and
 500 following steps. Top-1 counts how often baretile picks the reference's best
 token. Top-5 counts how often its pick is among the reference's five best tokens.
 
+## Benchmarks
+
+[test/benchmark.py](../test/benchmark.py) records matmul, decode, prefill and
+serving results; its opening comment gives the commands and workload sizes.
+`load` also drives an external OpenAI-compatible completion server. It asks
+for streamed usage and reports missing token counts or cache counts as `null`.
+Per-user rates include the whole request, including first-token latency.
+First-text latency measures the first nonempty SSE text event: a chunk may
+contain several tokens, so it is not an individual token timestamp. An empty
+completion has no first-text latency.
+
+A serving workload and each TT-NN demo subprocess have a one-hour deadline.
+Python callers can set `load(..., timeout=seconds)` for shorter runs. A failed
+or timed-out workload retains completed turns, reports failures, and includes
+the unfinished requests' elapsed time in its overall rate. TT-NN subprocesses
+write output as they run to `benchmark-ttnn-<run>.log`; a timeout stops their
+process group and retains that partial log. Version and line-count subprocesses
+have a separate 60-second limit.
+
 ## Where ttsim differs from a card
 
 Tensix instructions take no time in ttsim. NoC requests complete immediately.
