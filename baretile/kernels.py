@@ -796,19 +796,19 @@ def attention_kernel(ht, rows, rep, wt=None, phases=4, window=0, parts=1, keep=F
                    f"{on_v} " + each(f"for (unsigned j = 0; j < {ht}; j++) {{ {tt(unpack(val('j'), f'{p_slot} + r'))} }}") + f" {off_v} " +
                    each(tt(unpack(ones, f"{p_slot} + r"))) + f" {tt(REPORT)}", "")  # then the products for the sums, the ones in bf16
   told = "fetched(); " + read + " needed += 2 * (k1 - k0 + 1);"  # skip the unit's frames, since math and pack needn't wait for them
-  scores = lambda op, row: (f"{tt([aim(row)] + elementwise(op, slots) + walk(True))} "
+  scores = lambda op, row: (f"{tt(aim(row) + elementwise(op, slots) + walk(True))} "
                             f"for (unsigned m = 0; m < {ht}; m++) {{ {tt(matmul(slots, phases, True))} }} {tt(walk(False))}")
-  fold_h = tt(SFPU_START + [aim("h")] + runs(slots, "max2", 32))  # fold the tile 128 rows past h into it
+  fold_h = tt(SFPU_START + aim("h") + runs(slots, "max2", 32))  # fold the tile 128 rows past h into it
   begin = tt(math_begin(False))
   product = f"{tt(math_begin(True))} {tt(matmul(slots, phases))} {tt(MATH_END)} h ^= {DST_HALF};"  # p times a value tile, or times the ones
   free = tt([DST_FREE])  # wait until a Dst half is free for a result
-  take_acc, fold_acc = tt(take(group)), tt(SFPU_START + [aim(f"{acc} + 64 * r")] + runs(slots, "max2", 32))
+  take_acc, fold_acc = tt(take(group)), tt(SFPU_START + aim(f"{acc} + 64 * r") + runs(slots, "max2", 32))
   math = units(told,
                f"if (kt == k0) {{ {take_acc} }} " + each(f"if (kt == k0) {{ {scores('add', f'{acc} + 64 * r')} }} "
                                                         f"else {{ {scores('add', f'{acc + 128} + 64 * r')} {fold_acc} }}") if held else
                each(f"{begin} if (kt > k0) {{ {tt(elementwise('add', slots))} {scores('add', 'h + 128')} {fold_h} }} "
                     f"else {{ {scores('add', 'h')} }} {tt(MATH_END)} h ^= {DST_HALF};"),
-               each(f"{free} {tt([aim(f'{acc} + 64 * r')] + across_rows('max2') + sfpu(['floor', 'ftob'] * (parts > 1), slots) + MATH_END)}" +
+               each(f"{free} {tt(aim(f'{acc} + 64 * r') + across_rows('max2') + sfpu(['floor', 'ftob'] * (parts > 1), slots) + MATH_END)}" +
                     (f" {free} {tt([ins('SEMPOST', sem_sel=SEM_DST)])}" if parts > 1 else "")) if held else  # the largest is packed twice
                each(f"{begin} {tt(elementwise('add', slots) + across_rows('max2') + MATH_END)} h ^= {DST_HALF};"),
                each(f"{begin} {scores('sub', 'h')} {tt(sfpu(['exp'], slots))} {tt(MATH_END)} h ^= {DST_HALF};") + " " +

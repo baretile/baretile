@@ -675,10 +675,11 @@ def test_replay_keeps_pushes_small():
   # The TRISCs push one Tensix instruction a cycle, or four when they come in a row, so words pushed per tile cost
   # fetches and time. The repeating runs (a matmul phase, a mul phase, 15 PACRs) are recorded once per kernel in the
   # replay buffers of the threads, and replaying a run takes one word. An SFPU body's 32 runs per tile are a loop
-  # around one REPLAY word.
+  # around one REPLAY word. Aiming the FPU at a Dst half takes a STALLWAIT too, since a reduction's SFPU work may still
+  # be running when the next tile begins.
   c, slots = tensix, tensix.allocate({"mm", "mul"})
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
-  assert tile("add") <= 26 and tile("mul") <= 27, "a tile's repeating runs replayed, a word each"
+  assert tile("add") <= 27 and tile("mul") <= 28, "a tile's repeating runs replayed, a word each"
   assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step's phases replayed"
   assert len(c.sfpu(["recip"], c.allocate({"recip"}))) <= 3, "32 passes of 12 words: one REPLAY word, in a loop"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
