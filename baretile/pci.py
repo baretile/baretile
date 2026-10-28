@@ -110,7 +110,7 @@ class Card:
     """Allocate a locked, physically contiguous 2 MiB hugepage and return (memoryview, bus address). The page
     returns to the kernel's pool when the memoryview is no longer referenced. A Runtime keeps a reference
     for its command ring and status words."""
-    assert size <= 1 << 21, "Card.alloc gives at most one 2 MiB hugepage"
+    if size > 1 << 21: raise ValueError("Card.alloc gives at most one 2 MiB hugepage")
     MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages, even if the host's default differs
     # Cached scalar tensors refer back to their Runtime, so dropping a Runtime can leave a reference cycle.
     # Collect those cycles before giving up: an unused Runtime may still hold a hugepage.
@@ -122,7 +122,7 @@ class Card:
     with open("/proc/self/pagemap", "rb") as f:
       f.seek(ctypes.addressof(ctypes.c_char.from_buffer(buf)) // mmap.PAGESIZE * 8)
       pfn = int.from_bytes(f.read(8), "little") & ((1 << 55) - 1)
-    assert pfn, "pagemap hides physical addresses without CAP_SYS_ADMIN"
+    if not pfn: raise PermissionError("pagemap hides physical addresses without CAP_SYS_ADMIN")
     return memoryview(buf)[:size], pfn * mmap.PAGESIZE
 
   def tick(self): pass  # a card runs without being ticked
