@@ -15,7 +15,7 @@ def save(path, *runtimes, since=0):
   pathlib.Path(path).write_text(pathlib.Path(__file__).with_name("viz.html").read_text().replace("{data}", data))
 
 def _runtime(rt, since, made):
-  done = rt.launches - (rt.launches - rt.read_status(1)) % 2**32  # the last launch that finished
+  done = rt.finished()  # the last launch that finished
   kernels, index, launches, at, last = [], {}, [], 0, None
   for n in range(max(since, rt.launches - TIMES) + 1, done + 1):
     name, workers, image = rt.sent[n % TIMES]

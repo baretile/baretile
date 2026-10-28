@@ -147,9 +147,9 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
                  bh.DRAM_GBPS, "GB/s"))
   # and B by columns: chunks of a run from the worker's own bank, with a block float's exponents in a separate read
   for name in ("bf16", "bfp8", "bfp4"):
-    n = chunk_tiles(None if name == "bf16" else name)
+    c = chunk_tiles(None if name == "bf16" else name)
     rows.append((f"DRAM reads of {name} chunks, {CHUNKS} in flight: grid workers, own banks",
-                 dram(n * tile_bytes(name), CHUNKS, grid, split=0 if name == "bf16" else 64 * n, own=1)[1], bh.DRAM_GBPS, "GB/s"))
+                 dram(c * tile_bytes(name), CHUNKS, grid, split=0 if name == "bf16" else 64 * c, own=1)[1], bh.DRAM_GBPS, "GB/s"))
   rows += [("DRAM read of 64 bytes, alone: one worker", dram(64, 1, 1)[0] / rounds, None, "cycles"),
            ("DRAM reads of 64 bytes, 64 in flight: all workers", dram(64, 64, workers)[1], bh.DRAM_GBPS, "GB/s")]
   # NoC: a word there and back, between neighbours and across the grid

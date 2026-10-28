@@ -66,7 +66,6 @@ class Chip:
   def window(self, x, y, addr, start=None):  # TLB 0 is shared, and moves only when an access needs another block
     base = addr & ~(bh.TLB_WINDOW - 1)
     if self.target != (x, y, base, start): self.map(x, y, base, start, 0)
-    self.target = (x, y, base, start)
     return addr - base
 
   def chunks(self, x, y, addr, n, start=None):  # [addr, addr+n) as (BAR0 offset, size) pieces, split where the window moves
