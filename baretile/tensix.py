@@ -357,14 +357,19 @@ SFPU = {
 # bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would. c's test is a float's, so an int32
 # c comes as 0 or 1 (Tensor.where).
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
-BINARY = {"max", "cmplt", "cmpne", "keep", "drop"}
+# Map two's complement to SFPGT's total order, including INT32_MIN. Complement only the magnitude bits of
+# negatives: -1 becomes negative zero, ordered below positive zero. Applying the same map restores the input.
+def integer_order(*regs):
+  return [*sfp_bits(2, 0x7FFFFFFF), CC_ON, *[w for r in regs for w in
+          (CC_ALL, ins("SFPSETCC", vc=r), ins("SFPXOR", vd=r, vc=2))], CC_OFF]
+BINARY = {"max", "cmplt", "cmpne", "keep", "drop", "join"}
 # In an fp32 kernel the SFPU also does add, sub and mul, rounding once as fp32 does. There, exp, the reciprocal and
 # the comparisons handle NaN the IEEE way. The bf16 versions skip that work, since a bf16 NaN is already inf before the
 # SFPU sees it.
 FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt",
             "cmpne": "fcmpne"}
 INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne",  # int32's own programs
-             "keep": "keep", "drop": "drop"}
+             "keep": "keep", "drop": "drop", "join": "join"}
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # the SFPU program for a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
@@ -380,22 +385,24 @@ SFPU |= {
   "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  # The two disjoint masks of where combine without arithmetic, preserving a selected negative zero.
+  "join": ([], binary(ins("SFPOR", vd=0, vc=1), sfp_store(0, mod0=RAW))),
   "fadd": ([], binary(mad(0, 0, ONE, 1), sfp_store(0))), "fsub": ([], binary(mad(0, 1, ONE, 0, neg=1), sfp_store(0))),
   "fmul": ([], binary(mul(0, 0, 1), sfp_store(0))),
-  # int32 is two's complement in L1, Dst and LRegs alike, since they move it raw. Ordering goes through sign-magnitude,
-  # the order that SFPGT and SFPSWAP use, by SFPCAST 3, which is its own inverse. A comparison gives 1, not 1.0.
+  # int32 stays two's complement in L1, Dst and LRegs. Ordering uses the reversible map above. A comparison gives 1, not 1.0.
   "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, mod0=RAW))),
   "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, mod0=RAW))),
-  "imax": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPSWAP", vd=1, vc=0, mod1=1), ins("SFPCAST", vd=0, vc=0, mod1=3),
-                      sfp_store(0, mod0=RAW))),
-  "icmplt": ([], binary(*[ins("SFPCAST", vd=r, vc=r, mod1=3) for r in (0, 1)], ins("SFPGT", vd=1, vc=0, mod1=8),
+  "imax": ([], binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0), sfp_store(0, mod0=RAW))),
+  "icmplt": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=1, vc=0, mod1=8),
                         ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "icmpne": ([], binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
                         ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   # Casts. itof turns an integer into sign-magnitude, then into a float, rounding to nearest (exact below 2^24). ftoi
   # rounds a float toward 0 by shifting its mantissa, hidden bit included, by its exponent - 23. It gives 0 where the
   # exponent is negative, and negates the result for a negative float.
-  "itof": ([], [sfp_load(), ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0), sfp_store(0)]),
+  "itof": ([], [sfp_load(), *sfp_bits(1, 0x80000000), ins("SFPXOR", vd=1, vc=0),
+                ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0),
+                CC_ON, ins("SFPSETCC", vc=1, mod1=6), *sfp_const(0, -2**31), CC_OFF, sfp_store(0)]),
   "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
                 ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0),
                 ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, mod0=RAW)]),

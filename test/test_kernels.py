@@ -1317,6 +1317,33 @@ def test_int32(chip):
       assert value(got).tolist() == np.asarray(want, np.float64).reshape(got.shape).tolist(), (got.shape, got.dtype)
     assert (ts * 0.5).dtype == "fp32" and (ts > 0).dtype == "int32" and value(ts * 0.5).tolist() == (s * 0.5).reshape(1, 45, 70).tolist()
 
+def test_integer_boundaries(chip):
+  rt = Runtime(chip)
+  edge = np.array([-2**31, -2**31 + 1, -2**24 - 1, -1, 0, 1, 2**24 + 1, 2**31 - 1], np.int32)
+  x, y = edge[:, None], edge[None, :]
+  a, b = (Tensor.of(rt, v.tolist(), "int32") for v in (x, y))
+  for got, want in [(a < b, x < y), (a <= b, x <= y), (a > b, x > y), (a >= b, x >= y), (a == b, x == y), (a != b, x != y),
+                    (a.maximum(b), np.maximum(x, y)), (a.minimum(b), np.minimum(x, y))]:
+    assert np.array_equal(value(got)[0], want)
+  assert np.array_equal(value(a.float())[0], x.astype(np.float32))
+  assert np.array_equal(value(a.bfloat16())[0], bf16(x.astype(np.float32), True))
+
+def test_selection_boundaries(chip):
+  rt = Runtime(chip)
+  x = np.array([[np.nan, -np.inf, -1, -0.0, 0.0, 1, np.inf]], np.float32)
+  a, b = (Tensor.of(rt, v.tolist(), "fp32") for v in (x, x.T))
+  for got, want in [(a <= b, x <= x.T), (a >= b, x >= x.T), (a <= 0, x <= 0), (0 <= a, 0 <= x), (a >= 0, x >= 0), (0 >= a, 0 >= x)]:
+    assert np.array_equal(value(got)[0], want)
+  x = np.array([[-0.0, 0.0, -np.inf, np.inf, -0.0, 3.0]], np.float32)
+  y = np.array([[0.0, -0.0, np.inf, -np.inf, np.nan, -0.0]], np.float32)
+  for cond in ([[1, 0, 1, 0, 1, 0]], [[0, 1, 0, 1, 0, 1]]):
+    a, b = (Tensor.frombytes(rt, 1, 6, v.tobytes(), dtype="fp32") for v in (x, y))
+    got = Tensor.of(rt, cond, "int32").where(a, b)
+    want = np.where(cond, x, y)
+    assert got.tobytes() == want.tobytes()
+    with np.errstate(all="ignore"):
+      assert np.array_equal(np.signbit(value(got.reciprocal())[0]), np.signbit(1 / want))
+
 def test_autograd(chip):
   # This checks the ops' backward passes against numpy, on fp32 tensors with odd shapes and broadcasting. The loss is
   # sum(f(inputs) * w), with w random so that the elements of the gradient differ, and the reference gradient comes
@@ -1417,6 +1444,7 @@ def test_fuzz(chip, monkeypatch):
          "relu": lambda a: np.maximum(a, 0), "exp": np.exp, "exp2": np.exp2, "log": np.log, "log2": np.log2, "sin": np.sin,
          "cos": np.cos, "sqrt": np.sqrt, "recip": lambda a: 1 / a, "max": np.maximum, "cmplt": lambda a, b: (a < b) * 1.0,
          "cmpne": lambda a, b: (a != b) * 1.0, "keep": lambda c, x: np.where(c != 0, x, 0), "drop": lambda c, y: np.where(c != 0, 0, y),
+         "join": lambda a, b: (np.float32(a).view(np.uint32) | np.float32(b).view(np.uint32)).view(np.float32),
          "cast": lambda a: a, "ftob": lambda a: ((np.float32(a).view(np.uint32) + 0x8000) & 0xFFFF0000).view(np.float32)}
     f |= {k: lambda a, k=k: getattr(a, k[:3])(int(k[3]), keepdims=True) for k in tensix.FOLDS}  # sum0, max2, ...
     return f[e[0]](*v)

@@ -148,6 +148,12 @@ It implements arithmetic and the polynomial approximations used for functions
 such as exp and log. Packing a bf16 result rounds half up, while host uploads
 use round-to-nearest-even. The two can differ by one bf16 step on the same input.
 
+Integer comparisons, minimum and maximum cover the full int32 range, including
+`-2**31`. Integer addition and subtraction wrap; conversion to fp32 rounds to
+nearest. fp32 comparisons treat NaN as unordered: `<`, `<=`, `>`,
+`>=` and `==` are false, and `!=` is true. fp32 `where` preserves the selected
+value's bits, including the sign of zero.
+
 ## Attention
 
 `Tensor.attend` computes the scores and weighted values in an attention kernel,
