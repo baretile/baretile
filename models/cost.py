@@ -40,7 +40,7 @@ WORKERS, GRID = 119, (tuple(range(12)), tuple(range(9)))
 # its share of the host at $0.15 a kWh.
 CARD = dict(dram=len(bh.DRAM) * 4 * 2**30, reserve=2**30,  # 8 GDDR6 banks of 4 GiB, with a GiB kept for kernels and activations
             bandwidth=bh.DRAM_GBPS * 1e9, reach=0.7,  # 512 GB/s, and the share of it that a decode step gets (a guess)
-            tflops=664e12, phases=2,  # bfp8 matmuls at one fidelity phase (16 cycles a step), and the phases they take
+            tflops=664e12, phases=None,  # one-phase peak; None derives phases per operation, a number overrides all of them
             launch=1e-6, pcie=25e9,  # a launch's seconds on the card (a guess), and PCIe 4.0 x16 in bytes/s
             price=1299, host=600, years=3, watts=300, host_watts=75, kwh=0.15)
 # context is the number of positions in a session's slot. They're all filled, so a step reads every row. kv is the KV
@@ -65,7 +65,9 @@ def shape(c, mode="bf16"):
   head: bytes in the output layer used for drafting.
   bytes: total bytes held, including draft weights.
   values: matrix values used per token, including selected experts.
-  held: total parameter count."""
+  held: total parameter count.
+  work, draft_work, head_work, draft_head_work: the corresponding matrix values times their fidelity phases.
+  decode_phases, prefill_phases: attention fidelity in each stage."""
   prec, d, hd, e, m, sh = llama.precision(c, mode), c.dim, llama.head(c), c.experts, c.moe, c.shared
   fmt = lambda op, l=None: BYTES[prec.get((op, l), ("bf16",))[0]]  # a matrix's bytes a value. The routers and mtp.fc count as bf16 below
   mixture = lambda l: e and l not in c.dense  # the multi-token prediction block, c.layers, has experts if the model does
@@ -82,10 +84,22 @@ def shape(c, mode="bf16"):
   own = c.mtp * c.vocab * d * fmt("draft head") if ("draft head", None) in prec else 0  # the draft's own output layer
   values = sum(mixers(l) + ffn_values(l) for l in range(c.layers)) + c.vocab * d
   draft_values = c.mtp * (mixer + ffn_values(t) + 2 * d * d)
+  def work(l, draft=False):
+    # The projections can use different phases; routers and the MTP input projections use Tensor's default four.
+    out = c.heads * hd * d if draft or not llama.linear(c, l) else c.vh * c.vd * d
+    width = sh + c.k * m if mixture(l) else c.ffn
+    values = {"qkv": (mixer if draft else mixers(l)) - out, "o": out, "gate_up": 2 * d * width, "down": d * width}
+    return sum(v * prec[op, l][1] for op, v in values.items()) + (d * e * 4 if mixture(l) else 0)
+  head_work = c.vocab * d * prec["head", None][1]
+  draft_head_work = c.vocab * d * prec.get(("draft head", None), prec["head", None])[1]
   held = len(moe) + (c.mtp if e else 0)  # the blocks with experts, counting the multi-token prediction layer
   return SimpleNamespace(every=every, expert=expert, moe=len(moe), draft=draft, draft_values=draft_values, embed=c.vocab * d * BYTES["bf16"],
                          head=own or c.vocab * d * fmt("head"), bytes=every + held * e * expert + draft + own + c.vocab * d * BYTES["bf16"],
-                         values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1))
+                         values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1),
+                         work=sum(work(l) for l in range(c.layers)) + head_work,
+                         draft_work=c.mtp * (work(t, draft=True) + 2 * d * d * 4) if c.mtp else 0,
+                         head_work=head_work, draft_head_work=draft_head_work,
+                         decode_phases=prec["attention", "decode"][1], prefill_phases=prec["attention", "prefill"][1])
 
 def session(c, use, speculative=False):
   """Bytes reserved per session for KV caches and DeltaNet states, including the prediction layer. Sliding
@@ -141,21 +155,26 @@ def step(c, s, use, card, users, speculative=False, cards=1):
   reads = s.every + s.moe * touched(c, n) * s.expert + users * one.state * (1.5 if speculative else 2)
   reads += blocks * attention(c, c.kv * users, c.heads // c.kv * (1 + speculative), use["context"], use["kv"])
   reads += c.layers * ACTIVATIONS[0] + s.moe * outputs(n) + ACTIVATIONS[1] * -(-n // 32)
-  flops = 2 * n * s.values + n * blocks * 4 * c.heads * llama.head(c) * use["context"]
+  attention_flops = n * blocks * 4 * c.heads * llama.head(c) * use["context"]
+  flops = 2 * n * s.values + attention_flops
+  work = 2 * n * s.work + attention_flops * s.decode_phases
   linear = c.layers - blocks
   launches = blocks * LAUNCHES["attention" + v] + linear * LAUNCHES["deltanet" + v] + s.moe * LAUNCHES["experts"] + LAUNCHES["rest" + v]
   control = blocks * past("attention" + v, n) + linear * past("deltanet" + v, n) + past("rest" + v, n)
   if speculative:  # the drafting call runs the layer over two positions per user, and the output layer again
     reads += s.draft + c.mtp * (touched(c, 2 * users) * s.expert + ACTIVATIONS[0] + outputs(2 * users)) + s.head
     reads += c.mtp * attention(c, c.kv * users, 2 * c.heads // c.kv, use["context"], use["kv"])
-    flops += 2 * 2 * users * (s.draft_values + c.vocab * d)
+    attention_flops = 2 * users * c.mtp * 4 * c.heads * llama.head(c) * use["context"]
+    flops += 2 * 2 * users * (s.draft_values + c.vocab * d) + attention_flops
+    work += 2 * 2 * users * (s.draft_work + s.draft_head_work) + attention_flops * s.decode_phases
     launches += LAUNCHES["draft"]
     control += c.mtp * past("draft", n)
   control /= bh.AICLK
-  dram, compute = reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards)
+  if card["phases"] is not None: work = flops * card["phases"]
+  dram, compute = reads / (card["bandwidth"] * card["reach"] * cards), work / (card["tflops"] * cards)
   seconds = max(dram, compute) + launches * card["launch"] + control
   rate = (1 + use["accept"] if speculative else 1) / seconds
-  return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, rate=rate)
+  return SimpleNamespace(reads=reads, seconds=seconds, launches=launches, control=control, flops=flops, work=work, compute=compute, rate=rate)
 
 def prompt(c, s, use, card, chunk, cards=1):
   """Estimate seconds and tokens/s to prefill use's context in chunks, as serve.py does. Count non-expert
@@ -164,17 +183,23 @@ def prompt(c, s, use, card, chunk, cards=1):
   longer of DRAM and matmul time. Launch and control overhead are omitted."""
   hd, d, n = llama.head(c), c.dim, use["context"]
   blocks = sum(not llama.linear(c, l) for l in range(c.layers)) + c.mtp
-  seconds = 0.0
+  seconds = total_flops = total_work = 0.0
   for at in range(0, n, chunk):
     m = min(chunk, n - at)
     rows = at + m
     reads = s.every + s.moe * touched(c, m) * s.expert + blocks * attention(c, c.heads, m, rows, use["kv"]) + regroups(c, m)
-    flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + blocks * 4 * m * c.heads * hd * rows
+    attention_flops = blocks * 4 * m * c.heads * hd * rows
+    flops = 2 * m * (s.values - c.vocab * d) + 2 * c.vocab * d + attention_flops
+    work = 2 * m * (s.work - s.head_work) + 2 * s.head_work + attention_flops * s.prefill_phases
     if c.mtp:
       reads += s.draft + c.mtp * touched(c, m) * s.expert + s.head
-      flops += 2 * m * (s.draft_values + c.vocab * d)
-    seconds += max(reads / (card["bandwidth"] * card["reach"] * cards), flops / (card["tflops"] / card["phases"] * cards))
-  return SimpleNamespace(seconds=seconds, rate=n / seconds)
+      flops += 2 * m * s.draft_values + 2 * c.vocab * d
+      work += 2 * m * s.draft_work + 2 * s.draft_head_work
+    if card["phases"] is not None: work = flops * card["phases"]
+    total_flops += flops
+    total_work += work
+    seconds += max(reads / (card["bandwidth"] * card["reach"] * cards), work / (card["tflops"] * cards))
+  return SimpleNamespace(seconds=seconds, rate=n / seconds, flops=total_flops, work=total_work)
 
 def hourly(card): return (card["price"] + card["host"]) / (card["years"] * 8766) + (card["watts"] + card["host_watts"]) / 1000 * card["kwh"]
 
@@ -187,7 +212,7 @@ def report(folder, mode="bf16", **keys):
     if k != "probe": (card if k in card else use)[k] = v if k == "kv" else float(v)
   if "probe" in keys: card = probed(card, keys["probe"])
   for k, v in (card | use).items():
-    if k != "kv" and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
+    if k != "kv" and v is not None and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
   for k in ("bandwidth", "reach", "tflops", "phases", "years", "pcie"):
     if card[k] == 0: raise ValueError(f"{k} must be positive")
   if card["reserve"] >= card["dram"]: raise ValueError("reserve must be smaller than dram")
@@ -200,6 +225,8 @@ def report(folder, mode="bf16", **keys):
   room, hour = cards * (card["dram"] - card["reserve"]) - s.bytes, hourly(card) * cards
   out = [f"{name}: {s.held / 1e9:.1f}B parameters, {s.values / 1e9:.2f}B active per token. In {mode} mode it takes "
          f"{s.bytes / 1e9:.1f} GB on {cards} card{'s' * (cards > 1)}, {room / 1e9:.1f} GB free, ${hour:.3f} an hour"]
+  out.append("  compute uses each operation's precision phases" if card["phases"] is None else
+             f"  compute assumes {card['phases']:g} phases for every operation (override)")
   for speculative in (False, True) if c.mtp else (False,):
     one = session(c, use, speculative)
     most = int(room // one.bytes)

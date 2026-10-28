@@ -223,11 +223,13 @@ def bytes_per_token(t, c, context):
 def roofline(flops, seconds, phases):  # a benchmark's share of the card's peak matmul rate at its fidelity phases
   return flops / seconds / (cost.CARD["tflops"] / phases)
 
-def prefill_flops(c, n):
-  # B3's matmul flops. Each token goes through the weights, but only the last goes through the output layer.
+def prefill_flops(c, n, phases=False):
+  # B3's matmul flops, or phase-weighted work when phases=True. Each token goes through the weights, but only the last goes through the output layer.
   # Attention adds its scores and values over the rows that each token sees.
   s = cost.shape(c, "tt")
-  return 2 * n * (s.values - c.vocab * c.dim) + 2 * c.vocab * c.dim + c.layers * 4 * c.heads * llama.head(c) * n * (n + 1) // 2
+  values, head = (s.work, s.head_work) if phases else (s.values, c.vocab * c.dim)
+  attention = c.layers * 4 * c.heads * llama.head(c) * n * (n + 1) // 2
+  return 2 * n * (values - head) + 2 * head + attention * (s.prefill_phases if phases else 1)
 
 def model(folder, s, places):  # the model's config at TT's performance precision, and its weights, read lazily
   c, w = llama.load(folder, places)
@@ -303,7 +305,7 @@ def baretile(folder, prompt, after, top5, book, s):
     try:
       seconds, chunk = prefill(t, c, ids[:n])
       out[f"B3 prefill, {n} tokens"] = {"seconds to first token": seconds, "chunk": chunk,
-                                        "roofline": roofline(prefill_flops(c, n), seconds, cost.CARD["phases"])}
+                                        "roofline": roofline(prefill_flops(c, n, phases=True), seconds, 1)}
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run": f"{type(e).__name__}: {e}"}
   from models import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
   places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
@@ -383,7 +385,7 @@ def ttnn(folder, prompt, after, top5, book, s):
   for n in s.lengths:  # the script adds a beginning-of-text token to n - 1 tokens of the book. --max_seq_len leaves room for 2n
     b3 = out[f"B3 prefill, {n} tokens"] = demo(f"b3-{n}", "long-context-64k", ("seconds to first token",), "--mode", "prefill",
                                                "--max_seq_len", str(2 * n), "--max_generated_tokens", "1", text=tok.decode(ids[:n - 1]))
-    if "seconds to first token" in b3: b3["roofline"] = roofline(prefill_flops(c, n), b3["seconds to first token"], cost.CARD["phases"])
+    if "seconds to first token" in b3: b3["roofline"] = roofline(prefill_flops(c, n, phases=True), b3["seconds to first token"], 1)
   return out
 
 def table(baretile, ttnn):
