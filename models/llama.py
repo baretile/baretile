@@ -564,15 +564,17 @@ def python_regex(pat):
 
 class Tokenizer:
   """Encode and decode byte-level BPE using tokenizer.json, without a tokenizer library.
-  Split text with the tokenizer's regular expression and apply its ordered merges. ignore_merges keeps
+  Run pre-tokenizer stages in order and apply the configured merges. ignore_merges keeps
   whole vocabulary pieces; files without a merges list use token IDs as ranks, like tiktoken. Special-token
-  spellings are ordinary text unless encode is called with special=True."""
+  spellings are ordinary text unless encode is called with special=True. With no unknown token, bytes
+  absent from the alphabet are skipped before merging, as in Hugging Face BPE."""
   def __init__(self, folder):
     t = read_json(os.path.join(folder, "tokenizer.json"))
     model = t["model"]
     if model.get("type", "BPE") != "BPE": raise ValueError("Tokenizer needs a byte-level BPE model")
     if model.get("dropout") or model.get("continuing_subword_prefix") or model.get("end_of_word_suffix") or model.get("byte_fallback"):
       raise ValueError("Tokenizer needs deterministic byte-level BPE without subword affixes or byte fallback")
+    if model.get("unk_token") is not None: raise ValueError("Tokenizer does not support unknown-token replacement")
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))  # GPT-2's bytes as printable characters
     byte = dict(zip(map(chr, bs + [256 + i for i in range(256 - len(bs))]), bs + [b for b in range(256) if b not in bs]))
     special = {a["content"]: a["id"] for a in t.get("added_tokens", [])}
@@ -592,14 +594,23 @@ class Tokenizer:
     self.ignore_merges = model.get("ignore_merges", self.merges is None)
     self.bytes = {i: b for b, i in self.vocab.items()} | {i: s.encode() for s, i in special.items()}
     self.special, self.specials = special, re.compile("(" + "|".join(map(re.escape, sorted(special, key=len, reverse=True))) + ")")
-    pre = t.get("pre_tokenizer") or {}  # the split before BPE. Llama 3's tokenizer.json has its own, else we use SmolLM's
-    split = [p["pattern"]["Regex"] for p in pre.get("pretokenizers", [pre]) if p.get("type") == "Split" and "Regex" in p.get("pattern", {})]
-    self.split, self.pieces = python_regex(split[0] if split else SPLIT), {}
+    pre = t.get("pre_tokenizer") or {}
+    patterns = [] if pre else [SPLIT]  # legacy rank-only files without a pre-tokenizer
+    for p in pre.get("pretokenizers", [pre]) if pre else ():
+      kind = p.get("type")
+      if kind == "Split" and "Regex" in p.get("pattern", {}) and not p.get("invert") and p.get("behavior", "Isolated") == "Isolated":
+        patterns.append(p["pattern"]["Regex"])
+      elif kind == "Digits": patterns.append(r"\p{N}" + ("" if p.get("individual_digits", False) else "+"))
+      elif kind == "ByteLevel" and not p.get("add_prefix_space", True):
+        if p.get("use_regex", True): patterns.append(SPLIT.replace(r"|\p{N}|", r"| ?\p{N}+|"))  # GPT-2's digit groups
+      else: raise ValueError(f"Tokenizer does not support pre-tokenizer {p}")
+    self.splits, self.pieces = [python_regex("(" + p + ")") for p in patterns], {}
+    if any(p.groups != 1 for p in self.splits): raise ValueError("Tokenizer split patterns must not contain capturing groups")
     self.nfc = (t.get("normalizer") or {}).get("type") == "NFC"  # Qwen composes the text first, so an e and its accent become one letter
 
   def bpe(self, piece):  # a piece's bytes as ids
     if piece not in self.pieces:
-      parts = [piece] if self.ignore_merges and piece in self.vocab else [piece[i:i + 1] for i in range(len(piece))]
+      parts = [piece] if self.ignore_merges and piece in self.vocab else [b for i in range(len(piece)) if (b := piece[i:i + 1]) in self.vocab]
       while len(parts) > 1:
         ranks = (self.vocab.get(a + b, math.inf) if self.merges is None else self.merges.get((a, b), math.inf)
                  for a, b in zip(parts, parts[1:]))
@@ -611,7 +622,9 @@ class Tokenizer:
   def encode(self, text, special=False):  # with special, a special token's text becomes that token, as in a chat template
     if special and self.special:
       return [i for part in self.specials.split(text) if part for i in ([self.special[part]] if part in self.special else self.encode(part))]
-    return [i for piece in self.split.findall(unicodedata.normalize("NFC", text) if self.nfc else text) for i in self.bpe(piece.encode())]
+    pieces = [unicodedata.normalize("NFC", text) if self.nfc else text]
+    for split in self.splits: pieces = [part for piece in pieces for part in split.split(piece) if part]
+    return [i for piece in pieces for i in self.bpe(piece.encode())]
   def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")
 
 def main():

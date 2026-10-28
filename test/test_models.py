@@ -502,6 +502,25 @@ def test_bpe_merge_order(tmp_path):
     with pytest.raises(ValueError, match="Tokenizer"): llama.Tokenizer(str(tmp_path))
 
 
+def test_bpe_stages_and_missing_bytes(tmp_path):
+  # SmolLM splits digits before ByteLevel. Whitespace before a digit therefore reaches BPE as one piece. BPE with
+  # unk_token=None drops absent alphabet bytes before merging, so a missing byte can join two known letters.
+  vocab = {"a": 0, "b": 1, "ab": 2, "Ġ": 3, "ĠĠ": 4, "Ċ": 5, "ĉ": 6, "Ċĉ": 7, "2": 8, "1": 9, "12": 10}
+  model = dict(type="BPE", vocab=vocab, merges=[["a", "b"], ["Ġ", "Ġ"], ["Ċ", "ĉ"], ["1", "2"]], unk_token=None)
+  byte = dict(type="ByteLevel", add_prefix_space=False, use_regex=True)
+  def tokenizer(pre, extra=None):
+    (tmp_path / "tokenizer.json").write_text(json.dumps(dict(model=model | (extra or {}), pre_tokenizer=pre)))
+    return llama.Tokenizer(str(tmp_path))
+  for each in (False, True):
+    tok = tokenizer(dict(type="Sequence", pretokenizers=[dict(type="Digits", individual_digits=each), byte]))
+    assert tok.encode("  2") == [4, 8] and tok.encode("\n\t2") == [7, 8]
+    assert tok.encode("12") == ([9, 8] if each else [10])
+  tok = tokenizer(byte | dict(use_regex=False))
+  assert tok.encode("a?b") == tok.encode("a\x1db") == [2] and tok.encode("?") == []
+  with pytest.raises(ValueError, match="unknown-token"): tokenizer(byte, dict(unk_token="<unk>"))
+  with pytest.raises(ValueError, match="pre-tokenizer"): tokenizer(byte | dict(add_prefix_space=True))
+
+
 def test_generation_defaults():
   # A nonempty generation config without EOS inherits the selected text model's token, even in a multimodal config.
   model = dict(eos_token_id=1, temperature=0.8, text_config=dict(eos_token_id=2, top_k=30))
@@ -531,7 +550,7 @@ def test_tokenizer(tmp_path):
            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
            r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
   for split, nfc in ((llama3, False), (None, False), (llama3, True), (o200k, False)):
-    pre = {"type": "Split", "pattern": {"Regex": split}} if split else {"type": "ByteLevel"}
+    pre = {"type": "Split", "pattern": {"Regex": split or llama.SPLIT}}
     (tmp_path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}, "added_tokens": [{"content": "<|end|>", "id": len(vocab)}],
                                                          "pre_tokenizer": pre, "normalizer": {"type": "NFC"} if nfc else None}))
     ours = llama.Tokenizer(str(tmp_path))
