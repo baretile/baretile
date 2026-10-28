@@ -60,6 +60,15 @@ Some slices and reshapes change only the view of a tensor: its batch, strides
 and offset. When data has to move, `move_kernel` copies it to the new layout.
 `gather` reads rows by index, and `put` writes them. The models use these for
 embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
+Casting block floats to bf16 decodes them on the chip into ordinary tiles;
+casting column storage to its own dtype also restores ordinary tile order.
+Further casts and movement use those tiles. Column copies preserve gradients.
+Block-float casts use a straight-through gradient in bf16: backward treats the
+quantizer as an identity, while matmul uses the stored, quantized weights for
+its input gradient. This approximates the quantizer's derivative.
+Matmul with `dtype="int32"` accumulates in fp32 and then converts the result.
+Expressions with several indexed matmuls or mixed block-float weights are split
+into supported kernels before fusion.
 `move` checks that its selected source positions stay inside the input's logical
 shape. Its offset and strides must fit signed 32-bit integers. Padding outside
 the selected output bounds reads no source data. Negative `pad` widths crop
