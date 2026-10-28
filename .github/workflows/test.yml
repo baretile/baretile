@@ -2,7 +2,32 @@
 # transformers or tinygrad skip themselves here.
 name: test
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install build
+      # Build the wheel from the sdist, then import it without the checkout on sys.path.
+      - run: python -m build
+      - run: python -m pip install dist/*.whl
+      - name: Check the installed package and its visualization template
+        run: |
+          python -I - <<'PY'
+          from importlib import metadata, resources
+          from baretile import chip, kernels, pci, runtime, tensor, tensix, viz
+          assert not metadata.requires("baretile")
+          assert "<canvas" in resources.files("baretile").joinpath("viz.html").read_text()
+          PY
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

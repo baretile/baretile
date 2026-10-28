@@ -155,12 +155,13 @@ const under = px => {  // the launch under a point of the timeline, by binary se
 };
 let drag = null;
 canvas.onwheel = e => {
+  if (!run) return;
   e.preventDefault();
   const t = at(e.offsetX), f = Math.max(Math.exp(e.deltaY * 0.0015), 10 / (view[1] - view[0]));  // no closer than 10 cycles across
   view = [t - (t - view[0]) * f, t + (view[1] - t) * f];
   draw();
 };
-canvas.onmousedown = e => drag = { x: e.clientX, view: [...view], moved: false };
+canvas.onmousedown = e => { if (run) drag = { x: e.clientX, view: [...view], moved: false }; };
 onmouseup = e => {
   if (drag && !drag.moved && e.target == canvas) { const l = under(e.offsetX); if (l) pick(l[0]); }
   drag = null;
