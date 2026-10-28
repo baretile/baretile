@@ -1826,6 +1826,11 @@ def test_cost_fidelity():
   assert step.work == 2 * step.flops - 2 * 2 * gate_up
   attention = c.layers * 4 * 64 * c.heads * llama.head(c) * 64
   assert prompt.work == 2 * prompt.flops - 2 * 64 * gate_up + 2 * attention
+  # A one-token remainder uses decode attention, as does a workload made entirely of one-token chunks.
+  tail = cost.prompt(c, s, use | {"context": 65}, card, 64)
+  assert tail.work - prompt.work == 2 * s.work + c.layers * 4 * c.heads * llama.head(c) * 65 * s.decode_phases
+  singles = cost.prompt(c, s, use | {"context": 3}, card, 1)
+  assert singles.work == 2 * 3 * s.work + c.layers * 4 * c.heads * llama.head(c) * (1 + 2 + 3) * s.decode_phases
   # Llama-3.1-8B's last gate/up uses two phases rather than TT's usual one.
   large = llama.model(dim=4096, heads=32, kv=8, layers=32, ffn=14336, vocab=128256)
   s = cost.shape(large, "tt")
