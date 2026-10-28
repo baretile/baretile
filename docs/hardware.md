@@ -25,9 +25,10 @@ the ISA, see the simulator's `pcie.cpp` and kmd.
 
 `pci.Card` maps BAR0 through sysfs. It unbinds an existing kernel driver, enables
 memory access and bus mastering, and sets the maximum read request size to
-4 KiB. `pci.release` binds tt-kmd's `tenstorrent` driver again afterwards, and
-`pci.preflight` checks what `Card` needs without opening the card. It copies registers a word at a time. Using `memcpy` could split a register
-access into separate byte transactions. TLB 201 is reserved for tt-kmd.
+4 KiB. `Card` copies registers a word at a time, since `memcpy` could split a
+register access into separate byte transactions. TLB 201 is reserved for
+tt-kmd. `pci.preflight` checks what `Card` needs without opening the card, and
+`pci.release` binds tt-kmd's `tenstorrent` driver again afterwards.
 
 A TLB maps a BAR window to a tile and address on the NoC. The configuration
 starts at BAR0 `0x1FC00000`, with three 32-bit words per entry. Write those words
@@ -81,7 +82,7 @@ NoC0 routes along increasing x, then increasing y, wrapping at the grid edges.
 NoC1 routes the opposite way, along y first. A reply uses the same NoC as its
 request. A different DRAM port can shorten the route back to a worker. The
 runtime uses raw coordinates to compare those routes when assigning readers. See
-`NoC/Coordinates.md`, `RoutingPaths.md` and `bh.hops`.
+`NoC/Coordinates.md`, `NoC/RoutingPaths.md` and `bh.hops`.
 
 Each of the eight DRAM banks has three ports addressing the same memory.
 The allocator uses `0xFF000000` bytes per bank, matching ttsim's 4080 MiB.

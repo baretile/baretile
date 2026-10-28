@@ -142,8 +142,8 @@ def test_card_copies():
   assert [pci._width(a, n) for a, n in ((0, 64), (4, 12), (1, 7))] == [8, 4, None]
 
 def test_card_wants_root():
-  # pci.Card and pci.reset check for root before they touch the card, so this test needs no card. Without root they
-  # raise PermissionError before any sysfs write can fail.
+  # pci.Card, pci.reset and pci.release check for root before they touch the card, so this test needs no card.
+  # Without root they raise PermissionError before any sysfs write can fail.
   if os.geteuid() == 0: pytest.skip("as root, Card would go on to open the device")
   with pytest.raises(PermissionError, match="root"): pci.Card("0000:00:00.0")
   with pytest.raises(PermissionError, match="root"): pci.reset("0000:00:00.0")

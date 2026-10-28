@@ -21,14 +21,15 @@ STRICT = 1  # ordering: each write is acknowledged before the next one starts
 MCAST_VC = 2  # multicast on a static VC must use class 2. umd uses it too (ISA NoC/MemoryMap.md NOC_CTRL)
 
 # NoC endpoints, in translated coordinates. Firmware maps these at boot to skip harvested columns. Available Tensix
-# columns come first in TENSIX_X: a p150 has 12, and telemetry says how many. Tensix rows are 2..11.
+# columns come first in TENSIX_X: a p150 has 12, or 14 with firmware before 19.5, and telemetry says how many. Tensix
+# rows are 2..11.
 TENSIX_X, TENSIX_Y = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16), range(2, 12)
 DRAM = [(17 + b // 4, 12 + 3 * (b % 4)) for b in range(8)]  # bank b, which also answers at y+1 and y+2
 # ttsim models 4080 MiB a bank. A p150 has 4 GiB a bank, and we don't know whether firmware keeps any of it.
 DRAM_BANK_SIZE = 0xFF000000
 DRAM_GBPS = 512  # GDDR6 bandwidth of a p150, all banks together (Tenstorrent's specification)
 PCIE = (19, 24)
-ARC = (8, 0)  # rows 0 and 1 aren't translated
+ARC = (8, 0)  # raw x, since rows 0 and 1 aren't translated in x
 
 # ARC is the management core. We talk to it through the scratch registers of its reset unit.
 ARC_BOOT_STATUS, ARC_READY = 0x80030408, 5  # SCRATCH_RAM[2]: low 3 bits are 5 once firmware is up and takes messages
@@ -49,7 +50,7 @@ POWER_ON = 0x21 | 15 << 8 | 0x7FFF << 16
 # tt-kmd's probe sends it too. AICLK_GO_BUSY requests the busy AI clock, as UMD does.
 ASIC_STATE0, AICLK_GO_BUSY = 0xA0, 0x52
 # BAR0 offset of the NIU config of the PCIe tile. With this bit set, the NoC takes translated coordinates, which are
-# the ones in this file. UMD and kmd read it too.
+# the ones in this file. UMD reads it too.
 NIU_CFG_0, NOC_TRANSLATED = 0x1FD04100, 1 << 14
 # BAR0 offsets of that NIU's translation tables. They give the raw x of each translated x and the raw y of each
 # translated y, as 32 entries of 5 bits, 6 to a word (ISA NoC/Coordinates.md). Rows 0 and 1 aren't translated in x.
@@ -145,8 +146,9 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
   **{f"RMWCIB{i}": (0xB3 + i, {"cfg_reg_addr": (0, 8), "data": (8, 8), "mask": (16, 8)}) for i in range(4)},  # byte i of a config word
   # The SFPU is the 32-lane vector unit that works on Dst (ISA VectorUnit.md). Field names are the ones on the ISA
-  # pages. vd, vc, vb and va are LRegs. 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0, 11 = -1.0 and 15 = 2 * lane.
-  # Writing 12-15 does something else.
+  # pages. vd, vc, vb and va are LRegs. 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0 and 15 = 2 * lane (ISA
+  # LReg.md). Only SFPCONFIG writes 11-14, and leaving the SFPU's soft reset sets 11 to -1.0 (ISA SoftReset.md), where
+  # tt-llk keeps it too. Writing 12-15 does something else.
   "SFPLOAD": (0x70, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPLOADI": (0x71, {"imm16": (0, 16), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPSTORE": (0x72, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
@@ -205,15 +207,16 @@ TENSIX_CFG_FIELDS = {
   "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
 }
 # Thread config: 16-bit registers for each thread, written only by SETC16 from that thread. These are register indices.
-# Each address mode has 8 slots, slot i at base + i. Blackhole's addr_mode field is 3 bits wide (ttsim's
-# tensix_isa.json), so all 8 are usable. The ISA pages describe Wormhole, which has 2 bits and a separate
+# AB, DST and BIAS address modes have 8 slots and PACK has 4, slot i at base + i. Blackhole's addr_mode field is 3 bits
+# wide (ttsim's tensix_isa.json), so all 8 are usable. The ISA pages describe Wormhole, which has 2 bits and a separate
 # ADDR_MOD_SET_Base that Blackhole dropped.
 THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABLE_IMPLIED_SRCB": 3, "SRCA_SET": 5,
               "CLR_DVALID": 7, "FIDELITY_BASE": 11, "UNPACK_MISC": 41}
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA and SrcB rows come from the unpacker's address. our UNPACRs rely on that
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter, so it reads tiles below this (ISA ADCs.md)
 BFP_FIRST_DATUM = 1 << 16  # the unpacker finds a bfp tile's exponents from its first datum, which must stay below this
-LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}  # SFPU registers that hold these constants (ISA LReg.md). LReg 8 holds 0.8373
-# Address modes, 8 slots each. AB holds SrcAIncr | SrcBIncr << 8, DST holds DestIncr | FidelityIncr << FIDELITY_INCR,
-# PACK holds YsrcIncr, and BIAS is the packer's. Row counters wrap at 64 in Src and 1024 in Dst.
+LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}  # SFPU registers that hold these constants (see the SFPU note above). LReg 8 holds 0.8373
+# Address modes: 8 slots each of AB, DST and BIAS, and 4 of PACK. AB holds SrcAIncr | SrcBIncr << 8, DST holds
+# DestIncr | FidelityIncr << FIDELITY_INCR, PACK holds YsrcIncr, and BIAS is the packer's. Row counters wrap at 64 in
+# Src and 1024 in Dst.
 ADDR_MOD_AB, ADDR_MOD_DST, ADDR_MOD_PACK, ADDR_MOD_BIAS, FIDELITY_INCR = 12, 28, 37, 47, 13

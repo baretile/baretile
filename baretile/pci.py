@@ -113,8 +113,8 @@ class Card:
 
   def alloc(self, size):
     """Allocate a locked, physically contiguous 2 MiB hugepage and return (memoryview, bus address). The page
-    returns to the kernel's pool when the memoryview is no longer referenced. A Runtime keeps a reference
-    for its command ring and status words."""
+    returns to the kernel's pool when the memoryview is no longer referenced. A Runtime keeps one for its
+    status, ring, launch times and transfer staging."""
     if size > 1 << 21: raise ValueError("Card.alloc gives at most one 2 MiB hugepage")
     MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages, even if the host's default differs
     # Cached scalar tensors refer back to their Runtime, so dropping a Runtime can leave a reference cycle.

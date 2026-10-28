@@ -186,7 +186,7 @@ def probe(chip, n=64, rounds=32, upload=8 << 20):
 if __name__ == "__main__":
   chip = Chip(pci.open_device())
   sim = isinstance(chip.pci, pci.Sim)
-  print("ttsim: probes completed; timings do not predict card performance" if sim else f"{chip.pci.sys}: the card")
+  print("ttsim: timings do not predict card performance" if sim else f"{chip.pci.sys}: the card")
   rows = probe(chip, upload=(int(sys.argv[1]) if len(sys.argv) > 1 else 8) << 20)
   for what, value, against, unit in rows: print(f"  {what:72s} {value:12.2f} {unit:9s}" + (f" (bound: {against})" if against is not None else ""))
   if len(sys.argv) > 2: json.dump({what: value for what, value, _, _ in rows}, open(sys.argv[2], "w"), indent=1)

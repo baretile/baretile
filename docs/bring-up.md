@@ -90,7 +90,10 @@ On a card, we need to check that DMA reaches host memory, ARC turns the clocks
 on, and the status writes arrive in order. We also need to check that loading
 a new kernel invalidates the old instructions and that the Tensix registers
 are at the indices we use. The BAR2 offsets and parts of ARC's protocol come
-from the drivers and simulator because the ISA doesn't document them.
+from the drivers and simulator because the ISA doesn't document them. The SFPU
+programs read -1.0 from LReg 11, which leaving the SFPU's soft reset sets and
+tt-llk keeps there. baretile doesn't reset the SFPU itself, so check that the
+value is there when kernels start.
 `python3 -m baretile.chip release` is tested against fake sysfs files only.
 
 The host relies on x86 ordering between writes to the ring and the doorbell.
