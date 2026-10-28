@@ -745,7 +745,8 @@ def _backward(t, g):
   if op == "matmul" and len(srcs) == 3: raise NotImplementedError("a matmul by index has no backward")
   if op == "matmul":  # a transposed B gets its gradient as (g.T @ x).T, and the T's own rule cancels that transpose
     turn = y._ctx is not None and y._ctx[0] == "T"
-    plain = y.cast("bf16") if y.runs or y.dtype in BFP else y
+    plain = y
+    if y.runs or y.dtype in BFP: plain = y.srcs[0].cast("bf16").T if y.op == "T" else y.cast("bf16")
     yd = "bf16" if y.dtype in BFP else y.dtype
     if args:  # fp32: the forward's parts, transposed, and g's parts, made once for both
       gp, (xp, yp) = _parts(g), args

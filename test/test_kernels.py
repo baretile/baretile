@@ -1783,3 +1783,8 @@ def test_storage_conversion_and_gradients(chip):
     ga, gw = (a @ quant).sum().gradient(a, w)
     close(ga, np.asarray(quant.tolist()).sum(1).reshape(1, 2), 0.02)
     assert gw.tolist() == [[1., 1.], [2., 2.]]
+    w = Tensor.of(rt, [[1.25, -2.], [3.5, 4.25], [0.5, 1.]]).requires_grad_()
+    stored = w.cast(dtype)
+    ga, gw = (a @ stored.T).sum().gradient(a, w)
+    close(ga, np.asarray(stored.tolist()).sum(0).reshape(1, 2), 0.02)
+    assert gw.tolist() == [[1., 2.]] * 3
