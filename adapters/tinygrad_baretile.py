@@ -599,7 +599,10 @@ def tinyjit(self, *args, **kwargs):
         back = [(h, old) for h, (old, _) in recording.items() if old is not None and h not in holders]
         same = lambda h, old: isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
         into_input = any(stored and h in holders for h, (_, stored) in recording.items())
-        replayable = hosted == 0 and not into_input and all(same(h, old) for h, old in back)
+        # Returned input views still name the caller's holder, which is restored below rather than replayed.
+        input_bases = {t.uop.storage_base for t in ins}
+        returns_input = any(t.uop.storage_base in input_bases for t in get_parameters(ret))
+        replayable = hosted == 0 and not into_input and not returns_input and all(same(h, old) for h, old in back)
         for h, old in back if replayable else ():
           if h.value.t is not old.t: old.t.assign(h.value.t)
           h.value = Value(old.t, h.value.view, h.value.dtype)

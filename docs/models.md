@@ -196,8 +196,9 @@ reuse their recorded storage on subsequent calls. Assigning a captured BARETILE
 weight or other buffer invalidates the recording; the next eligible call records
 again. A mixed-device call also discards the recording before running normally.
 Calls that materialize data on the host, bind symbolic variables, pass repeated
-or partial input buffers, or store into input buffers execute normally. Discarded
-recordings release their allocations after queued work completes. Keep captured
+or partial input buffers, store into input buffers, or return an input or a view
+of one execute normally, including aliases inside returned containers.
+Discarded recordings release their allocations after queued work completes. Keep captured
 CPU tensors constant, or pass changing values as BARETILE inputs.
 
 PyTorch uses tinygrad's `extra/torch_backend`, which needs a tinygrad checkout,
