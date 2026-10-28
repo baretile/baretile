@@ -4,7 +4,8 @@
 #   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4]
 # model is a local folder or Hugging Face ID. The final two arguments select the precision mode and KV cache format.
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import codecs, collections, functools, json, math, os, queue, re, shutil, sys, tempfile, threading, time, urllib.error, urllib.request, uuid
+import codecs, collections, functools, json, math, os, queue, re, shutil, socket, sys, tempfile, threading, time, uuid
+import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -15,17 +16,20 @@ from baretile.tensor import Tensor, jit
 from models import gpt2, llama, qwen
 
 class Head:
-  """The largest logits in a row, with token IDs in descending logit order. lse is log(sum(exp(x*t))) over the
-  whole row, where t is inverse temperature. row() reads the full row when sampling needs it. Head.of builds
-  the same representation from NumPy logits."""
+  """The largest logits in a row, with token IDs in descending logit order. lse is log(sum(exp((x-max(x))*t)))
+  over the whole row, where t is inverse temperature. Subtract the maximum before scaling to avoid overflow.
+  row() reads the full row when sampling needs it. Head.of builds the same representation from NumPy logits."""
   def __init__(self, values, ids, lse, row): self.values, self.ids, self.lse, self.row = np.asarray(values, np.float64), ids, float(lse), row
   @staticmethod
   def of(logits, t=1.0, k=64):  # finds the k-th largest with a partition, then sorts the logits at least that large. Ties keep the lower id first
+    logits = np.asarray(logits, np.float64)
+    if logits.ndim != 1 or not logits.size or np.isnan(logits).any() or np.isposinf(logits).any() or not np.isfinite(logits).any():
+      raise ValueError("sampling needs a nonempty logit row with a finite maximum and no NaN")
     bar = np.partition(logits, len(logits) - k)[len(logits) - k] if k < len(logits) else logits.min()
     ids = np.flatnonzero(logits >= bar)
     ids = ids[np.argsort(-logits[ids], kind="stable")][:k]
     m = float(logits[ids[0]])
-    return Head(logits[ids], ids, m * t + math.log(np.exp((np.float64(logits) - m) * t).sum()), lambda: logits)
+    return Head(logits[ids], ids, math.log(np.exp((logits - m) * t).sum()), lambda: logits)
 
 def scale(r): return 1 / r.temperature if r and r.temperature > 0 else 1.0  # the 1/temperature of a request. Any value works for greedy
 
@@ -46,9 +50,9 @@ def heads(logits, t=None, k=64):
   best, ids = logits.topk(-(-k // 32) * 32 if parts > 1 else k, parts)
   values, ids = best.topk(k, labels=ids) if parts > 1 else (best, ids)
   if t is None: return values.realize(), ids.realize()
-  x, m = logits.split(parts), best.split(parts).max(2).realize()  # the largest of each part, taken from its best, so the row is read once
-  lse = ((x - m) * t).exp().sum(2).log() + m * t  # for each part
-  if parts > 1: top = lse.max(0); lse = (lse - top).exp().sum(0).log() + top
+  x, m = logits.split(parts), values.max(2).realize()  # one maximum for the row, including every part
+  mass = ((x - m) * t).exp().sum(2)
+  lse = (mass.sum(0) if parts > 1 else mass).log()
   return values.realize(), ids.realize(), lse.realize()
 
 class Request:
@@ -70,6 +74,11 @@ class Request:
       except OverflowError: valid = False
       if not valid: raise ValueError(f"{name} must be a finite number")
     if temperature < 0: raise ValueError("temperature must be nonnegative")
+    fp32 = np.finfo(np.float32)
+    if temperature and not float(fp32.tiny) <= 1 / temperature <= float(fp32.max):
+      raise ValueError("inverse temperature must fit a normal fp32 value, or temperature must be zero")
+    if any(abs(v) > float(fp32.max) for v in (presence, frequency, repetition)) or 0 < repetition < float(fp32.tiny):
+      raise ValueError("penalties must fit fp32, with a normal positive repetition penalty")
     if not 0 < top_p <= 1 or not 0 <= min_p <= 1: raise ValueError("top_p must be in (0, 1] and min_p in [0, 1]")
     if repetition <= 0: raise ValueError("repetition_penalty must be positive")
     if stop is not None and not isinstance(stop, (str, list, tuple)): raise ValueError("stop must be a string or a list of strings")
@@ -81,7 +90,7 @@ class Request:
     self.shape = shape
     self.made, self.said, self.out, self.finish, self.gone, self.cached, self.probs, self.marks = [], "", queue.Queue(), None, False, 0, [], []
     self.text, self.utf8 = "", codecs.getincrementaldecoder("utf-8")("replace")  # the text so far, except a character that's still coming
-    self.room = None
+    self.room, self.error = None, None
 
   def whole(self):
     """Whether sampling needs the full logit row. Penalties or shape constraints can select tokens outside the
@@ -96,15 +105,16 @@ class Request:
     Reject a token that makes the prefix invalid and draw again without it. Accept eos only for complete
     text. This avoids testing every vocabulary token when the first few draws already fit."""
     if not self.whole() and (token := self.sample(head)) is not None: return token
-    logits = head.row()
+    logits = np.asarray(head.row(), np.float64)
     if self.presence or self.frequency or self.repetition != 1:
       made = np.bincount(self.made, minlength=len(logits))[:len(logits)]
       logits = logits - self.presence * (made > 0) - self.frequency * made
       seen = (made > 0) | (np.bincount(self.ids, minlength=len(logits))[:len(logits)] > 0)
       logits = np.where(seen, np.where(logits > 0, logits / self.repetition, logits * self.repetition), logits)
     if self.shape is None: return self.draw(logits)
-    logits = np.array(logits, np.float32)
+    logits = np.array(logits, np.float64)
     for _ in range(32):
+      if not np.isfinite(logits).any(): break
       if self.fits(token := self.draw(logits)): return token
       logits[token] = -np.inf
     # The likeliest token that fits, else None, which ends the request. None comes for a complete text when the model
@@ -119,9 +129,12 @@ class Request:
     doesn't decide it: a top_k larger than the head, or a top_p or min_p cut that reaches past it. Both are known before
     drawing. With no top_k, top_p or min_p, a draw that lands past the mass of the head reads the row back and draws
     from the tokens past the head, so all tokens keep their probabilities."""
+    if not len(head.ids) or not np.isfinite(head.values[0]) or np.isnan(head.values).any():
+      raise ValueError("sampling needs finite top logits")
     if self.temperature == 0: return int(head.ids[0])
+    if not math.isfinite(head.lse) or head.lse < 0: return self.draw(head.row())
     t, k = 1 / self.temperature, len(head.ids)
-    p, total = np.exp((head.values - head.values[0]) * t), math.exp(head.lse - head.values[0] * t)  # relative to the largest
+    p, total = np.exp((head.values - head.values[0]) * t), math.exp(head.lse)  # relative to the largest
     keep = None  # None means no cut
     if self.top_k or self.top_p < 1:
       if self.top_k > k: return None
@@ -146,6 +159,9 @@ class Request:
     Apply top_k first (0 keeps all tokens), then keep the smallest prefix whose probability reaches
     top_p, then remove tokens below min_p times the highest probability. Try the 1,024 largest logits
     first to avoid sorting the whole vocabulary when they contain enough probability."""
+    logits = np.asarray(logits, np.float64)
+    if not logits.size or np.isnan(logits).any() or np.isposinf(logits).any() or not np.isfinite(logits).any():
+      raise ValueError("sampling needs a finite maximum logit and no NaN")
     if self.temperature == 0: return int(logits.argmax())
     p, keep = np.exp((logits - logits.max()) / self.temperature), None  # None means no cut
     if self.top_k or self.top_p < 1:
@@ -168,7 +184,7 @@ class Request:
     if not end:
       self.made.append(token)
       if self.logprobs is not None:  # from the raw logits, before any penalty or temperature. vLLM does the same
-        logits = head.row()
+        logits = np.asarray(head.row(), np.float64)
         lp = logits - logits.max()
         lp = lp - np.log(np.exp(lp).sum())
         n = min(self.logprobs, len(lp))
@@ -263,7 +279,7 @@ class Engine:
     logits at most once if sampling needs them."""
     logits, made = self.made[f, n]
     whole = functools.cache(lambda: gpt2.values(logits))
-    if made is None: return [Head.of(row, x) for row, x in zip(whole(), ts)]
+    if made is None: return list(whole())
     values, ids, lse = (gpt2.values(x) for x in made)
     return [Head(values[i], ids[i], lse[i, 0], lambda i=i: whole()[i]) for i in range(len(ts))]
 
@@ -332,7 +348,7 @@ class Engine:
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
-    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, Head.of(gpt2.values(out)[0], scale(r)), 1 + self.spec)
+    if len(self.held[u]) == len(r.ids): self.save(u); self.take(u, gpt2.values(out)[0], 1 + self.spec)
     if self.spec and self.busy[u] is r:  # the next token at each position: from the prompt, and past its end the one just taken
       after = self.on((r.ids + r.made)[at + 1:at + len(ids) + 1])
       drafts = gpt2.values(qwen.draft(after, places, h, self.t, self.c, self.slot[u], length=n, every=False))
@@ -353,7 +369,13 @@ class Engine:
   # the request ends, so whoever waits on it finds the chip idle.
   def take(self, u, head, room=1):
     r = self.busy[u]
-    if r.take(head, len(self.held[u]) + room < self.places): self.save(u); self.busy[u] = None; r.end()
+    try: done = r.take(head, len(self.held[u]) + room < self.places)
+    except (ValueError, ArithmeticError) as e:
+      r.finish, r.error, done = "error", str(e), True
+    if done:
+      if r.finish != "error": self.save(u)
+      self.busy[u] = None
+      r.end()
     return self.busy[u] is None
 
   def decode(self, ids, places, t, length):  # replayed: the next tokens of the slots, giving their logits and their heads at t
@@ -682,7 +704,7 @@ def answer(text):
   reasoning, _, content = text.partition("</think>")
   return reasoning.removeprefix("<think>").strip(), content.lstrip()
 
-def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None):
+def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None, body_limit=8 << 20, input_wait=10, connections=32):
   """Create an HTTP server for an engine whose thread is already running. Serve /v1/models, /v1/completions and
   /v1/chat/completions, with complete responses or server-sent events.
 
@@ -694,8 +716,41 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   no text arrives within wait seconds. Sampling defaults come from defaults, populated from
   generation_config.json for temperature, top_k, top_p, min_p and repetition_penalty, then from the
   handler's built-in defaults."""
+  for key, v in (("wait", wait), ("input_wait", input_wait)):
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v <= 0:
+      raise ValueError(f"{key} must be a finite positive number")
+  for key, v in (("body_limit", body_limit), ("connections", connections)):
+    if type(v) is not int or v < 1: raise ValueError(f"{key} must be a positive integer")
   defaults, thinks, harmony = defaults or {}, "<think>" in template, family(template) == "harmony"
   class Handler(BaseHTTPRequestHandler):
+    def handle(self):
+      # A socket timeout alone restarts for every read; the timer also bounds a client that trickles bytes.
+      self.expired = threading.Event()
+      def expire():
+        self.expired.set()
+        try: self.connection.shutdown(socket.SHUT_RD)
+        except OSError: pass
+      self.deadline = threading.Timer(input_wait, expire)
+      self.deadline.daemon = True
+      self.connection.settimeout(input_wait)
+      self.deadline.start()
+      try: super().handle()
+      finally: self.deadline.cancel()
+    def input_done(self):
+      self.deadline.cancel()
+      self.connection.settimeout(wait)
+    def body(self):
+      try:
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+          raise ValueError("provide one nonnegative Content-Length and no Transfer-Encoding")
+        size = int(lengths[0])
+        if size > body_limit: raise OverflowError(f"request body exceeds {body_limit} bytes")
+        data = self.rfile.read(size)
+        if self.expired.is_set(): raise TimeoutError("request input deadline expired")
+        if len(data) != size: raise ValueError("request body ended before Content-Length")
+        return data
+      finally: self.input_done()
     def reply(self, code, body):
       data = json.dumps(body).encode()
       self.send_response(code)
@@ -703,13 +758,15 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       self.end_headers()
       self.wfile.write(data)
     def do_GET(self):
+      self.input_done()
+      if self.expired.is_set(): return self.reply(408, {"error": {"message": "request input deadline expired"}})
       if self.path != "/v1/models": return self.reply(404, {"error": {"message": f"not found: {self.path}"}})
       self.reply(200, {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "baretile"}]})
     def do_POST(self):
       is_chat = self.path == "/v1/chat/completions"
       if not is_chat and self.path != "/v1/completions": return self.reply(404, {"error": {"message": f"not found: {self.path}"}})
       try:
-        q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        q = json.loads(self.body())
         if not isinstance(q, dict): raise ValueError("the request must be a JSON object")
         thinking, tools = (q.get("chat_template_kwargs") or {}).get("enable_thinking", True) is not False, is_chat and q.get("tools")
         prompt = chat(template, q["messages"], thinking, q.get("reasoning_effort") or "medium", tools) if is_chat else q["prompt"]
@@ -729,6 +786,8 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
                     top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=given("top_k", 0),
                     min_p=given("min_p", 0.0), presence=given("presence_penalty", 0.0), frequency=given("frequency_penalty", 0.0),
                     repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
+      except TimeoutError: return self.reply(408, {"error": {"message": "request input deadline expired"}})
+      except OverflowError as e: return self.reply(413, {"error": {"message": str(e)}})
       except (ValueError, KeyError, TypeError, AttributeError) as e: return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
       if len(ids) >= engine.places - 1: return self.reply(400, {"error": {"message": f"{len(ids)} tokens, but a slot holds {engine.places - 2}"}})
       # Reject immediately when all slots are busy, so the client can retry or use another provider.
@@ -782,12 +841,38 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       except queue.Empty:
         r.gone = True  # nobody is waiting for it now, so let its slot go
         return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
-      if r.finish == "error": return self.reply(500, {"error": {"message": "the engine stopped on an error"}})
+      if r.finish == "error": return self.reply(500, {"error": {"message": r.error or "the engine stopped on an error"}})
       message, (content, made) = parts(text), called(text)
       if made: message |= {"content": content or None, "tool_calls": made}
       choice = ({"index": 0, "message": {"role": "assistant"} | message} if is_chat else {"index": 0, "text": text}) | logprobs()
       self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
-  return ThreadingHTTPServer(("", port), Handler)
+  class Server(ThreadingHTTPServer):
+    def process_request(self, request, address):
+      if not self.room.acquire(blocking=False):
+        try:
+          request.settimeout(min(input_wait, 1))
+          request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError: pass
+        finally: self.shutdown_request(request)
+        return
+      try: super().process_request(request, address)
+      except BaseException: self.room.release(); raise
+    def process_request_thread(self, request, address):
+      try: super().process_request_thread(request, address)
+      finally: self.room.release()
+  http = Server(("", port), Handler)
+  http.room = threading.BoundedSemaphore(connections)
+  return http
+
+class ScopedRedirect(urllib.request.HTTPRedirectHandler):
+  """Keep download credentials only across redirects within the same origin."""
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+    def origin(url):
+      p = urllib.parse.urlsplit(url)
+      return p.scheme, p.hostname, p.port or {"http": 80, "https": 443}.get(p.scheme)
+    if redirected is not None and origin(req.full_url) != origin(newurl): redirected.remove_header("Authorization")
+    return redirected
 
 def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
   """Return a local model folder, downloading a Hugging Face ID if needed. Fetch config, tokenizer, optional
@@ -796,6 +881,7 @@ def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
   if os.path.isdir(model): return model
   if not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)?", model) or any(p in (".", "..") for p in model.split("/")):
     raise ValueError("model must be an existing folder or a Hugging Face model ID")
+  opener = urllib.request.build_opener(ScopedRedirect())
   folder = os.path.join(cache, model)
   if os.path.exists(os.path.join(folder, ".done")): return folder
   os.makedirs(folder, exist_ok=True)
@@ -810,7 +896,7 @@ def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
     with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), suffix=".part", delete=False) as f:
       try:
         try:
-          with urllib.request.urlopen(urllib.request.Request(url, headers=token), timeout=60) as r: shutil.copyfileobj(r, f)
+          with opener.open(urllib.request.Request(url, headers=token), timeout=60) as r: shutil.copyfileobj(r, f)
         except urllib.error.HTTPError as e:
           if needed or e.code != 404: raise
           return None

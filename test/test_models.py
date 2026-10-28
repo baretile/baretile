@@ -986,7 +986,7 @@ def bytes_tokenizer(folder):  # writes a byte-level vocabulary of the 256 bytes 
 
 def test_heads(chip):
   # serve.heads finds each row's 64 largest logits on the chip, in numpy's stable argsort order, and the log of the sum
-  # of exp(x t) over the row. Qwen3.6's vocabulary splits into 97 parts of 2,560. Llama 3's doesn't split into parts of
+  # of exp((x - max(x)) t) over the row. Qwen3.6's vocabulary splits into 97 parts of 2,560. Llama 3's doesn't split into parts of
   # 96 tiles or fewer, so it takes 24 parts of 5,344, as big as topk's L1 holds. serve.Head.of must agree on the host.
   rt, rng = Runtime(chip), np.random.default_rng(3)
   x = np.float32(rng.integers(-3, 4, (40, 300))) * np.float32(rng.choice([1, 0.5], (40, 300)))  # many ties, -0 among them
@@ -999,8 +999,10 @@ def test_heads(chip):
     values, ids, lse = serve.heads(logits, Tensor.of(rt, [[t] for t in ts], "fp32"))
     want, scaled = np.argsort(-x, -1, kind="stable")[:, :64], np.float64(x) * np.array(ts)[:, None]
     assert np.array_equal(gpt2.values(ids), want) and np.array_equal(gpt2.values(values), np.take_along_axis(x, want, -1)), vocab
-    exact = scaled.max(1) + np.log(np.exp(scaled - scaled.max(1, keepdims=True)).sum(1))
-    assert np.allclose(gpt2.values(lse)[:, 0], exact, rtol=1e-6, atol=0), (gpt2.values(lse)[:, 0], exact)
+    exact = np.log(np.exp(scaled - scaled.max(1, keepdims=True)).sum(1))
+    assert np.allclose([serve.Head.of(row, t).lse for row, t in zip(x, ts)], exact, rtol=1e-13, atol=1e-13)
+    # Relative lse can approach zero. An absolute error of 1e-6 means about one ppm in the normalization mass.
+    assert np.allclose(gpt2.values(lse)[:, 0], exact, rtol=1e-6, atol=1e-6), (gpt2.values(lse)[:, 0], exact)
     assert np.array_equal(gpt2.values(serve.heads(logits, k=1)[1])[:, 0], want[:, 0])
 
 def test_sampling():
@@ -1036,6 +1038,126 @@ def test_request_inputs(tmp_path):
   r = serve.Request(bytes_tokenizer(tmp_path), [1], temperature=0, logprobs=20)
   r.take(np.array([0., 1., 2.]), True)
   assert r.made == [2] and [t for t, _ in r.probs[0][2]] == [2, 1, 0], "logprobs can exceed a small vocabulary"
+
+def test_sampling_boundaries(chip):
+  # Small finite temperatures must not overflow either the inverse temperature or the device normalization.
+  for kw in ({"temperature": 1e-320}, {"temperature": 1e300}, {"repetition": 1e-320}, {"frequency": 1e300}):
+    with pytest.raises(ValueError): serve.Request(None, [], **kw)
+  rt = Runtime(chip)
+  logits = np.full((1, 512), 1e20, np.float32)
+  temperature = 1e-30
+  values, ids, lse = (gpt2.values(x)[0] for x in serve.heads(Tensor.frombytes(rt, 1, 512, logits.tobytes(), dtype="fp32"),
+                                                         Tensor.of(rt, [[1 / temperature]], "fp32")))
+  assert np.allclose(lse, math.log(512), rtol=1e-6), lse
+  for head in (serve.Head(values, ids, lse[0], lambda: logits[0]), serve.Head.of(logits[0], 1 / temperature)):
+    r = serve.Request(None, [], temperature=temperature, min_p=0.1, seed=1)
+    assert len({r.pick(head) for _ in range(100)}) > 64, "equal logits retain all candidates at a small temperature"
+  r = serve.Request(None, [], temperature=temperature, min_p=0.1)
+  assert r.draw(np.array([-np.finfo(np.float32).max, np.finfo(np.float32).max])) == 1
+
+def test_request_sampling_failure(tmp_path):
+  # A bad sampling row releases only its request. Other slots and later offers still work.
+  import queue
+  tok, engine = bytes_tokenizer(tmp_path), object.__new__(serve.Engine)
+  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(2)
+  engine.waiting, engine.busy, engine.held, engine.places = queue.Queue(), [None, None], [[1], [2]], 64
+  engine.save = lambda u: None
+  first, second = [serve.Request(tok, [i], max_tokens=1, temperature=0) for i in (1, 2)]
+  for u, r in enumerate((first, second)):
+    assert engine.offer(r)
+    engine.busy[u] = engine.waiting.get_nowait()
+  assert engine.take(0, np.array([np.nan, 1.]))
+  assert first.finish == "error" and first.error and first.room is None and first.out.get_nowait() is None
+  assert engine.take(1, np.array([0., 1.])) and second.made == [1] and second.finish == "length"
+  later = serve.Request(tok, [3], max_tokens=1, temperature=0)
+  assert engine.offer(later) and not engine.failed
+  engine.busy[0] = engine.waiting.get_nowait()
+  assert engine.take(0, np.array([1., 0.])) and later.made == [0]
+
+def test_http_input_limits(tmp_path):
+  import socket
+  engine = SimpleNamespace(tok=bytes_tokenizer(tmp_path), places=64)
+  http = serve.server(engine, "limits", port=0, body_limit=64, input_wait=0.3, connections=1)
+  thread = threading.Thread(target=http.serve_forever, daemon=True)
+  thread.start()
+  address = ("127.0.0.1", http.server_address[1])
+  def connect(): return socket.create_connection(address, timeout=2)
+  def read(s):
+    out = b""
+    while chunk := s.recv(4096): out += chunk
+    return out
+  prefix = b"POST /v1/completions HTTP/1.0\r\n"
+  try:
+    for headers in (b"Content-Length: -1", b"Content-Length: bad", b"Content-Length: 1\r\nContent-Length: 1",
+                    b"Content-Length: 1\r\nTransfer-Encoding: chunked", b"Content-Length: 65"):
+      with connect() as s:
+        s.sendall(prefix + headers + b"\r\n\r\n")
+        assert read(s).startswith(b"HTTP/1.0 " + (b"413" if headers.endswith(b"65") else b"400")), headers
+    # Bytes continue arriving inside the socket timeout; the total input deadline must still end the body read.
+    with connect() as slow:
+      slow.sendall(prefix + b"Content-Length: 64\r\n\r\n{")
+      start = time.monotonic()
+      for _ in range(6):
+        time.sleep(0.06)
+        try: slow.sendall(b" ")
+        except OSError: break
+      assert read(slow).startswith(b"HTTP/1.0 408") and time.monotonic() - start < 1.5
+    with connect() as headers:
+      headers.sendall(b"GET /v1/models HTTP/1.0\r\nX-Slow: ")
+      assert read(headers).startswith(b"HTTP/1.0 408"), "the deadline also bounds incomplete headers"
+    # One unfinished request consumes the only handler; another gets a bounded rejection.
+    with connect() as held:
+      held.sendall(prefix + b"Content-Length: 64\r\n\r\n{")
+      end = time.monotonic() + 1
+      while time.monotonic() < end:
+        if not http.room.acquire(blocking=False): break
+        http.room.release()
+        time.sleep(0.001)
+      else: pytest.fail("request did not acquire a handler")
+      with connect() as extra:
+        assert read(extra).startswith(b"HTTP/1.0 503")
+      assert read(held).startswith(b"HTTP/1.0 408")
+    with connect() as s:
+      s.sendall(b"GET /v1/models HTTP/1.0\r\n\r\n")
+      assert read(s).startswith(b"HTTP/1.0 200"), "expired requests release their handlers"
+  finally:
+    http.shutdown(); http.server_close(); thread.join(timeout=2)
+    assert not thread.is_alive()
+
+def test_download_redirect_credentials(tmp_path, monkeypatch):
+  import http.server, urllib.request
+  received = []
+  class Sink(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+      received.append((self.path, self.headers.get("Authorization")))
+      data = b"{}"
+      self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self, *args): pass
+  other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+  class Hub(Sink):
+    def do_GET(self):
+      if self.path == "/same": return super().do_GET()
+      self.send_response(302)
+      self.send_header("Location", "/same" if self.path.endswith("config.json") else f"http://127.0.0.1:{other.server_port}/other")
+      self.end_headers()
+  hub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+  threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (hub, other)]
+  for t in threads: t.start()
+  monkeypatch.setenv("HF_ENDPOINT", f"http://127.0.0.1:{hub.server_port}")
+  monkeypatch.setenv("HF_TOKEN", "fake-test-token")
+  try:
+    # Exercise fetch's opener, then stop before its synthetic index is parsed.
+    with pytest.raises(KeyError, match="weight_map"): serve.fetch("org/model", str(tmp_path))
+    assert received and all(token == ("Bearer fake-test-token" if path == "/same" else None) for path, token in received)
+    assert {path for path, _ in received} == {"/same", "/other"}
+    redirect = serve.ScopedRedirect()
+    req = urllib.request.Request("https://example.test/a", headers={"Authorization": "Bearer fake"})
+    for url, want in (("https://example.test:443/b", "Bearer fake"), ("http://example.test/b", None),
+                      ("https://example.test:444/b", None), ("https://other.test/b", None)):
+      assert redirect.redirect_request(req, None, 302, "", {}, url).get_header("Authorization") == want
+  finally:
+    for s in (hub, other): s.shutdown(); s.server_close()
+    for t in threads: t.join(timeout=2); assert not t.is_alive()
 
 def test_tokenizer_without_specials(tmp_path):
   bytes_tokenizer(tmp_path)
