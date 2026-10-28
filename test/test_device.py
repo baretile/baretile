@@ -63,6 +63,14 @@ def test_dma(chip):
   chip.write(*bh.PCIE, bus + 1024, data[::-1])
   assert bytes(buf[1024:1040]) == data[::-1]
 
+def test_sim_dma_fault(chip):
+  # ttsim reaches host memory through a C callback, which can't pass a Python error on. A DMA outside the memory
+  # baretile allocated fails the next tick instead, once.
+  if not isinstance(chip.pci, pci.Sim): pytest.skip("ttsim's DMA callbacks")
+  chip.write(*bh.PCIE, 0x7 << 40, bytes(16))
+  with pytest.raises(RuntimeError, match="not host memory"): chip.pci.tick()
+  chip.pci.tick()
+
 def test_l1(chip):
   # Write both targets before reading either back, so targets that alias each other fail. Then map a TLB onto the first
   # block and read through it. Mapping the same block again gives back the same TLB, so later runtimes don't take a

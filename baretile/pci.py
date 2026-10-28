@@ -29,7 +29,7 @@ class Sim:
       lib.libttsim_clock.argtypes = [ctypes.c_uint32]
       # the devices reach host memory through these callbacks, so they must stay referenced as long as the library lives
       cb = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32)
-      Sim.cbs = (cb(lambda bus, p, n: ctypes.memmove(p, Sim.host(bus, n), n)), cb(lambda bus, p, n: ctypes.memmove(Sim.host(bus, n), p, n)))
+      Sim.cbs = (cb(lambda bus, p, n: Sim.dma_copy(bus, p, n, False)), cb(lambda bus, p, n: Sim.dma_copy(bus, p, n, True)))
       lib.libttsim_set_pci_dma_mem_callbacks(*Sim.cbs)
       lib.libttsim_init()
       Sim.counts = hasattr(lib, "libttsim_chaos")  # a marker that test/ttsim-chaos.patch adds
@@ -54,14 +54,19 @@ class Sim:
     buf, bus = mmap.mmap(-1, size), (len(Sim.dma) + 1) << 32
     Sim.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), buf))
     return memoryview(buf), bus
+  fault = None  # an error in a DMA callback, which ctypes can't raise through C. tick raises it
   @staticmethod
-  def host(bus, n):
+  def dma_copy(bus, p, n, to_host):  # a device reads (to_host False) or writes host memory at bus
     for base, size, addr, _ in Sim.dma:
-      if base <= bus and bus + n <= base + size: return addr + bus - base
-    raise RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
+      if base <= bus and bus + n <= base + size:
+        at = addr + bus - base
+        ctypes.memmove(*((at, p) if to_host else (p, at)), n)
+        return
+    Sim.fault = Sim.fault or RuntimeError(f"device DMA to {bus:#x}+{n}, which is not host memory we allocated")
 
   TICK = 10  # chip clocks per poll, so waits and cycle counts round up to a multiple of TICK
   def tick(self):  # the simulator runs only when we tick it, and a tick advances all of its chips
+    if Sim.fault: fault, Sim.fault = Sim.fault, None; raise fault
     self.lib.libttsim_clock(self.TICK)
     Sim.clocks += self.TICK
   def now(self): return Sim.clocks / bh.AICLK  # seconds of chip time by ttsim's clock, which doesn't match silicon
