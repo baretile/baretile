@@ -708,7 +708,7 @@ def test_matmul_by_columns(chip):
       x = x.repeat_interleave(e) if t > 1 else x
       assert np.array_equal(value(x.matmul(w.columns(), index=ids)), value(x.matmul(w, index=ids))), (w.dtype, t, e)
   x, wc = Tensor.of(rt, rng.normal(0, 1, (1, 64)).tolist()), Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()).columns()
-  for misuse in (lambda: wc + 1, lambda: x @ wc.T, lambda: wc[:, :32], lambda: wc.gather([0]), lambda: wc.cast("bfp4")):
+  for misuse in (lambda: wc + 1, lambda: x @ wc.T, lambda: wc[:, :32], lambda: wc.gather([0])):
     with pytest.raises(ValueError, match="by columns"): misuse().realize()
 
 def test_matmul_chunks(chip):
@@ -1715,3 +1715,39 @@ def test_block_float_cache(chip):
     cache[2:4, 32:96, :].assign(back)
     want[2:4, 32:96] = want[0:2, :64]
     assert np.array_equal(value(back), want[0:2, :64]) and np.array_equal(value(cache), want), fmt
+
+def test_matmul_composition_and_integer_output(chip):
+  rt = Runtime(chip)
+  for k in (1, 2, 32):
+    a, b = Tensor.full(rt, 1, k, 1), Tensor.full(rt, k, 1, 1.5)
+    assert a.matmul(b, 'int32').tolist() == [[int(1.5 * k)]]
+  a = Tensor.full(rt, 32, 64, 0.5)
+  w1, w2 = (Tensor.of(rt, [[[v] * 32] * 64] * 2) for v in (1., 2.))
+  ids = Tensor.of(rt, [[1, 0]], 'int32')
+  assert (a.matmul(w1, index=ids) + a.matmul(w2, index=ids)).tolist() == [[[96.] * 32] * 32] * 2
+  assert a.matmul(w1, 'int32', index=ids).tolist() == [[[32] * 32] * 32] * 2
+  assert (a @ w1.cast('bfp8') + a @ w2.cast('bfp4')).tolist() == [[[96.] * 32] * 32] * 2
+
+
+def test_storage_conversion_and_gradients(chip):
+  rt, rng = Runtime(chip), np.random.default_rng(83)
+  raw = bf16(rng.normal(size=(2, 65, 96)))
+  x = Tensor.of(rt, raw.tolist())
+  for dtype in ('bf16', 'bfp8', 'bfp4'):
+    stored = x.cast(dtype).realize()
+    for t in (stored, stored.columns()):
+      assert t.cast('bf16').tolist() == t.tolist()
+      assert t.cast('fp32').tolist() == t.tolist()
+    if dtype != 'bf16':
+      assert stored[:, 32:64, :].cast('bf16').tolist() == value(stored)[:, 32:64].tolist()
+      assert stored.repeat_interleave(2).cast('bf16').tolist() == np.repeat(value(stored), 2, axis=0).tolist()
+      assert stored.cast('bf16').T.tolist() == value(stored).transpose(0, 2, 1).tolist()
+  split = Tensor.full(rt, 96, 64, 1).cast('bfp4').columns().split(3, 1)
+  assert split.cast('bf16').tolist() == split.tolist()
+  for dtype in ('bf16', 'bfp8', 'bfp4'):
+    a, w = Tensor.of(rt, [[1., 2.]]), Tensor.of(rt, [[1.25, -2.], [3.5, 4.25]])
+    a.requires_grad = w.requires_grad = True
+    quant = w.cast(dtype).columns()
+    ga, gw = (a @ quant).sum().gradient(a, w)
+    close(ga, np.asarray(quant.tolist()).sum(1).reshape(1, 2), 0.02)
+    assert gw.tolist() == [[1., 1.], [2., 2.]]

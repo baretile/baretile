@@ -5,7 +5,7 @@ from baretile import bh
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
 from baretile.kernels import attention_parts, attention_store, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
-                             put_kernel, readback_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
+                             put_kernel, readback_kernel, storage_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
 
 FIDELITY = 4  # phases a bf16 matmul takes by default. 4 gives exact products, and tensix.matmul says what fewer drop
 # frombytes sends at least this many bytes through upload_kernel, and less through the BAR, which starts sooner but
@@ -434,11 +434,17 @@ class Tensor:
     batch, rows, cols = map(max, a.shape, b.shape)
     return Tensor(self.rt, rows, cols, op, (a, b), batch, a.dtype)
   def cast(self, dtype):  # bfp4 isn't lazy: bfp4_kernel makes it now from the bf16 value, and says why
-    if dtype == self.dtype: return self
+    if dtype not in (*ITEMSIZE, *BFP): raise ValueError(f"unknown tensor dtype: {dtype}")
+    if dtype == self.dtype and not self.runs: return self
+    if self.dtype in BFP or self.runs:
+      x, out, tc = self.realize(), Tensor(self.rt, self.rows, self.cols, batch=self.batch), -(-self.cols // 32)
+      key = ("storage", self.dtype, bool(self.runs))
+      return out.run(key, lambda: storage_kernel(*key[1:]), out.addr, *x._where(True), tc, self.tiles // self.batch, self.rep,
+                     name="storage")._track("cast", (self,)).cast(dtype)
     if dtype != "bfp4": return Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype)
     x, out, tc = _plain(self.cast("bf16").realize()), Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32)
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
-                   -(-self.rows // 32) * tc, name="bfp4")
+                   -(-self.rows // 32) * tc, name="bfp4")._track("cast", (self,))
   def columns(self):
     """Store each tile column of B together so matmul can read several tiles along K per request.
     Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
@@ -448,7 +454,8 @@ class Tensor:
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
     out = Tensor(self.rt, self.rows, self.cols, "view", batch=self.batch, dtype=self.dtype)
     out.op, out.runs, out.addr = None, (runs, tr, 0), self.rt.dram_alloc(self.batch * runs * tr * tile_bytes(self.dtype))
-    return out.run(("columns", self.dtype), lambda: columns_kernel(self.dtype), out.addr, x, tc, tr * tc, runs, tr, name="columns")
+    return out.run(("columns", self.dtype), lambda: columns_kernel(self.dtype), out.addr, x, tc, tr * tc, runs, tr,
+                   name="columns")._track("columns", (self,))
   def float(self): return self.cast("fp32")
   def bfloat16(self): return self.cast("bf16")
   def exp2(self): return self._unary("exp2")
@@ -563,6 +570,7 @@ class Tensor:
     Indices are read on the chip so replay can select different experts. An index >= x.batch gives zero
     without reading a matrix. A matmul by index has no gradient."""
     self._same_runtime(x, *((index,) if index is not None else ()))
+    if dtype == "int32": return self.matmul(x, "fp32", fidelity, index).cast("int32")
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("matmul fidelity must be between one and four phases")
     if index is not None:
@@ -729,17 +737,19 @@ def _backward(t, g):
   unary = {"exp": lambda: g * t, "exp2": lambda: g * t * math.log(2), "log": lambda: g * x.reciprocal(),
            "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(), "cos": lambda: -(g * x.sin()),
            "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
-           "cast": lambda: g.cast(x.dtype)}
+           "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g}
   if op in unary: return (unary[op](),)
   g = _full(g, t.shape)  # movement and matmul can't take g broadcast
   if op == "matmul" and len(srcs) == 3: raise NotImplementedError("a matmul by index has no backward")
   if op == "matmul":  # a transposed B gets its gradient as (g.T @ x).T, and the T's own rule cancels that transpose
     turn = y._ctx is not None and y._ctx[0] == "T"
+    plain = y.cast("bf16") if y.runs or y.dtype in BFP else y
+    yd = "bf16" if y.dtype in BFP else y.dtype
     if args:  # fp32: the forward's parts, transposed, and g's parts, made once for both
       gp, (xp, yp) = _parts(g), args
       gx, gy = _bf16x3(gp, _pT(yp)), _bf16x3(_pT(gp), xp) if turn else _bf16x3(_pT(xp), gp)
-    else: gx, gy = g.matmul(y.T, x.dtype), g.T.matmul(x, y.dtype) if turn else x.T.matmul(g, y.dtype)
-    gx, gy = _unbroadcast(gx.cast(x.dtype), x.shape), gy.cast(y.dtype)
+    else: gx, gy = g.matmul(plain.T, x.dtype), g.T.matmul(x, yd) if turn else x.T.matmul(g, yd)
+    gx, gy = _unbroadcast(gx.cast(x.dtype), x.shape), gy.cast(yd)
     return gx, _unbroadcast(gy, (y.batch, y.cols, y.rows)).T if turn else _unbroadcast(gy, y.shape)
   if op == "T": return (g.T,)
   if op == "reshape": return (g.reshape(*x.shape),)
@@ -764,6 +774,14 @@ def _fit(t):
   reductions to avoid recomputing them on each pass. Also realize elementwise values shared with work outside
   the reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
   heaviest branch."""
+  indexed, block = False, None
+  for u in [v for v in _lazy(t, set()) if v.op == "matmul"]:
+    dtype = u.srcs[1].dtype
+    if len(u.srcs) == 3 and indexed or dtype in BFP and block is not None and dtype != block:
+      u.realize()  # one index stream and one block-float unpack format per fused kernel
+    else:
+      indexed |= len(u.srcs) == 3
+      if dtype in BFP: block = dtype
   if any(u.op in COMBINE for u in _lazy(t, set())):
     for u in [u for u in _lazy(t, set()) if u.op == "matmul" and u.srcs[0].cols > 256]: u.realize()
     lazy = list(_lazy(t, set()))

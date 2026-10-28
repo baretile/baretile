@@ -1316,6 +1316,49 @@ void kmain(volatile unsigned *a) {{
   }}
 }}""")
 
+def storage_kernel(dtype, runs=False):
+  """Copy column runs or decode block floats into ordinary bf16 tiles, one tile per work unit.
+
+  args: [first unit, units, out, input address, batch stride, row stride, tile offset, tile columns,
+  tiles per matrix, repeat]. With runs, the three layout fields describe column runs, as in readback_kernel.
+  Decode sign-magnitude values exactly as the unpacker does, including its negative-zero encoding of -inf."""
+  n = tile_bytes(dtype)
+  place = "from = b / a[9] * a[4] + i * a[5] + j + a[6]"
+  get = f"noc_get(BANK(from), AT(a[3], from, {n}), IN, {n});"
+  if runs:
+    place = f"run = a[3] + (b / a[9] * a[4] + j / {len(bh.DRAM)}) * a[5] * {n}, m = b / a[9] * a[6] + i"
+    get = (f"noc_get(BANK(j), run + 64 * m, IN, 64); noc_get(BANK(j), run + 64 * a[5] + {BFP[dtype]} * m, IN + 64, {BFP[dtype]});"
+           if dtype in BFP else f"noc_get(BANK(j), run + m * {n}, IN, {n});")
+  value = ("((volatile unsigned char *)(IN + 64))[q]" if dtype == "bfp8" else
+           "(((volatile unsigned char *)(IN + 64))[q / 2] >> (4 * (q % 2)) & 15) << 4")
+  decode = f"""
+    for (unsigned k = 0; k < 1024; k += 2) {{
+      unsigned word = 0;
+      for (unsigned h = 0; h < 2; h++) {{
+        unsigned q = k + h, x = {value}, e = ((volatile unsigned char *)IN)[q / 16], v = x >> 7 ? 0xff80 : 0;
+        if (x & 127) {{
+          unsigned m = (x & 127) << 1, shift = 0;
+          while (!(m & 128)) {{ m <<= 1; shift++; }}
+          v = (x >> 7) << 15 | ((e - shift) & 255) << 7 | (m & 126);
+        }}
+        word |= v << (16 * h);
+      }}
+      ((volatile unsigned *)OUT)[k / 2] = word;
+    }}""" if dtype in BFP else ""
+  return compile_kernel(f"""
+#define IN {DATA:#x}
+#define OUT {DATA + 2048:#x}
+{BANKS}
+void kmain(volatile unsigned *a) {{
+  for (unsigned u = 0; u < a[1]; u++) {{
+    unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], {place};
+    {get}
+    noc_wait();{decode}
+    noc_write({"OUT" if dtype in BFP else "IN"}, BANK(t), AT(a[2], t, 2048), 2048);
+    noc_wait();
+  }}
+}}""")
+
 def bfp4_kernel():
   """Convert bf16 tiles to bfp4. BRISC does it alone, a tile a unit.
 
