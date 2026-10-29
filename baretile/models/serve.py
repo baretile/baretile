@@ -1101,6 +1101,7 @@ def fetch(model, cache=str(pci.CACHE / "hub")):
   opener = urllib.request.build_opener(ScopedRedirect())
   folder = os.path.join(cache, model)
   if os.path.exists(os.path.join(folder, ".done")): return folder
+  print(f"downloading {model} into {folder}. there is no more output until it's done", file=sys.stderr, flush=True)
   os.makedirs(folder, exist_ok=True)
   def get(name, needed=True):
     if not isinstance(name, str) or not re.fullmatch(r"[\w./-]+", name) or any(p in ("", ".", "..") for p in name.split("/")):
@@ -1160,8 +1161,9 @@ def main():
   jinja = os.path.join(folder, "chat_template.jinja")  # where transformers 5 keeps it
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   http = server(engine, name, template, eos, port, defaults=defaults, connections=connections)
-  print(f"{name} is on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} positions, "
-        f"prefilling {engine.chunk} tokens at a time, on port {port} with {http.connections} connections, {http.per_client} per address", flush=True)
+  print(f"serving {name} on port {port}: on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), "
+        f"{slots} slots of {places} positions, prefilling {engine.chunk} tokens at a time, {http.connections} connections, "
+        f"{http.per_client} per address", flush=True)
   http.serve_forever()
 
 if __name__ == "__main__": main()
