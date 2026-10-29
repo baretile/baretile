@@ -95,14 +95,14 @@ Open an [issue](https://github.com/baretile/baretile/issues) with:
 ## Releasing
 
 The version is in [pyproject.toml](pyproject.toml). The package on PyPI holds
-`baretile/` alone. To publish a new version, raise the version, then build and
-upload it:
+`baretile/`, with its models and adapters. To publish a new version:
 
-```sh
-uv build
-uv publish
-```
+1. Raise the version, and describe the release's changes in
+   [CHANGELOG.md](CHANGELOG.md).
+2. Build it with `uv build`.
+3. Install the wheel with `[models]` in a clean environment, outside the
+   checkout so imports can't fall back to it, and run the README's commands.
+4. Upload it with `uv publish`, then tag the commit, for example `v0.0.3`.
 
-CI builds a wheel from the source distribution and checks its imports and
-visualization template on Python 3.12, 3.13 and 3.14. Before publishing, test the
-built wheel in a clean environment so imports cannot fall back to the checkout.
+CI builds a wheel from the source distribution on Python 3.12, 3.13 and 3.14,
+and checks its imports, its visualization template, and the models with NumPy.
