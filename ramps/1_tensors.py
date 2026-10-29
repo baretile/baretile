@@ -9,8 +9,8 @@ from baretile.chip import Chip
 from baretile.runtime import Runtime
 from baretile.tensor import Tensor, jit
 
-def check(value, message="ramp result did not match"):
-  if not value: raise AssertionError(message)
+def check(ok):  # an assert that python -O keeps. The traceback shows which check failed
+  if not ok: raise AssertionError("the ramp's result is wrong")
 
 # 1. Open the device and create a runtime. A Tensix tile contains RISC-V cores and local memory.
 # The last tile dispatches work; the others run the kernels as workers.

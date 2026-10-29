@@ -11,12 +11,12 @@ from baretile.tensix import (DST_HALF, MATH_END, MUL_PHASE, allocate, elementwis
                              matmul, pack, pack_program, sfpu, slot_base, to_bf16, tt, unpack, unpack_program)
 from baretile.tensor import Tensor
 
+def check(ok):  # an assert that python -O keeps. The traceback shows which check failed
+  if not ok: raise AssertionError("the ramp's result is wrong")
+
 chip = Chip(pci.open_device())
 rt = Runtime(chip)
 x, y = rt.cores[0]  # a launch over one unit runs on the first worker
-
-def check(value, message="ramp result did not match"):
-  if not value: raise AssertionError(message)
 
 # 1. A Tensix instruction is a 32-bit word with the opcode in its top byte and fields below it. bh.TENSIX_OPS has each
 # instruction's opcode and field layout from the ISA. A TRISC pushes instructions to its Tensix thread by executing

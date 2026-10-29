@@ -48,10 +48,10 @@ const runs = data.startsWith("[") ? JSON.parse(data) : [], $ = id => document.ge
 const esc = s => String(s).replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
 const num = n => n >= 1e9 ? (n / 1e9).toFixed(2) + "G" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
 const color = (k, a = 1) => `hsla(${k * 137.5 % 360}, 50%, 60%, ${a})`;  // golden-angle hues, so kernels next to each other differ
-let run, picked, view, activeLaunch = -1;  // the runtime, kernel, visible cycles and keyboard-selected launch
+let run, picked, view, cursor = -1;  // the runtime shown, the kernel picked, the cycles [from, to] the timeline shows, and the launch the arrow keys are on
 
 function show(r) {
-  run = runs[r]; picked = null; activeLaunch = -1; $("launch").textContent = "";
+  run = runs[r]; picked = null; cursor = -1; $("launch").textContent = "";
   $("tabs").innerHTML = runs.length > 1 ? runs.map((u, i) => `<button class="${i == r ? "on" : ""}" onclick="show(${i})">${esc(u.title)}</button>`).join(" ") : esc(run.title);
   const [first, last] = [run.launches[0], run.launches.at(-1)], cycles = run.kernels.reduce((a, k) => a + k.cycles, 0);
   $("summary").innerHTML = (first ? `launches ${first[1]} to ${last[1]} of ${run.total}, ${run.kernels.length} kernels, ${num(cycles)} cycles` : "no finished launches") +
@@ -174,6 +174,8 @@ onmouseup = e => {
   if (drag && !drag.moved && e.target == canvas) { const l = under(e.offsetX); if (l) pick(l[0]); }
   drag = null;
 };
+const describe = l => [`launch ${l[1]}: ${run.kernels[l[0]].name || "(no name)"}`,  // for the tooltip and the arrow keys' status
+  `${num(l[3])} cycles on ${l[5]} worker${l[5] > 1 ? "s" : ""}${l[4] != null ? `, ${num(l[4])} bytes read` : ""}`];
 onmousemove = e => {
   const tip = $("tip");
   if (drag && e.buttons) {  // clientX, since the pointer can leave the canvas while it drags
@@ -183,8 +185,8 @@ onmousemove = e => {
   }
   const l = run && e.target == canvas && under(e.offsetX);
   if (!l) { tip.style.display = "none"; return; }
-  tip.innerHTML = `launch ${l[1]}: ${esc(run.kernels[l[0]].name || "(no name)")}<br><span class="dim">${num(l[3])} cycles on ${l[5]} worker${l[5] > 1 ? "s" : ""}` +
-    `${l[4] != null ? `, ${num(l[4])} bytes read` : ""}</span>`;
+  const [name, numbers] = describe(l);
+  tip.innerHTML = `${esc(name)}<br><span class="dim">${esc(numbers)}</span>`;
   tip.style.display = "block";  // shown before it's measured, so offsetWidth is its width
   Object.assign(tip.style, { left: Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 4) + "px", top: e.clientY + 14 + "px" });
 };
@@ -194,10 +196,10 @@ canvas.onkeydown = e => {
   if (!run) return;
   if (e.key == "ArrowLeft" || e.key == "ArrowRight") {
     if (!run.launches.length) return;
-    activeLaunch = Math.max(0, Math.min(run.launches.length - 1, activeLaunch + (e.key == "ArrowRight" ? 1 : -1)));
-    const l = run.launches[activeLaunch];
+    cursor = Math.max(0, Math.min(run.launches.length - 1, cursor + (e.key == "ArrowRight" ? 1 : -1)));
+    const l = run.launches[cursor];
     pick(l[0]);
-    $("launch").textContent = `Launch ${l[1]}: ${run.kernels[l[0]].name || "unnamed kernel"}, ${l[3]} cycles on ${l[5]} workers`;
+    $("launch").textContent = describe(l).join(", ");
     $(`k${l[0]}`).scrollIntoView({ block: "nearest" });
   } else if (e.key == "+" || e.key == "=" || e.key == "-") {
     const mid = (view[0] + view[1]) / 2, span = Math.max(10, (view[1] - view[0]) * (e.key == "-" ? 1.5 : 1 / 1.5));

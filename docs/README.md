@@ -7,10 +7,9 @@ now, and each page links to the files it covers.
 ## Learning baretile
 
 The ramps are scripts that teach baretile in order, from tensors down to Tensix
-instructions. Each one explains its steps in comments and checks its results
-with explicit checks that also run under `python -O`, so you can change a step
-and see what breaks. Run them from
-the checkout with `TTSIM` set:
+instructions. Each one explains its steps in comments and checks its results,
+also under `python -O`, so you can change a step and see what breaks. Run them
+from the checkout with `TTSIM` set:
 
 ```sh
 python3 ramps/1_tensors.py
