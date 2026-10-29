@@ -286,10 +286,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   plans = [plan(p) for p in range(last + 1)]
   reads = [{r for j in sum(pl, []) for r in operands(ops[j]) if isinstance(r, int)} for pl in plans]  # the inputs each pass reads
   # In passes, an input that is one tile along the sweep gets its own slot and is fetched once a line. An input read in
-  # several passes keeps its line of tiles in L1, fetched in the first pass, if they fit below slot 256. Neither is
-  # read from DRAM twice.
+  # several passes keeps its line of tiles in L1, fetched in the first pass, if they fit. Neither is read from DRAM twice.
   kept, passes_of, narrow = {}, lambda r: [p for p in range(last + 1) if r in reads[p]], lambda r: ext(shapes[r], axis) == 1
-  room = min(UNPACKABLE, (OUTS - slot_base(dtype)) // tile_bytes(dtype))
+  room = min(UNPACKABLE, (OUTS - slot_base(dtype)) // tile_bytes(dtype))  # the slots an unpacker reads, below the outputs
   for r in range(inputs) if reducing else ():
     if narrow(r) and passes_of(r) and top < room: kept[r], top = top, top + 1
     elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= room: kept[r], top = top, top + L
@@ -302,7 +301,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   for j in matmuls:
     mine = [p for p, pl in enumerate(plans) if j in pl[1]]
     if (reducing and line_b is None and len(mine) > 1 and not ops[j]["wt"] and ops[j]["ids"] is None and rows_at[matmuls.index(j)] is not None and
-        top + L * ops[j]["kt"] <= UNPACKABLE): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
+        top + L * ops[j]["kt"] <= room): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
   if line_b is not None: decls += f"static unsigned line_done[{L}];\n"
   single = {}  # without passes, a scalar input also gets its own slot, fetched once a worker
   if kept_b is not None and parts: top = max(top, kept_b + (0 if b8 else 3) * kp)  # a block-float B goes past the slots
@@ -369,7 +368,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     c = [[], [], [], []]  # each program's C for a tile
     final = f"p == {n_parts - 1}" if parts else None  # with parts, the test that picks out the last part
     fetches = [fetch(p, r) for r in sorted(reads[p]) if r not in single]
-    # Singles arrive with the first tile, even when the epilogue waits for the last K part.
+    # singles come with the first tile, also when the rest waits for the last part of K
     c[B] += (["reached(frame_done[fr]);"] + [fetch(p, r) for r in sorted(reads[p]) if r in single] +
              ([f"if ({final}) {{ {' '.join(fetches)} }}"] if parts and fetches else fetches) + ["ready();"])
     c[U].append("fetched();")

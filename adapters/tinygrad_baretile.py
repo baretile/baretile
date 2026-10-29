@@ -222,8 +222,8 @@ def cpu(a, dtype):  # only logical bf16 values use uint16 storage as raw bits
 def array(t):  # bf16 as raw bits
   t = t.realize()
   return t.bitcast(dtypes.uint16).numpy() if t.dtype is dtypes.bfloat16 else t.numpy()
-def constant(t):  # a uniform host constant; padding can introduce zeros into a nonzero constant
-  u = t.uop
+def constant(t):  # the number, if a host tensor is a constant broadcast over a shape, else None
+  u = t.uop  # movement ops keep a constant uniform, but a pad puts zeros around it
   while u is not u.base and u.op is not Ops.PAD: u = u.src[0]
   return u.arg if u.op is Ops.CONST else None
 
@@ -443,8 +443,7 @@ class Evaluator:
     return self.movement(x, v) if isinstance(v, Value) else self.on_host(x, [v] + [self.values.get(s) for s in x.src[1:]])
 
   def read(self, v):
-    """Read BUFFER v's current contents. A BARETILE buffer contains a chip value or bytes;
-    other devices supply bytes."""
+    """Read BUFFER v's current contents. A BARETILE buffer contains a chip value or bytes; other devices supply bytes."""
     buf = v.buffer
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_baretile(v):
@@ -640,11 +639,10 @@ def tinyjit(self, *args, **kwargs):
       for h, old, stored, alias in bound if replayable else ():
         if stored: alias.assign(h.value.t)
         h.value = old
-    # A buffer uploaded from host bytes and then written needs another recording, once its current value is on the chip.
-    uploaded_store = any(old is HOST and stored for old, stored, _ in recording.values())
-    self.replay = None if uploaded_store else bool(rec.launches) and replayable and (
-      rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
-      [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None])
+    if any(old is HOST and stored for old, stored, _ in recording.values()):
+      self.replay = None  # a store over host bytes records again next call, when the stored value is on the chip
+    else: self.replay = bool(rec.launches) and replayable and (rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
+                                                               [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None])
     if not self.replay: rec.close()
   finally: recording = None
   return ret

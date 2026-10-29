@@ -91,6 +91,8 @@ def test_bytes(chip):
     assert [r[3] for r in rt.profile(since)] == [want]
 
 def test_gather_shared_indices(chip):
+  # A worker keeps its index tile across the result tiles that share it, and zeros only partial tiles. A block float
+  # can't be gathered, and the refusal comes before any allocation or launch.
   rt = Runtime(chip, end=chip.tensix[1])
   rows = np.arange(65 * 96).reshape(65, 96) % 7
   selected = list(range(34, -1, -1))
@@ -103,6 +105,11 @@ def test_gather_shared_indices(chip):
   if chip.pci.counts:
     # Two index tiles, zero padding for three partial output tiles, and two 64-byte runs per selected row and tile column.
     assert [r[3] for r in profile] == [2 * 4096 + 3 * 2048 + 35 * 3 * 2 * 64]
+  for dtype in ("bfp8", "bfp4"):
+    packed = x.cast(dtype).realize()
+    before = dict(rt.used), rt.launches
+    with pytest.raises(ValueError, match="block-float"): packed.gather([0])
+    assert (rt.used, rt.launches) == before
 
 def test_viz(chip, tmp_path):
   # viz.save records completed launches and compiler details. A shared subexpression gets one graph node,
@@ -290,24 +297,24 @@ def test_jit_formats(chip):
       x = Tensor.full(rt, 32, 32, n).cast(dtype).realize()
       assert step(x).tolist() == [[32 * n] * 32] * 32
 
-def test_jit_returned_repeat(chip):
+def test_jit_returned_views(chip):
+  # A returned view of an input is on each call's input, keeps a repeat's rep, and has a plain address, so another
+  # jit that captures it doesn't take it for one of its own inputs.
   rt = Runtime(chip)
   repeat = tensor.jit(lambda x: x.repeat_interleave(2))
   for n in range(1, 5):
     x = Tensor.of(rt, [[[float(n)] * 32] * 32, [[float(n + 1)] * 32] * 32])
     assert np.array_equal(value(repeat(x)), np.repeat(value(x), 2, axis=0))
-
-def test_jit_returned_binding(chip):
-  rt = Runtime(chip)
   x = Tensor.of(rt, [[[4.0] * 32] * 32, [[5.0] * 32] * 32])
   pick = tensor.jit(lambda x: x[1])
   pick(x)
-  captured = pick(x)  # a recording's returned view must not retain that recording's input binding
+  captured = pick(x)  # returned by the recording call
   add = tensor.jit(lambda y: y + captured)
   for n in (10, 20, 30, 40):
     assert add(Tensor.full(rt, 32, 32, n)).tolist() == [[n + 5] * 32] * 32
 
 def test_repeat_copies_preserve_storage(chip):
+  # Assigning a repeat copies its bits, -0 and block floats included, instead of computing x + 0.
   rt = Runtime(chip)
   raw = struct.pack("<2f", -0.0, 3.0)
   x = Tensor.frombytes(rt, 1, 2, raw, dtype="fp32").repeat_interleave(3)
@@ -420,6 +427,7 @@ def test_tensor_inputs(chip):
   with pytest.raises(NotImplementedError, match="by index"): picked.sum().backward()
 
 def test_movement_allocation_retry(chip, monkeypatch):
+  # A transpose or move whose allocation fails stays unrealized, so it can be realized again once there's room.
   rt = Runtime(chip)
   source = Tensor.of(rt, [[1.0, 2.0], [3.0, 4.0]])
   allocate = rt.dram_alloc
@@ -429,11 +437,6 @@ def test_movement_allocation_retry(chip, monkeypatch):
     with pytest.raises(MemoryError, match="allocation limit"): moved.realize()
     monkeypatch.setattr(rt, "dram_alloc", allocate)
     assert moved.tolist() == want
-  for dtype in ("bfp8", "bfp4"):
-    packed = source.cast(dtype).realize()
-    before = dict(rt.used), rt.launches
-    with pytest.raises(ValueError, match="block-float"): packed.gather([0])
-    assert (rt.used, rt.launches) == before, "reject an unsupported gather before allocation or launch"
 
 def test_move_bounds_and_tensor_truth(chip):
   rt = Runtime(chip)
@@ -790,6 +793,7 @@ def test_matmul_parts_scalars(chip, layout):
 
 @pytest.mark.parametrize("dtype", ["bf16", "bfp8", "bfp4"])
 def test_matmul_split_transposed_weights(chip, dtype):
+  # A one-row matmul split along K reads a transposed B in place, block floats included, with no transpose kernel.
   rt = Runtime(chip)
   x = Tensor.full(rt, 1, 1024, 1 / 32)
   w = Tensor.full(rt, 64, 1024, 1 / 32).cast(dtype).realize()
@@ -939,17 +943,15 @@ def test_matmul_indexed(chip):
       want = lambda b, e: value(x[b // k] @ w[e])[0] if e < 16 else np.zeros((1, 160))
       assert all(np.array_equal(got[b], want(b, int(ids[b // k, b % k]))) for b in range(n * k)), (wt, n, k)
 
-@pytest.mark.parametrize("passes", [False, True])
-def test_indexed_matmul_rows_and_passes(chip, passes):
+def test_indexed_matmul_rows_and_passes(chip):
+  # A matmul by index over several tile rows, and one under a softmax's passes. An index past B's batch picks zeros.
   rt, rng = Runtime(chip), np.random.default_rng(71)
   a, b = bf16(rng.normal(0, 0.1, (64, 96))), bf16(rng.normal(0, 0.1, (3, 96, 160)))
   x, w = Tensor.of(rt, a.tolist()), Tensor.of(rt, b.tolist())
-  if not passes:
-    for index in (1, 3):
-      ids = Tensor.of(rt, [[index]], "int32")
-      want = a @ b[index] if index < 3 else np.zeros((64, 160))
-      close(x.matmul(w, index=ids), want, 0.004)
-    return
+  for index in (1, 3):
+    ids = Tensor.of(rt, [[index]], "int32")
+    want = a @ b[index] if index < 3 else np.zeros((64, 160))
+    close(x.matmul(w, index=ids), want, 0.004)
   a = bf16(rng.normal(0, 0.1, (2, 1, 96)))
   x = Tensor.of(rt, a.tolist()).repeat_interleave(2)
   ids = Tensor.of(rt, [[0, 1], [2, 7]], "int32")
@@ -959,6 +961,7 @@ def test_indexed_matmul_rows_and_passes(chip, passes):
   close(x.matmul(w, index=ids).softmax(), expected, 0.0001)
 
 def test_reduction_l1_boundary(chip):
+  # fp32 softmaxes at the widths where a row's tiles stop fitting in the slots below the outputs. One of them raised.
   rt, rng = Runtime(chip), np.random.default_rng(73)
   for width in (7424, 7456, 7488):
     a = rng.normal(0, 1, (2, width)).astype(np.float32)
@@ -1056,6 +1059,7 @@ def test_assign_overlapping_views(chip):
     assert np.array_equal(value(x)[0], want), "overlapping block floats copy without elementwise arithmetic"
 
 def test_assign_matmul_without_copy(chip):
+  # assign computes a matmul that doesn't read its destination straight into it, in one kernel.
   rt = Runtime(chip)
   x, w, out = (Tensor.full(rt, 32, 32, n) for n in (1, 2, 0))
   since = rt.launches
@@ -1741,6 +1745,7 @@ def test_autograd(chip):
   assert np.allclose(value((ta * ta).sum().gradient(ta)[0])[0], 2 * a, rtol=1e-6), "gradient() gives it without touching .grad"
 
 def test_long_autograd_history(chip):
+  # Graphs deeper than Python's recursion limit realize and differentiate.
   rt = Runtime(chip)
   x = Tensor.full(rt, 1, 1, 2, "fp32").requires_grad_()
   y = x

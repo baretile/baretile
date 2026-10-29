@@ -357,9 +357,9 @@ class Tensor:
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
       if self.dtype in BFP: raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
       x, op, d = _plain(self.srcs[0].realize()), self.op, self.dtype
-      where = x._where()  # validate the source before this tensor counts as realized
+      src = x._where()  # check the source before this tensor counts as realized
       self.addr, self.op, self.srcs = self._alloc(), None, ()
-      where = (self.addr, *where)
+      where = (self.addr, *src)
       if op == "T" and d == "bf16":
         return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where, name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
@@ -963,7 +963,7 @@ def _bindable(t):  # whether a replay can read t where it is, laid out as a new 
   tr, tc = -(-t.rows // 32), -(-t.cols // 32)
   return t.runs is not None or (t.offset, t.rep, t.stride, t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
 
-def _on_input(t, inputs):  # expose a recorded input view on this call's storage, without leaking its Bound address
+def _on_input(t, inputs):  # t, or if it's a view of a recorded input, the same view of this call's input, with a plain address
   if not isinstance(t.addr, Bound): return t
   v = inputs[t.addr.key]._view(t.rows, t.cols, t.batch, t.offset, t.bstride, t.runs)
   v.addr, v.rep = int(v.addr), t.rep
@@ -975,11 +975,11 @@ def jit(f):
 
   Keep input shapes and dtypes fixed, and a tensor by columns in the same layout. Don't replace tensors captured by
   f or read tensors back to the host inside f. Recorded assign operations can update captured tensors and inputs in
-  place. Keep written inputs separate from each other and from captured tensors f only reads. An input laid out
-  otherwise than a new tensor, such as a slice or a repeat, is
-  copied first, and copied back if f writes it. Results and retained tensors, including .grad, reuse their buffers;
-  the next call overwrites their contents. Recorded calls set an input's .grad without accumulating across calls.
-  Pass an input that needs a gradient once: a repeated one gets the gradient through its last position only."""
+  place. Keep written inputs apart from each other and from captured tensors that f only reads. An input laid out
+  otherwise than a new tensor, such as a slice or a repeat, is copied first, and copied back if f writes it. Results
+  and retained tensors, including .grad, reuse their buffers; the next call overwrites their contents. So an input's
+  .grad holds the latest call's gradient instead of adding up. Pass an input that needs a gradient once: a repeated
+  one gets the gradient through its last position only."""
   signature, runs, wrote, taken, out, rec, grads = None, (), set(), set(), None, None, ()
   @functools.wraps(f)
   def run(*xs):
@@ -1020,7 +1020,6 @@ def jit(f):
     rec.send({i: t.addr for i, t in enumerate(bound)})
     for i in wrote:
       if bound[i] is not xs[i]: xs[i].assign(bound[i])
-    # A result or gradient that is an input, or a view of one, is on this call's input
     for x, g in zip(xs, grads):
       if g is not None: x.grad = _on_input(g, bound)
     return _on_input(out, bound)
