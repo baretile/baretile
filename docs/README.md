@@ -34,6 +34,7 @@ After the ramps, [models/gpt2.py](../models/gpt2.py) is a whole model in under
 | [Runtime](runtime.md) | Workers and the dispatcher, L1 layout, the command ring, DRAM allocation, `jit` and profiling |
 | [Compiler](compiler.md) | Tile layout and storage formats, fusion and reductions, unpack, math and pack, matmul and attention |
 | [Models, serving and adapters](models.md) | The model loaders, precision modes, the OpenAI-compatible server, tinygrad and PyTorch, and cost estimates |
+| [First P150a workload](workload.md) | Pinned models, correctness gates, single-user limits and the measurements needed for the first release |
 | [Testing and debugging](testing.md) | Running the tests, optional checks, ttsim-chaos and hung launches |
 | [Hardware reference](hardware.md) | PCIe, TLB windows, coordinates, DRAM, ARC, the RISC-V cores, NoC transfers and Ethernet, with sources |
 | [Bring-up on a card](bring-up.md) | Running on a p150 for the first time, measuring it, and what we still need to check |
