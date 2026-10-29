@@ -472,12 +472,14 @@ class Tensor:
   def relu(self): return self._unary("relu")
   def rsqrt(self): return self.sqrt().reciprocal()
   def maximum(self, x): return self._binop("max", x)
-  def minimum(self, x): return (self < x).where(self, x) if self.dtype == "int32" else -((-self).maximum(-x))
+  def minimum(self, x):  # -max(-a, -b). Negating -2**31 overflows, so int32 complements instead: ~v = -1 - v
+    if self.dtype == "int32" and (x.dtype == "int32" if isinstance(x, Tensor) else not isinstance(x, float)): return -1 - (-1 - self).maximum(-1 - x)
+    return -((-self).maximum(-x))
   def where(self, x, y):
     """x where self isn't 0, else y. A condition of another dtype, or an int32 one that isn't a comparison's 0 or 1,
     becomes 0 or 1 in theirs first, since the SFPU tests it as a float."""
     dtype = next((t.dtype for t in (x, y) if isinstance(t, Tensor)), self.dtype)
-    c = self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmpne")) else self.ne(0).cast(dtype)
+    c = self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmple", "cmpne")) else self.ne(0).cast(dtype)
     return c._binop("keep", x)._binop("join", c._binop("drop", y))
   def __add__(self, x): return self._binop("add", x)
   def __sub__(self, x): return self._binop("sub", x)
@@ -488,8 +490,8 @@ class Tensor:
   def __neg__(self): return 0 - self if self.dtype == "int32" else self * -1  # int32 subtracts exactly but multiplies through fp32
   def __lt__(self, x): return self._binop("cmplt", x)
   def __gt__(self, x): return self._binop("cmplt", x, True)
-  def __ge__(self, x): return (self > x) + self.eq(x)
-  def __le__(self, x): return (self < x) + self.eq(x)
+  def __ge__(self, x): return self._binop("cmple", x, True)
+  def __le__(self, x): return self._binop("cmple", x)
   def ne(self, x): return self._binop("cmpne", x)
   def eq(self, x): return 1 - self.ne(x)
   __ne__, __eq__ = ne, eq
@@ -727,8 +729,8 @@ def _backward(t, g):
   """The gradients of t's operands, given t's gradient g. A condition or a comparison has none, and gets None."""
   op, srcs, args = t._ctx
   x, y = (srcs + (None,))[:2]
-  if op in ("add", "sub", "mul", "max", "keep", "drop", "join", "cmplt", "cmpne"):
-    if op in ("cmplt", "cmpne"): return (None, None)
+  if op in ("add", "sub", "mul", "max", "keep", "drop", "join", "cmplt", "cmple", "cmpne"):
+    if op in ("cmplt", "cmple", "cmpne"): return (None, None)
     if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape))  # halves of where: the condition has no gradient
     if op in ("add", "join"): gx, gy = g, g  # join combines where's disjoint masks
     elif op == "sub": gx, gy = g, -g

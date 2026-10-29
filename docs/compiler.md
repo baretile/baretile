@@ -175,8 +175,9 @@ nearest. fp32 comparisons treat NaN as unordered: `<`, `<=`, `>`,
 value's bits, including the sign of zero.
 
 Square root covers every positive normal fp32 input, including the smallest
-normal value and the largest finite value. Intermediate values are rescaled
-to avoid underflow and overflow. Subnormal arithmetic flushes to zero.
+normal value and the largest finite value. Its iteration keeps every
+intermediate value near the root, its reciprocal or 1/2, so none underflows
+or overflows. Subnormal arithmetic flushes to zero.
 Sine and cosine support finite inputs with absolute value below `2**24`;
 inputs outside that range return NaN. Their range reduction splits both the
 integer turn count and pi to keep large-argument subtraction accurate.
