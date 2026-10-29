@@ -1,5 +1,5 @@
 # Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
-import importlib, json, math, os, pathlib, struct, sys, threading, time, unicodedata, pytest
+import importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
 from baretile import pci, tensor
@@ -1156,6 +1156,36 @@ def test_ramp(ramp):
   root = pathlib.Path(__file__).parent.parent
   run = subprocess.run([sys.executable, str(root / "ramps" / ramp)], capture_output=True, text=True, timeout=600, cwd=root)
   assert run.returncode == 0 and run.stdout.strip().splitlines()[-1].startswith("the ramp ran"), run.stdout + run.stderr
+
+@pytest.mark.skipif(pci.simulator() is None, reason="the examples open the device themselves, and a card can't be open in two processes")
+def test_readme_examples():
+  # The README's Python blocks print what their "# " lines say, and baretile.hello prints what the README says it does,
+  # apart from the count of workers, which depends on the chip.
+  root = pathlib.Path(__file__).parent.parent
+  readme = (root / "README.md").read_text()
+  run = lambda *args: subprocess.run([sys.executable, *args], capture_output=True, text=True, timeout=600, cwd=root)
+  for block in re.findall(r"```python\n(.*?)```", readme, re.S):
+    out, said = run("-c", block), [line[2:] for line in block.splitlines() if line.startswith("# ")]
+    assert out.returncode == 0 and out.stdout.splitlines() == said, out.stdout + out.stderr
+  said, out = re.search(r"`baretile.hello` prints:\n\n```text\n(.*)\n```", readme)[1], run("-m", "baretile.hello")
+  workers = lambda text: re.sub(r"^\d+ Tensix workers", "N Tensix workers", text.strip())
+  assert out.returncode == 0 and workers(out.stdout) == workers(said), out.stdout + out.stderr
+
+def test_doc_links():
+  # Each link in the Markdown files to a file of the repository, by a relative path or on GitHub's main branch, finds
+  # the file, and each #anchor in one finds a heading there, as GitHub makes them. Links in code blocks don't count.
+  root = pathlib.Path(__file__).parent.parent
+  headings = lambda p: {re.sub(r"[^\w\- ]", "", h.strip().lower()).replace(" ", "-") for h in re.findall(r"^#+ (.+)$", p.read_text(), re.M)}
+  broken = []
+  for page in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob("website/*.md")]:
+    for target in re.findall(r"\]\(([^)\s]+)\)", re.sub(r"```.*?```", "", page.read_text(), flags=re.S)):
+      if m := re.fullmatch(r"https://github\.com/baretile/baretile/(?:blob|tree)/main/([^#]*)(?:#(.*))?", target): path, anchor = root / m[1], m[2]
+      elif re.match(r"\w+:", target): continue  # another site
+      else:
+        file, _, anchor = target.partition("#")
+        path = page.parent / file if file else page
+      if not path.exists() or anchor and path.suffix == ".md" and anchor not in headings(path): broken.append(f"{page.name}: {target}")
+  assert not broken, broken
 
 @pytest.mark.skipif("TTSIM2" not in os.environ, reason="set TTSIM2 to ttsim's two-chip libttsim_bh_x2.so")
 def test_two_chips():

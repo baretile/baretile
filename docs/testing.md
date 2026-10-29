@@ -26,8 +26,10 @@ python3 -m pytest -s test/test_models.py
 The tests follow the layers of the code. `test_device.py` starts at PCIe access
 and goes through the runtime. `test_kernels.py` tests the instructions and the
 tensor operations built from them. Models, the server, the adapters and the
-[ramps](../ramps) are in `test_models.py`. `test_layers` checks that each module
-imports only the standard library and the layers below it.
+[ramps](../ramps) are in `test_models.py`, and so are `test_readme_examples`,
+which runs the README's Python examples and checks what they print, and
+`test_doc_links`, which checks every link to a file of the repository and its
+anchor. `test_layers` checks that each module imports only the layers below it.
 
 If pytest exits without explaining why, run it with `-s`. ttsim stops the
 process on errors such as an invalid address or decrementing an empty semaphore.
