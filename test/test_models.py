@@ -1221,6 +1221,21 @@ def test_llama_8b_shapes(chip):
     got, want = llama.logits(out), llama.forward(new, places, arrays, c, np_kv)[0]
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
+@pytest.mark.skipif(pci.simulator() is None, reason="bring-up opens the device itself, and a card can't be open in two processes")
+def test_bringup(tmp_path):
+  # test/bringup.py runs its stages in order and records each one. Without clang, preflight fails, and the run stops
+  # there with the rest not run. The first workload's gate reads the accuracy that llama.main prints.
+  import bringup, subprocess
+  run = lambda record, *args, **env: subprocess.run([sys.executable, bringup.__file__, str(tmp_path / record), *args], capture_output=True,
+                                                    text=True, timeout=1200, env=os.environ | env)
+  results = lambda record: {s["stage"]: s["result"] for s in json.loads((tmp_path / record / "record.json").read_text())["stages"]}
+  out = run("up", "--only", "preflight,chip,transfers")
+  assert out.returncode == 0 and [k for k, v in results("up").items() if v == "passed"] == ["preflight", "chip", "transfers"], out.stdout + out.stderr
+  out = run("down", PATH="/nonexistent")
+  assert out.returncode == 1 and set(results("down").values()) == {"failed", "not run"} and results("down")["preflight"] == "failed"
+  assert "Install clang" in (tmp_path / "down" / "preflight.log").read_text()
+  assert bringup.accurate("top-1 90.0%, top-5 98.0% (12s)") and not bringup.accurate("top-1 89.8%, top-5 99.0%") and not bringup.accurate("")
+
 def test_benchmark_bad_stack():
   # An unknown stack is a ValueError, also under python -O.
   import subprocess

@@ -16,10 +16,10 @@ python3 -m baretile.chip check
 ```
 
 It reads sysfs without touching the card, so it runs without root too. It
-checks clang and lld, then reports whether you're root, whether the IOMMU passes DMA addresses through,
-how many 2 MiB hugepages are free, whether the PCIe link runs at the card's
-best speed and width, and which driver has the card, with tt-kmd's firmware
-version. It exits with an error if anything would stop baretile. Configure the
+checks clang and lld, then reports whether you're root, whether the IOMMU passes
+DMA addresses through, how many 2 MiB hugepages are free, whether the PCIe link
+runs at the card's best speed and width, and which driver has the card, with
+tt-kmd's firmware version. It exits with an error if anything would stop baretile. Configure the
 IOMMU for passthrough (`iommu=pt`) or disable it, and reserve a few hugepages as
 root:
 
@@ -29,30 +29,54 @@ echo 4 > /proc/sys/vm/nr_hugepages
 
 ## Steps
 
-Run the following commands as root from the checkout, with `TTSIM` unset.
-Use the Python environment that has the test dependencies.
+Run bring-up as root from the checkout, with `TTSIM` unset, in the Python
+environment that has the test dependencies:
 
-1. Run `python3 -m baretile.chip`. Check ARC status, the clock, available columns
-   and DRAM training before loading worker programs.
-2. Run `python3 -m pytest -s test/test_device.py::test_config_space test/test_device.py::test_arc`,
-   then `python3 -m pytest -s test/test_device.py::test_dma test/test_device.py::test_l1 test/test_device.py::test_dram`.
-   These test register access and memory transfers that the host drives,
-   including DRAM at the top of each bank. Nothing runs on the workers yet.
-3. Run `python3 -m baretile.hello`, then the rest of `test/test_device.py`.
-   `test_host_memory` checks that a worker can read and write host memory, which
-   the dispatcher's commands, uploads and readback depend on. Investigate launch
-   failures before testing Tensix math.
-4. Run `python3 -m pytest -s test/test_kernels.py -k 'tile_math or tensor_math'`.
-   This checks instruction encoding and basic unpack, math and pack behavior.
-5. Run `python3 -m baretile.probe 8 probe.json`, before anything uploads large
-   tensors. Compare `upload over PCIe`, where workers read the data from host
-   memory, with `upload over PCIe, through the BAR`. `tensor.DMA_UPLOAD` picks
-   between the two by size, and its value is a guess until these measurements exist.
-6. Run the rest of `test/test_kernels.py`, then the model tests. If a failure
-   comes and goes, check the waits that ttsim doesn't model. ttsim-chaos models
-   some of them (see [testing](testing.md#ttsim-chaos)).
-7. Run `python3 -m baretile.bench`, and pass `probe=probe.json` to
-   `baretile/models/cost.py`.
+```sh
+python3 test/bringup.py record
+```
+
+It runs the stages below in order and stops at the first failure, since the
+later stages need the earlier ones to work. It says where the failing stage's
+output is and what to look at. Each stage's output goes in `record/<stage>.log`.
+`record/record.json` holds the device, the host, the commit, and each stage's
+result and time, so keep the folder as the record of the bring-up. After a fix,
+`--from <stage>` starts again at that stage, and `--only` runs the stages you
+name, separated by commas.
+
+1. **preflight** runs `python3 -m baretile.chip check`, as above.
+2. **chip** runs `python3 -m baretile.chip`: ARC status, the clock, available
+   columns and DRAM training, before any worker program loads.
+3. **transfers** runs `test_config_space`, `test_arc`, `test_dma`, `test_l1` and
+   `test_dram` from `test/test_device.py`. They test register access and memory
+   transfers that the host drives, including DRAM at the top of each bank.
+   Nothing runs on the workers yet.
+4. **launches** runs `python3 -m baretile.hello`, then all of
+   `test/test_device.py`. `test_host_memory` checks that a worker can read and
+   write host memory, which the dispatcher's commands, uploads and readback
+   depend on.
+5. **math** runs `test_tile_math` and `test_tensor_math` from
+   `test/test_kernels.py`, which check instruction encoding and basic unpack,
+   math and pack.
+6. **probe** runs `python3 -m baretile.probe 8 record/probe.json` before anything
+   uploads large tensors. Compare `upload over PCIe`, where workers read the data
+   from host memory, with `upload over PCIe, through the BAR`. `tensor.DMA_UPLOAD`
+   picks between the two by size, and its value is a guess until these
+   measurements exist.
+7. **kernels** runs all of `test/test_kernels.py`. If a failure comes and goes,
+   check the waits that ttsim doesn't model. ttsim-chaos models some of them (see
+   [testing](testing.md#ttsim-chaos)).
+8. **models** runs `test/test_models.py`.
+9. **smollm** runs `test_llama_model` on SmolLM-135M's checkpoint, given by
+   `--smollm path/to/SmolLM-135M`.
+10. **llama** runs the [first workload](workload.md)'s token accuracy, given
+    `--llama path/to/Llama-3.1-8B-Instruct` and `--reference
+    path/to/Llama-3.1-8B-Instruct.refpt`. It passes at top-1 90% and top-5 98%
+    over 500 steps.
+
+The stages run on ttsim too, which is how they're tested. Once they pass on a
+card, run `python3 -m baretile.bench`, and pass `probe=record/probe.json` to
+`python3 -m baretile.models.cost`.
 
 ## Giving the card back
 
