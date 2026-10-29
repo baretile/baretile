@@ -35,12 +35,12 @@ model in under 200 lines. It runs the same code on baretile tensors and NumPy ar
 
 | Page | What it covers |
 | --- | --- |
-| [Writing a kernel](kernels.md) | A tensor operation of your own, from its four programs to a tested function |
 | [Runtime](runtime.md) | Workers and the dispatcher, L1 layout, the command ring, DRAM allocation, `jit` and profiling |
 | [Compiler](compiler.md) | Tile layout and storage formats, fusion and reductions, unpack, math and pack, matmul and attention |
 | [Models, serving and adapters](models.md) | The model loaders, precision modes, the OpenAI-compatible server, tinygrad and PyTorch, training, and cost estimates |
 | [First P150a workload](workload.md) | Pinned models, correctness gates, single-user limits and the measurements needed for the first release |
 | [Testing and debugging](testing.md) | Running the tests, optional checks, ttsim-chaos and hung launches |
+| [Writing a kernel](kernels.md) | A tensor operation of your own, from its four programs to a tested function |
 | [Hardware reference](hardware.md) | PCIe, TLB windows, coordinates, DRAM, ARC, the RISC-V cores, NoC transfers and Ethernet, with sources |
 | [Bring-up on a card](bring-up.md) | Running on a p150 for the first time, measuring it, and what we still need to check |
 
