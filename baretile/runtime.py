@@ -387,6 +387,14 @@ def _exit():  # stop every runtime still running when Python exits, since the ca
     try: resources.close()
     except Exception as e: print(f"baretile: could not stop the runtime from {resources.start} to {resources.end}: {e}", file=sys.stderr)
 
+class Bound(int):
+  """A launch argument that a replay can replace, such as the address of a jit input. key names it in a binding.
+  Recording doesn't pin the allocation it points into, since replays point elsewhere."""
+  def __new__(cls, value, key):
+    self = super().__new__(cls, value)
+    self.key = key
+    return self
+
 class _Resources:
   """Own a rectangle, its host DMA views and its DRAM without retaining the Runtime that uses them."""
   def __init__(self, rt, views):
@@ -555,7 +563,8 @@ class Runtime:
       self.log.append((kernel, args, units, name))
       # Raw kernel arguments can contain pointers inside an allocation. Conservatively retain any allocation
       # they address. New allocations are already retained by dram_alloc; only older ones need this lookup.
-      for value in args if self.recorded is not None else ():
+      for value in args:
+        if isinstance(value, Bound): continue
         i = bisect.bisect_right(self.recorded_bases, value) - 1
         if i >= 0:
           addr = self.recorded_bases[i]
@@ -586,6 +595,14 @@ class Runtime:
     length = -(-(16 + len(body)) // 64) * 64
     if length > len(self.ring): raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
     return struct.pack("<4I", length, self.load(kernel), len(body), n) + body.ljust(length - 16, b"\0"), n
+
+  def bound(self, cmds, launches):
+    """[(byte offset, argument)] for each Bound argument of launches in cmds, which block made from all of them."""
+    found, at = [], 0
+    for _, args, _, _ in launches:
+      found += [(at + 24 + 4 * j, v) for j, v in enumerate(args) if isinstance(v, Bound)]  # after the header, units and 0
+      at += struct.unpack_from("<I", cmds, at)[0]
+    return found
 
   def send(self, cmds, launches):
     """Write commands back to back into the ring, then ring the doorbell. A block uses one PCIe write when it fits

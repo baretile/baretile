@@ -140,8 +140,8 @@ def test_tinygrad_jit_changed_state(chip):
   for i in range(1, 4): assert product(Tensor([float(i)], device="BARETILE")).item() == i * 2
   assert len(calls) == 2
   weight.assign(Tensor([10.0], device="BARETILE")).realize()
-  assert product(Tensor([3.0], device="BARETILE")).item() == 30 and len(calls) == 3
-  assert product(Tensor([4.0], device="BARETILE")).item() == 40 and len(calls) == 3
+  assert product(Tensor([3.0], device="BARETILE")).item() == 30 and len(calls) == 2, "a replay reads the weight's new storage"
+  assert product(Tensor([4.0], device="BARETILE")).item() == 40 and len(calls) == 2
   # Leaving the BARETILE device context must not dispatch to tinygrad's uninitialized native JIT state.
   assert product(Tensor([5.0], device="CPU")).item() == 50
   assert product(Tensor([6.0], device="BARETILE")).item() == 60
@@ -158,6 +158,46 @@ def test_tinygrad_jit_changed_state(chip):
       state.assign(state + 1).realize()
       return state
     for want in (15, 16, 17): assert tick().item() == want
+
+def test_tinygrad_jit_rebinds(chip):
+  # A replay reads captured buffers where they are at that call. Two TinyJits that each update what the other reads,
+  # and a learning rate assigned outside the TinyJit before each step, replay from the third call, as on tinygrad's CPU.
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  from tinygrad import Tensor, TinyJit
+  rt = adapter.RT = adapter.RT or Runtime(chip)
+  def run(device):
+    a, b, w, lr = (Tensor([1.0], device=device).contiguous().realize() for _ in range(4))
+    calls = {"f": 0, "g": 0, "h": 0}
+    def jit(name, update):
+      def body(x):
+        calls[name] += 1
+        update(x)
+        return (a * 1 + b * 2 + w * 4).realize()
+      return TinyJit(body)
+    f, g = jit("f", lambda x: a.assign(a + b * x).realize()), jit("g", lambda x: b.assign(b + a * x).realize())
+    h = jit("h", lambda x: w.assign(w - lr * x).realize())
+    got = [step(Tensor([1.0], device=device)).item() for _ in range(8) for step in (f, g)]
+    for i in range(6):
+      lr.assign(Tensor([(i + 1) / 4], device=device)).realize()
+      got.append(h(Tensor([float(i)], device=device)).item())
+    return got, calls, [t.item() for t in (a, b, w)]
+  launches, (got, calls, state) = rt.launches, run("BARETILE")
+  want = run("CPU")
+  assert rt.launches > launches and (got, calls, state) == want and calls == {"f": 2, "g": 2, "h": 2}, ((got, calls, state), want)
+  # Passed the result of the call before, a replay would write its result where it reads its input, so it copies that
+  # input first. Each worker moves three tiles or more in order, reading each where it wrote the one before.
+  rows, calls = 32 * -(-len(rt.cores) // 2), []
+  @TinyJit
+  def shift(x):  # the columns, a tile to the right
+    calls.append(1)
+    return x.pad(((0, 0), (32, 0)))[:, :192].contiguous().realize()
+  want = (np.arange(rows * 192) % 251).reshape(rows, 192).astype(np.float32)
+  x = Tensor(want, device="BARETILE").realize()
+  for n in range(4):
+    x, want = shift(x), np.pad(want, ((0, 0), (32, 0)))[:, :192]
+    assert np.array_equal(x.numpy(), want), n
+  assert len(calls) == 2
 
 
 def test_tinygrad_host_materialize(chip):

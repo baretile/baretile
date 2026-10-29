@@ -19,7 +19,7 @@ from tinygrad.uop.ops import GroupOp, Ops, PatternMatcher, UOp, UPat, graph_rewr
 from tinygrad.schedule.prepare import resolve_function
 from baretile import pci, tensor
 from baretile.chip import Chip
-from baretile.runtime import Runtime
+from baretile.runtime import Bound, Runtime
 
 # A View is a shape, strides, an offset and a mask over a baretile tensor's elements in row-major order. When an op
 # needs the data, the View becomes a tensor of three axes: the tensor as stored, a transpose that a matmul reads in
@@ -229,12 +229,28 @@ def flat(a, n, npd):  # the bytes of n values, broadcasting a scalar
   a = np.asarray(a)
   return np.ascontiguousarray(np.broadcast_to(a, (n,)) if a.ndim == 0 else a.reshape(-1), npd).tobytes()
 
-# While TinyJit records a call, recording maps each holder it reads or changes to [value before, stored into], and
-# hosted counts the host work it does on the values it reads, which a replay wouldn't redo.
+# While TinyJit records a call, recording maps each holder it reads or changes to [value before, stored into, alias],
+# where alias is the chip tensor from before at a Bound address. The call reads that value through the alias, so a
+# replay can read the holder wherever it is then. hosted counts the host work the call does on the values it reads,
+# which a replay wouldn't redo.
 recording, hosted = None, 0
 def note_host_work():
   global hosted
   if recording is not None: hosted += 1
+
+def noted(h, key=None):  # h's entry in recording. A replay binds the alias to h's tensor, or to input key's
+  if h not in recording:
+    t = None if h.value is None else h.value.t
+    # all of the tensor, as a view of its own. A repeat's slice would be a copy and one by columns can't be sliced, so
+    # those aren't bound: the recording reads them where they are, and a change to them makes it record again
+    alias = t[:, :, :] if t is not None and t.rep == 1 and t.runs is None else None
+    if alias is not None: alias.addr = Bound(alias.addr, h if key is None else key)
+    recording[h] = [h.value, False, alias]
+  return recording[h]
+
+def layout(v):  # what a recording assumes of a chip value it reads, other than where it is
+  w, t = v.view, v.t
+  return v.dtype, w.shape, w.strides, w.offset, w.mask, t.dtype, t.shape, t.bstride, t.stride, t.offset, t.rep, t.runs
 
 def to_chip(v, dtype):
   return Value(upload(array(v), DTYPES[dtype]), View(v.shape), dtype)
@@ -429,7 +445,9 @@ class Evaluator:
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_baretile(v):
       h = buf.ensure_allocated()._buf
-      if recording is not None and isinstance(h, Holder): recording.setdefault(h, [h.value, False])
+      if recording is not None and isinstance(h, Holder):
+        before, _, alias = noted(h)
+        if alias is not None and h.value is before: return Value(alias, before.view, before.dtype)
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if (data := h.bytes) is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
       # up to 32 values, like an optimizer's scalars, are uploaded now
@@ -477,7 +495,7 @@ class Holder:  # contents of a BARETILE buffer: bytes from the host, or a chip V
   def __init__(self): self.bytes, self.value, self.version = None, None, 0
   # new contents, noted while TinyJit records a call. stored is False when the same value is laid out again
   def set(self, bytes=None, value=None, stored=True):
-    if recording is not None: recording.setdefault(self, [self.value, False])[1] |= stored
+    if recording is not None: noted(self)[1] |= stored
     self.version += 1
     if bytes is not None: note_host_work()
     self.bytes, self.value = bytes, value
@@ -556,8 +574,10 @@ tinygrad.engine.jit._TinyJit.reset = tinyreset
 
 _tinyjit = tinygrad.engine.jit._TinyJit.__call__
 def tinyjit(self, *args, **kwargs):
-  """Record eligible BARETILE calls with private input buffers. Replay skips Python and overwrites the returned
-  buffers. Host work and unsupported inputs run normally; changing a captured holder invalidates its recording."""
+  """Record eligible BARETILE calls, then replay their launches without running Python. A replay reads each input and
+  captured buffer where it is then, copies what the call stores into a captured buffer back into its storage, and
+  overwrites the returned buffers. Host work and unsupported inputs run normally. A buffer the recording read that is
+  now laid out otherwise, or a changed buffer that the recording made or uploaded, makes it record again."""
   global recording, hosted
   given = [*args, *(v for _, v in sorted(kwargs.items()))]  # tensors, and tensors in shallow containers
   ins = [t for t in given if t.__class__ is Tensor]
@@ -577,48 +597,47 @@ def tinyjit(self, *args, **kwargs):
   _, var_vals, names, info = (None, {}, None, None) if repeated else _prepare_jit_inputs(args, kwargs)
   holders = [on_chip(t) for t in ins]
   eligible = JIT and not repeated and None not in holders and not var_vals
-  if self.cnt == 0 or not eligible or self.replay and any(h.version != version for h, version in self.replay[3]): discard()
+  if self.cnt == 0 or not eligible: discard()
+  elif self.replay:
+    if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")
+    rec, ret, reads, versions = self.replay
+    values = [(holders[key] if isinstance(key, int) else key).value for key, _ in reads]  # what each buffer it binds holds now
+    if all(h.version == n for h, n in versions) and all(v is not None and layout(v) == want for v, (_, want) in zip(values, reads)):
+      self.cnt += 1
+      # The replay overwrites the recording's results while it reads its inputs, so a result passed back in is copied first
+      ts = [tensor.Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t) if t.addr in rec.made else t for t in (v.t for v in values)]
+      rec.send({key: t.addr for (key, _), t in zip(reads, ts)})
+      return ret
+    discard()
   self.cnt += 1
   if self.cnt == 1 or not eligible or self.replay is False:
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
-  if self.replay is None:
-    original = [h.value for h in holders]
-    values = [Value(tensor.Tensor(v.t.rt, v.t.rows, v.t.cols, batch=v.t.batch, dtype=v.t.dtype).assign(v.t), v.view, v.dtype)
-              for v in original]
-    # Bind the caller's graph to private storage only while capturing. Neither capture nor replay overwrites inputs.
-    for h, v in zip(holders, values): h.value = v
-    recording, hosted, self.inputs = {}, 0, (names, info)
-    rec = tensor.Recording(runtime())
-    try:
-      with rec:
-        ret = self.fxn(*args, **kwargs)
-        if params := get_parameters(ret): Tensor.realize(*params)
-        _check_no_non_tensor_return(ret)
-        back = [(h, old) for h, (old, _) in recording.items() if old is not None and h not in holders]
-        same = lambda h, old: isinstance(h.value, Value) and (h.value.t.shape, h.value.t.dtype) == (old.t.shape, old.t.dtype)
-        into_input = any(stored and h in holders for h, (_, stored) in recording.items())
-        # Returned input views still name the caller's holder, which is restored below rather than replayed.
-        input_bases = {t.uop.storage_base for t in ins}
-        returns_input = any(t.uop.storage_base in input_bases for t in get_parameters(ret))
-        replayable = hosted == 0 and not into_input and not returns_input and all(same(h, old) for h, old in back)
-        for h, old in back if replayable else ():
-          if h.value.t is not old.t: old.t.assign(h.value.t)
-          h.value = Value(old.t, h.value.view, h.value.dtype)
-      self.replay = bool(rec.launches) and replayable and (rec, values, ret, [(h, h.version) for h in recording if h not in holders])
-      if not self.replay: rec.close()
-    finally:
-      for h, v in zip(holders, original):
-        if not recording.get(h, (None, False))[1]: h.value = v
-      recording = None
-    return ret
-  rec, values, ret, _ = self.replay
-  if (names, info) != self.inputs: raise JitError(f"args mismatch in JIT: {names, info} where it recorded {self.inputs}")
-  sources, addresses = [h.value.t for h in holders], {v.t.addr for v in values}
-  sources = [tensor.Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t) if t.addr in addresses else t for t in sources]
-  for t, v in zip(sources, values): v.t.assign(t if t.shape == v.t.shape else t.reshape(*v.t.shape))
-  rec.send()
+  recording, hosted, self.inputs = {}, 0, (names, info)
+  for i, h in enumerate(holders): noted(h, i)  # inputs bind by position
+  rec = tensor.Recording(runtime())
+  try:
+    with rec:
+      ret = self.fxn(*args, **kwargs)
+      if params := get_parameters(ret): Tensor.realize(*params)
+      _check_no_non_tensor_return(ret)
+      bound = [(h, old, stored, alias) for h, (old, stored, alias) in recording.items() if alias is not None]
+      # A store into an input runs normally, since a replay may read that input from a copy
+      into_input = any(stored and h in holders for h, _, stored, _ in bound)
+      # A replay returns what this call returns, so a returned input, or a view of one, would name this call's input
+      input_bases = {t.uop.storage_base for t in ins}
+      returns_input = any(t.uop.storage_base in input_bases for t in get_parameters(ret))
+      same = lambda h, old: isinstance(h.value, Value) and (h.value.dtype, h.value.t.shape, h.value.t.dtype) == (old.dtype, old.t.shape, old.t.dtype)
+      replayable = hosted == 0 and not into_input and not returns_input and all(same(h, old) for h, old, stored, _ in bound if stored)
+      # Each holder ends in its storage from before the call, holding what the call stored, as it will after each replay
+      for h, old, stored, alias in bound if replayable else ():
+        if stored: alias.assign(h.value.t)
+        h.value = old
+    self.replay = bool(rec.launches) and replayable and (rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
+                                                         [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None])
+    if not self.replay: rec.close()
+  finally: recording = None
   return ret
 tinygrad.engine.jit._TinyJit.__call__ = tinyjit
 
