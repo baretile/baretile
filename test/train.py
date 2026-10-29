@@ -1,7 +1,7 @@
 # Train a small character-level GPT-2 on README and the docs using fp32 and Adam.
 # PyTorch checks the loss and gradients at each step using the same weights. A separate PyTorch
 # run starts from the same weights to compare loss curves; floating-point rounding lets them diverge.
-#   TTSIM=/path/to/libttsim.so python3 test/train.py [steps]
+#   python3 test/train.py [steps]
 import math, os, pathlib, sys, time
 from types import SimpleNamespace
 import numpy as np
