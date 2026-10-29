@@ -36,7 +36,8 @@ pytest can otherwise hide that error message. The tests share a `Chip` because
 the simulator can only be initialized once per process.
 
 The runtime compiles device programs with clang for `riscv32-unknown-elf` and
-links them with lld. Builds go in `~/.cache/baretile`, so you won't have to
+links them with lld. Builds go in `$XDG_CACHE_HOME/baretile`, which is
+`~/.cache/baretile` by default, so you won't have to
 compile them again on the next run. Entries expire after a week without use.
 
 ## Optional checks
@@ -56,8 +57,8 @@ GPT2=/path/to/gpt2/model.safetensors python3 -m pytest -s test -k gpt2_model
 LLAMA=/path/to/SmolLM-135M python3 -m pytest -s test -k llama_model
 ```
 
-`LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` sets the
-number of random expressions in the kernel fuzz test. `TTSIM2=/path/to/libttsim.so`
+`LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` raises the
+number of random expressions in the kernel fuzz test above its default of 30. `TTSIM2=/path/to/libttsim.so`
 enables the two-chip test. ttsim's releases include that library as
 `libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2` target.
 
@@ -167,5 +168,7 @@ the status write to host memory. A read ID that's still outstanding means a
 transfer hasn't finished. Use the [pipeline counters](compiler.md#unpack-math-and-pack) to
 see where a kernel is waiting.
 
-Creating a new runtime resets its worker cores. If the NoC or ARC has hung,
-see [bring-up](bring-up.md#when-a-card-hangs) for the chip reset command.
+Creating a new runtime resets its worker cores, but not a Tensix coprocessor that a
+hung kernel left waiting. If the next runtime's kernels hang on those workers, or
+the NoC or ARC has hung, see [bring-up](bring-up.md#when-a-card-hangs) for the chip
+reset command.

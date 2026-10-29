@@ -71,8 +71,8 @@ print((x @ w).relu().tolist())
 ```
 
 The matmul and ReLU run when you call `tolist()`. Until then, they're an
-expression waiting to be compiled. They run in one kernel here, with the matmul's
-result kept in local memory for the ReLU.
+expression waiting to be compiled. They run in one kernel here: the ReLU works on
+the matmul's result in the math unit's registers, before it's written out.
 
 Tensors support broadcasting, reductions, views and autograd. Storage formats are
 bf16, fp32, int32, bfp8 and bfp4. The
