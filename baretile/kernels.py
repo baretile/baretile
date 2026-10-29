@@ -8,7 +8,7 @@ from baretile.runtime import DATA, ZEROS, compile_kernel
 from baretile.tensix import (ACCS, B8, B8_SLOTS, BANKS, BFP, BINARY, CASTS, CC_OFF, CC_ON, CHUNKS, COMBINE, DEPTH, DST_HALF, FILLED, FLAGS_B,
                             FOLDS, FP32_OPS, FRAMES, INT32_OPS, ITEMSIZE, MATH_END, MAX_OPS, ONE, OUTS, PAIR, REPORT, ROWS, SEM_L1, SEM_PACKED,
                             SFPU, SFPU_START, UNPACKABLE, WALK, ZERO_SLOT, Loop, accumulating, across_rows, aim, allocate, bfp_b, brisc_program,
-                            chunk_tiles, config, elementwise, ext, field, fill, fold, haloize, ins, kernel_config, mad, mask_columns, mask_rows_at,
+                            chunk_tiles, elementwise, ext, field, fill, fold, haloize, ins, kernel_config, mad, mask_columns, mask_rows_at,
                             math_begin, math_program, matmul, pack, pack_program, reconfigure, reduce_finish, reduce_step, reload, repack, setadc,
                             sfpu, sfp_bits, sfp_load, sfp_store, slot_base, step_unpack, table, tile_bytes, tile_of, tt, unpack, unpack_program,
                             walk)
@@ -190,17 +190,16 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # If K is too long for that, it goes in parts (grid_parts). Workers sum their result tiles over the parts in L1
   # (tensix.accumulating). The last part starts each tile from its sum (tensix.reload) and runs the rest of the tree.
   mc, parts = None, None
-  if grid and len(matmuls) == 1 and not reducing and nb == 1 and rt > 1 and ext(ops[matmuls[0]]["shape"], 2) == w:
+  if (grid and len(matmuls) == 1 and ops[matmuls[0]]["ids"] is None and not reducing and nb == 1 and rt > 1 and
+      ext(ops[matmuls[0]]["shape"], 2) == w):
     kt = ops[matmuls[0]]["kt"]
     bp, bq = -(-rt // min(len(grid[1]), rt)), -(-w // min(len(grid[0]), w))
     n_grid = (-(-w // bq), -(-rt // bp))
     parts = grid_parts(rt, w, kt, grid, base, inputs)
     if parts is not False and n_grid[0] * n_grid[1] > 1 and max(n_grid) <= FLAGS_B: mc = n_grid
     else: parts = None
-  if parts:  # the packer switches to the accumulators and back, so TRISC0's config must hold the words it changes
+  if parts:
     (kp, group, acc_at), n_parts = parts, -(-ops[matmuls[0]]["kt"] // parts[0])
-    cfg, root_cfg = cfg | config(Pack_L1_Acc=0), root_cfg | config(Pack_L1_Acc=0)
-    around = (tt(repack(cfg, root_cfg)), tt(repack(root_cfg, cfg))) if out != dtype and len(ops) > 1 else ("", "")
   # bcast: with one row of tiles, as in a token's matmul, grid workers take blocks of the result's columns. The first
   # grid row reads A's tiles in shares and multicasts them to the grid, so A's row is read from DRAM once. No two
   # workers share B, so it streams as usual. In a batch, like a K cut into parts, each matrix gets its own grid rows,
@@ -261,7 +260,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   if mc:
     (gx_n, gy_n), (xs, ys) = mc, grid
     decls = (table("row_rect", [bh.noc_rect((xs[0], y), (xs[gx_n - 1], y)) for y in ys[:gy_n]]) +
-             table("col_rect", [bh.noc_rect((x, ys[0]), (x, ys[gy_n - 1])) for x in xs[:gx_n]]))
+             table("col_rect", [bh.noc_rect((x, ys[0]), (x, ys[gy_n - 1])) for x in xs[:gx_n]])) + "\n"
     tail = f"unflag({gx_n}, {gy_n});"
   part_code = [("", "")] * 4  # with parts, the code each program runs before and after a part
   if parts:
@@ -290,25 +289,26 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # several passes keeps its line of tiles in L1, fetched in the first pass, if they fit below slot 256. Neither is
   # read from DRAM twice.
   kept, passes_of, narrow = {}, lambda r: [p for p in range(last + 1) if r in reads[p]], lambda r: ext(shapes[r], axis) == 1
+  room = min(UNPACKABLE, (OUTS - slot_base(dtype)) // tile_bytes(dtype))
   for r in range(inputs) if reducing else ():
-    if narrow(r) and passes_of(r) and top < UNPACKABLE: kept[r], top = top, top + 1
-    elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= UNPACKABLE: kept[r], top = top, top + L
+    if narrow(r) and passes_of(r) and top < room: kept[r], top = top, top + 1
+    elif not narrow(r) and len(passes_of(r)) > 1 and top + L <= room: kept[r], top = top, top + L
   # the last pass that reads a kept input: of the narrow inputs if keep is True, of the others if not
   last_read = lambda keep: max([passes_of(r)[-1] for r in kept if narrow(r) == keep], default=None)
   # In passes, a matmul computed in several passes, like the scores under a softmax, keeps the line's tiles of B in L1
-  # from the first pass, as a kept input does. At most one matmul gets this. B can't be a block float, its row of A
-  # must be kept, and the tiles must fit.
+  # from the first pass, as a kept input does. At most one matmul gets this. B can't be a block float or picked by
+  # indices, its row of A must be kept, and the tiles must fit.
   line_b, computed = None, [None]
   for j in matmuls:
     mine = [p for p, pl in enumerate(plans) if j in pl[1]]
-    if (reducing and line_b is None and len(mine) > 1 and not ops[j]["wt"] and rows_at[matmuls.index(j)] is not None and
+    if (reducing and line_b is None and len(mine) > 1 and not ops[j]["wt"] and ops[j]["ids"] is None and rows_at[matmuls.index(j)] is not None and
         top + L * ops[j]["kt"] <= UNPACKABLE): line_b, computed, lines_at, top = j, mine, top, top + L * ops[j]["kt"]
   if line_b is not None: decls += f"static unsigned line_done[{L}];\n"
   single = {}  # without passes, a scalar input also gets its own slot, fetched once a worker
   if kept_b is not None and parts: top = max(top, kept_b + (0 if b8 else 3) * kp)  # a block-float B goes past the slots
   elif kept_b is not None: top = max(top, kept_b + (3 if mc else 1) * ops[matmuls[0]]["kt"])  # past A's rows and B's buffers
   for r in range(inputs) if not reducing else ():
-    if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < UNPACKABLE: single[r], top = top, top + 1
+    if all(ext(shapes[r], ax) == 1 for ax in range(3)) and top < room: single[r], top = top, top + 1
   if long: rows_at, top = [top], top + ops[matmuls[0]]["kt"]  # past the singles, which stay below slot 256
   b8_at = slot_base(dtype) + top * tile_bytes(dtype) if long or parts and b8 else None  # a block-float B goes past it, or at B8
   if chunked and not ops[matmuls[0]]["wt"]: ring_slot, top = top, top + chunked  # a bf16 B's ring goes past it too
@@ -368,8 +368,10 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   for p, (reductions, swept_ops, once) in enumerate(plans):
     c = [[], [], [], []]  # each program's C for a tile
     final = f"p == {n_parts - 1}" if parts else None  # with parts, the test that picks out the last part
-    fetches = [fetch(p, r) for r in sorted(reads[p])]
-    c[B] += ["reached(frame_done[fr]);"] + ([f"if ({final}) {{ {' '.join(fetches)} }}"] if parts and fetches else fetches) + ["ready();"]
+    fetches = [fetch(p, r) for r in sorted(reads[p]) if r not in single]
+    # Singles arrive with the first tile, even when the epilogue waits for the last K part.
+    c[B] += (["reached(frame_done[fr]);"] + [fetch(p, r) for r in sorted(reads[p]) if r in single] +
+             ([f"if ({final}) {{ {' '.join(fetches)} }}"] if parts and fetches else fetches) + ["ready();"])
     c[U].append("fetched();")
     # A picked matmul's math reads the indices, which are in L1 once the first frame is.
     if dst or picked: c[M].append("fetched();")
@@ -746,7 +748,7 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
     store, room = attention_store(ht, R, wt, parts)
     rows_a = 64 // ht
   kept = f"(kt - k0 < {room})" if keep else "0"  # the key row is in the store
-  cfg = kernel_config() | config(Pack_L1_Acc=0)
+  cfg = kernel_config()
   first, onto = accumulating(oacc, False), accumulating(oacc, True)  # pack the output tiles in fp32, then add onto them
   slots = allocate({"mmT", "mm", "exp", "one"} | ({"none"} if parts > 1 else set()))
   # Row r's largest scores are a quarter of accumulator tile r / 4: the even columns of its left faces, moved on 16
@@ -878,7 +880,7 @@ def gather_kernel(dtype):
   args: [first unit, units, out, input address, input tile stride, input tile offset,
   result tile columns, result rows, index address, index tile offset]. Indices form an int32 row.
 
-  Each unit writes one result tile. It reads the index tile, then two runs of 16 values per selected
+  Each unit writes one result tile. A worker keeps its current index tile, then reads two runs of 16 values per selected
   row, one from each face. DRAM reads must preserve the low six address bits, so each run is fetched
   as the containing 64-byte block. Read all blocks for a tile together, then copy the values into place.
   A single-row result repeats that row throughout its tile using NoC copies within L1."""
@@ -891,10 +893,10 @@ def gather_kernel(dtype):
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // index r of this tile's 32, in row 0
 static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * {item}; }}  // row n's run in face f, in its tile, in bytes
 void kmain(volatile unsigned *a) {{
-  for (unsigned u = 0; u < a[1]; u++) {{
+  for (unsigned u = 0, held = ~0u; u < a[1]; u++) {{
     unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;  // it: the indices' tile
-    noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")});
-    copy({ZEROS:#x}, SLOT, {tb});  // the rows past the end stay zero
+    if (it != held) noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")}), held = it;
+    if (rows < 32) copy({ZEROS:#x}, SLOT, {tb});  // full tiles overwrite every row; partial tiles keep zero padding
     noc_wait();
     for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{  // row r's run in face f, through block 2 r + f of BLOCKS
       unsigned n = id(r), from = n / 32 * a[4] + j + a[5];
@@ -918,7 +920,7 @@ def copy_kernel(dtype):
   its read with the previous tile's write.
 
   args: [first unit, units, output address, output batch stride, output row stride, output tile offset,
-  input address, input batch stride, input row stride, input tile offset, tile rows, tile columns]."""
+  input address, input batch stride, input row stride, input tile offset, tile rows, tile columns, input repeat]."""
   tb = tile_bytes(dtype)
   return compile_kernel(f"""
 {BANKS}
@@ -926,7 +928,7 @@ void kmain(volatile unsigned *a) {{
   unsigned tr = a[10], tc = a[11];
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u, b = t / (tr * tc), i = t / tc % tr, j = t % tc, slot = {DATA:#x} + u % 2 * {tb};
-    unsigned from = b * a[7] + i * a[8] + j + a[9], to = b * a[3] + i * a[4] + j + a[5];
+    unsigned from = b / a[12] * a[7] + i * a[8] + j + a[9], to = b * a[3] + i * a[4] + j + a[5];
     noc_get(BANK(from), AT(a[6], from, {tb}), slot, {tb});
     noc_wait();  // this waits for the write of the tile before too, from the other slot
     noc_write(slot, BANK(to), AT(a[2], to, {tb}), {tb});
@@ -1090,7 +1092,7 @@ void kmain(volatile unsigned *a) {{
   datum *x = (datum *)X;
   volatile datum *values = (volatile datum *)VALUES;  // a result tile of each. This unit writes its row in it
   volatile unsigned *ids = (volatile unsigned *)IDS;
-  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, done = ~0u, top[{k}], col[{k}], kept = 0;  // done: the row that top and col hold
+  unsigned rows = a[8], tr = (rows + 31) / 32, held = ~0u, top[{k}], col[{k}], kept = 0;
   for (unsigned u = 0; u < a[1]; u++) {{
     // row r of tile row i of x, in part p of matrix b. first is the part's first tile
     unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};
@@ -1098,8 +1100,8 @@ void kmain(volatile unsigned *a) {{
     unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here, and the row r holds
     unsigned face = at(r, 0);  // the row's run in the left face
     if (rows == 1 && r) continue;  // with one row of x, the tile row's first unit writes all its copies
-    if (s < n && t * 32 + s != done) {{
-      done = t * 32 + s, kept = 0;
+    if (s < n) {{
+      kept = 0;
       if (t != held || rows <= 8) {{  // up to 8 rows read their runs. More read the part's tile row, once a worker
         for (unsigned j = 0; j < {ct}; j++)
           if (rows <= 8) for (unsigned f = 0; f < 2; f++) {{

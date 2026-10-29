@@ -72,7 +72,7 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
   late = bh.FP32 if out in BFP else pack
   return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
                 PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out),
-                PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0,
+                PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0, Pack_L1_Acc=0,
                 L1_Dest_addr=(slot_base(dtype) if out == dtype else OUTS) // 16 - 1, Disable_zero_compress=1, Pack_out_format=pack,
                 Exp_section_size=4,  # the 64 exponents of a block float, in units of 16 bytes
                 Pack_in_format=late, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=64, UNP0_ZW_1=0, UNP1_ZW_1=0,
@@ -86,8 +86,8 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
 # own modes, so ops can mix without rewriting modes between them.
 ADDR_MODES = {0: ((8, 8), (8, 0)), 1: ((0, 0), (0, 1)), 2: ((0, 0), (0, 0)), 3: ((0, 0), (2, 0)),
               4: ((16, 0), (0, 0)), 5: ((48, 8), (0, 0)), 6: ((16, 8), (0, 0)), 7: ((16, 8), (0, 1))}
-# The config of a thread. We write all of it because the reset values aren't documented. With dst, the thread unpacks
-# into Dst.
+# The config of a thread. We write all of it because the reset values aren't documented, except packer modes 1-3,
+# since every PACR uses mode 0. With dst, the thread unpacks into Dst.
 def thread(dst=False):
   return [ins("SETC16", setc16_reg=r, setc16_value=v) for r, v in
           ({r: 0 for r in bh.THREAD_CFG.values()} | {bh.ADDR_MOD_BIAS + m: 0 for m in range(8)} |
@@ -130,9 +130,9 @@ SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ 
 # run time.
 def field(word, v): return word + v if isinstance(v, int) else (word, v)
 def setadc(unpacker, slot): return field(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)  # Z is the slot
-def unpack(a, b):  # unpacks slot a into SrcA and slot b into SrcB, then hands both banks to the FPU
-  return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
-          ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1)]
+def unpacr(b, z):  # unpacks a tile into SrcA, or SrcB with b, and hands the bank to the FPU. Then Z moves on by z
+  return ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=b, addr_mode=z)
+def unpack(a, b): return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), unpacr(0, 0), unpacr(1, 0)]  # slot a into SrcA, b into SrcB
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 # Unpacks an fp32 tile from an L1 slot into Dst, from row `row` on, bypassing SrcA. The math thread does this, with
 # unpacker 0 in context 1.
@@ -172,12 +172,10 @@ def bfp_b(wt, slots, region=0, base=None):
   fmt, base = (FORMAT[wt], base or B8 + region * slots * tile_bytes(wt)) if slots else (bh.BF16, slot_base("bf16"))
   return reconfigure(SEC0_format=fmt, SEC0_out_format=fmt, SEC0_z_dim=max(slots, 1), SEC0_base=base // 16 - 1)
 def step_unpack(s):  # a matmul step. B's tile goes from stream slot s into SrcA, and the next tile of A's row into SrcB
-  return [setadc(bh.UNPACK0, s), ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1),
-          ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)] + REPORT  # mode 1: Z += 1
+  return [setadc(bh.UNPACK0, s), unpacr(0, 0), unpacr(1, 1)] + REPORT
 # PAIR unpacks a tile into SrcA and one into SrcB, then moves each unpacker's Z on by 1. WALK is a matmul step along
 # B's column and A's row when both are kept in L1.
-PAIR = [ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, addr_mode=1),
-        ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=1, addr_mode=1)]
+PAIR = [unpacr(0, 1), unpacr(1, 1)]
 WALK = PAIR + REPORT
 # Aims the FPU and SFPU at Dst row `row` on. The write waits for this thread's FPU and SFPU work first, as tt-llk's
 # dest_section_flip does, since work still in their pipelines would see the new offset. TTSIM_CHAOS_MATH tests this.
@@ -194,7 +192,6 @@ def pack(row, slot, *done):  # packs 64 Dst rows from `row` into an L1 slot, the
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
           field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
           field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),  # channel 1 Y: L1 slot
-          ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
          [ins("SEMPOST", sem_sel=d) for d in done]
@@ -251,9 +248,10 @@ ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
 CC_ON, CC_ALL, CC_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags: on, all set, off
 NAN, INF = 0x7FC00000, 0x7F800000
 def nans(x, t, inf):  # sets the lane flags where LReg x is NaN, using LRegs t and inf
-  # A lane is NaN where |x| is above the bits of inf (which LReg inf gets) in SFPGT's order. An SFPMOV between CC_ON
-  # and CC_OFF can then give those lanes NaN.
-  return [*sfp_bits(inf, INF), ins("SFPABS", vd=t, vc=x, mod1=1), ins("SFPGT", vd=t, vc=inf, mod1=1)]
+  # x + 0 makes any NaN 0x7FC00000, even a negative one that SFPABS would leave at the bottom of SFPGT's order. A lane
+  # is NaN where that is above the bits of inf (which LReg inf gets). An SFPMOV between CC_ON and CC_OFF can then give
+  # those lanes NaN.
+  return [mad(t, x, ONE, ZERO), *sfp_bits(inf, INF), ins("SFPGT", vd=t, vc=inf, mod1=1)]
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # with flags on, keeps lanes where int LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n. both overwrite LReg t
 # LReg d = cs[0] + cs[1] x + ..., by Horner. Each coefficient goes into LReg temp when it's needed, except 0 and +-1,
@@ -372,8 +370,9 @@ SFPU = {
 # They load into LRegs 0 and 1, and the result is stored over x. Comparisons give 1.0 or 0: the all ones or 0 from
 # SFPGT, ANDed with the bits of 1.0. x + 0 first turns -0 into 0. keep and drop are the two halves of where.
 # keep(c, x) is x if c else 0, and drop(c, y) is y if not c else 0, where c is true when it isn't 0. They work on the
-# bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would. c's test is a float's, so an int32
-# c comes as 0 or 1 (Tensor.where).
+# bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would. c's test is on its bits too: an
+# integer SFPABS makes every c but +-0 positive, a negative NaN included, which a float one leaves negative. An int32 c
+# comes as 0 or 1 (Tensor.where), since its lowest value would count as -0.
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 # fp32 comparisons start from x + 0 and y + 0, which turn -0 into 0 and a NaN into 0x7FC00000, the top of SFPGT's
 # order. -(-(y + 0) - 0) then gives y + 0 back, but its NaN negated, at the bottom: an SFPMAD's NaN is always
@@ -406,8 +405,8 @@ SFPU |= {
   "fcmple": ([], binary(*UNORDERED, ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
   "fcmpne": ([], binary(*UNORDERED, ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8),
                         ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
-  "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
+  "keep": ([], binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  "drop": ([], binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   # The two disjoint masks of where combine without arithmetic, preserving a selected negative zero.
   "join": ([], binary(ins("SFPOR", vd=0, vc=1), sfp_store(0, mod0=RAW))),
@@ -493,10 +492,10 @@ def mask_columns(kind, n, d=0):
   store goes only to the lanes whose column is n or more."""
   p, identity = masking(kind)
   p += sfp_bits(7, 14) + [ins("SFPAND", vd=7, vc=15)]
-  for base, right, odd in [(b, r, o) for b in (0, 4, 8, 12, 32, 36, 40, 44) for r in (0, 1) for o in (0, 1)]:
+  for right, odd in [(r, o) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first of the 8 lanes at column n or more
-    if t < 8:  # store to lanes t and up at the face's rows. a right face is 16 rows further on
-      p += [CC_ON, at_least(7, 2 * t, 6), sfp_store(identity, at=d + base + 16 * right + 2 * odd, step=False)]
+    if t < 8:  # store to lanes t and up at the face's rows. a right face is 16 rows further on. stores keep the flags
+      p += [CC_ON, at_least(7, 2 * t, 6)] + [sfp_store(identity, at=d + b + 16 * right + 2 * odd, step=False) for b in (0, 4, 8, 12, 32, 36, 40, 44)]
   return p + [CC_OFF]
 def mask_rows(kind, m, d=0):
   """Set rows m and up of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, with
@@ -505,7 +504,7 @@ def mask_rows(kind, m, d=0):
   for r in range(0, 32, 4):  # rows r..r+3 start at Dst row (r // 16) * 32 + r % 16 in the left face, 16 on in the right
     k = max(0, m - r)
     if k < 4:
-      p += [w for o in (0, 2, 16, 18) for w in (CC_ON, at_least(15, 16 * k, 6), sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False))]
+      p += [CC_ON, at_least(15, 16 * k, 6)] + [sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False) for o in (0, 2, 16, 18)]
   return p + [CC_OFF]
 def mask_rows_at(m):
   """Generate mask_rows("sum", m) with m supplied as a C expression at run time. m is the number of valid rows
@@ -515,8 +514,8 @@ def mask_rows_at(m):
   cut, store = at_least(15, 0, 6), sfp_store(identity, step=False)
   imm12, imm10 = bh.TENSIX_OPS["SFPIADD"][1]["imm12"][0], bh.TENSIX_OPS["SFPSTORE"][1]["imm10"][0]
   return (f"{tt(p)} for (unsigned r = 0; r < 32; r += 4) if ({m} < r + 4) {{ unsigned k = {m} > r ? {m} - r : 0; "
-          f"for (unsigned o = 0; o < 4; o++) {{ push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); "
-          f"push_word({store:#x} | (r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} }} {tt([CC_OFF])}")
+          f"push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); for (unsigned o = 0; o < 4; o++) "
+          f"push_word({store:#x} | (r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} {tt([CC_OFF])}")
 MASK = {1: mask_rows, 2: mask_columns}  # masks the padding past the tensor's end, in its last tile along an axis
 MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
 MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE

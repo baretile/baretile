@@ -169,6 +169,7 @@ class Tensor:
   def gather(self, ids):
     """Read rows selected by ids. Accept a Python list or an int32 tensor row, so indices can be computed on
     the chip. Python indices are bounds-checked; tensor indices aren't."""
+    if self.dtype not in ITEMSIZE: raise ValueError("cast block-float storage to bf16 before gathering rows")
     if not isinstance(ids, Tensor):
       if not all(0 <= i < self.rows for i in ids): raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
       ids = Tensor.of(self.rt, [list(ids)], "int32")
@@ -236,7 +237,8 @@ class Tensor:
     """Map elements into a new tensor of shape (batch, rows, cols). Output element (b, r, c) reads
     input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order.
     Output positions outside [lo, hi) on any axis are zero. Every selected source element must lie
-    inside this tensor; offsets and strides are signed 32-bit integers."""
+    inside this tensor; offsets and strides are signed 32-bit integers. No gradient: reshape, permute,
+    expand, pad and slices provide their own gradient rules."""
     try:
       shape, strides, lo = (tuple(map(operator.index, values)) for values in (shape, strides, lo))
       hi, offset = shape if hi is None else tuple(map(operator.index, hi)), operator.index(offset)
@@ -354,9 +356,10 @@ class Tensor:
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
       if self.dtype in BFP: raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
-      x, op, self.op, self.srcs, d = _plain(self.srcs[0].realize()), self.op, None, (), self.dtype
-      self.addr = self._alloc()
-      where = (self.addr, *x._where())
+      x, op, d = _plain(self.srcs[0].realize()), self.op, self.dtype
+      where = x._where()  # validate the source before this tensor counts as realized
+      self.addr, self.op, self.srcs = self._alloc(), None, ()
+      where = (self.addr, *where)
       if op == "T" and d == "bf16":
         return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where, name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
@@ -385,21 +388,17 @@ class Tensor:
     return self
   def assign(self, x):
     """Write x into this tensor in place, as an optimizer updates a weight. An unrealized x is computed into this
-    tensor's DRAM, which is safe because elementwise kernels read each tile before writing it. Matmuls and moves read
-    other tiles too, which may already be overwritten, so they're realized first and copied in. Overlapping
-    views with different layouts also copy their source before writing."""
+    tensor's DRAM. A matmul with an overlapping input, or an overlapping view with a different layout, computes
+    its source before writing. Moves and transposes compute into their own storage first."""
     self._same_runtime(x)
     if not (self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype)):
       raise ValueError("assign requires a realized tensor with rep=1 and an x of the same shape and dtype")
     _writes(self)
-    if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
-    reads = [x] if x.op is None else [s for t in _lazy(x, set()) for s in t.srcs]
-    if any(t.addr == self.addr and _layout(t) != _layout(self) for t in reads):
-      x = x.realize() if x.op is not None else _copy(x)
+    if x.op in ("T", "move"): x = x.realize()
     if x.op is not None: x.realize(self); return self
-    x = _plain(x)
+    if x.addr == self.addr and _layout(x) != _layout(self): x = _copy(x)
     return self.run(("copy", self.dtype), lambda: copy_kernel(self.dtype), *self._where(), *x._where(),
-                    -(-self.rows // 32), -(-self.cols // 32), name="copy")
+                    -(-self.rows // 32), -(-self.cols // 32), x.rep, name="copy")
 
   def run(self, key, make, *args, units=None, name=""):
     """Build a kernel with make(), cache it by key, and queue it over units (tiles by default). Realize tensors
@@ -477,7 +476,7 @@ class Tensor:
     return -((-self).maximum(-x))
   def where(self, x, y):
     """x where self isn't 0, else y. A condition of another dtype, or an int32 one that isn't a comparison's 0 or 1,
-    becomes 0 or 1 in theirs first, since the SFPU tests it as a float."""
+    becomes 0 or 1 in theirs first, since the SFPU tests its bits as a float's, where -0 is false."""
     dtype = next((t.dtype for t in (x, y) if isinstance(t, Tensor)), self.dtype)
     c = self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmple", "cmpne")) else self.ne(0).cast(dtype)
     return c._binop("keep", x)._binop("join", c._binop("drop", y))
@@ -544,7 +543,7 @@ class Tensor:
       raise ValueError("to requires different runtimes with neither recording launches")
     x = self.realize()
     if x.runs: raise ValueError("cast a tensor by columns to bf16 before transferring it to another chip")
-    if x.owner is not None or x.rep > 1 or x.offset: x = (x + 0).realize()  # copy a view into a tensor of its own first
+    if x.owner is not None or x.rep > 1 or x.offset: x = _copy(x)  # transfer a view from its own storage, preserving its bits
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
     x.rt.wait(), rt.wait()
     flags, n = link_flags(x.dtype)
@@ -605,7 +604,8 @@ class Tensor:
     s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and tr == 1 and self.cols % (32 * s) == 0 and k // s >= 4
              and s * -(-x.cols // 32) <= len(self.rt.cores)], default=1)
     if s > 1:
-      parts = self.split(s).matmul(x.split(s, 1), dtype, fidelity)
+      b = x.srcs[0].split(s).T if x.op == "T" else x.split(s, 1)
+      parts = self.split(s).matmul(b, dtype, fidelity)
       return sum((parts[i] for i in range(1, s)), parts[0])
     out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x), max(self.batch, x.batch), dtype)
     out.fidelity = fidelity
@@ -675,17 +675,10 @@ class Tensor:
     if gradient is None and self.shape != (1, 1, 1): raise ValueError("self must be a single value, or pass gradient")
     if gradient is not None and gradient.shape != self.shape: raise ValueError("gradient must have the output's shape")
     if gradient is not None: self._same_runtime(gradient)
-    order, seen = [], set()
-    def visit(t):  # what self was made of, operands first
-      if id(t) in seen or t._ctx is None: return
-      seen.add(id(t))
-      for s in t._ctx[1]:
-        if s.requires_grad: visit(s)
-      order.append(t)
-    visit(self)
     grads = {id(self): gradient if gradient is not None else Tensor.full(self.rt, 1, 1, 1.0, self.dtype)}
     wanted, found = {id(t) for t in targets}, {}
-    for t in reversed(order):
+    for t in reversed(_graph(self)):
+      if t._ctx is None: continue
       if (g := grads.pop(id(t), None)) is None: continue
       if id(t) in wanted: found[id(t)] = g
       for s, gs in zip(t._ctx[1], _backward(t, g)):
@@ -696,14 +689,7 @@ class Tensor:
     """Accumulate gradients in .grad for leaves that require them, and return self. Existing gradients are
     added to, as in PyTorch and tinygrad. Queue the forward value and all gradients before returning, so
     later parameter updates cannot change the values used by another parameter's gradient."""
-    leaves, seen = [], set()
-    def visit(t):
-      if id(t) in seen: return
-      seen.add(id(t))
-      if t._ctx is None: leaves.append(t)
-      for s in t._ctx[1] if t._ctx else ():
-        if s.requires_grad: visit(s)
-    visit(self)
+    leaves = [t for t in _graph(self) if t._ctx is None]
     grads = self.gradient(*leaves, gradient=gradient)
     self.realize()
     for t, g in zip(leaves, grads):
@@ -722,6 +708,17 @@ def _unbroadcast(g, shape):  # the gradient of a broadcast operand: g summed ove
   return g
 def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for ops that can't take g broadcast
 def _layout(t): return t.shape, t.bstride, t.stride, t.offset, t.rep, t.runs
+
+def _graph(t):  # autograd's operands before their users, without recursion through long histories
+  order, seen, stack = [], set(), [(t, False)]
+  while stack:
+    u, done = stack.pop()
+    if done: order.append(u)
+    elif id(u) not in seen:
+      seen.add(id(u))
+      stack.append((u, True))
+      stack.extend((s, False) for s in reversed(u._ctx[1] if u._ctx else ()) if s.requires_grad)
+  return order
 
 def _backward(t, g):
   """The gradients of t's operands, given t's gradient g. A condition or a comparison has none, and gets None."""
@@ -813,7 +810,7 @@ def _parts(t):  # an fp32 matmul operand as bf16 (hi, lo), lo None for bf16. a t
   if t.dtype == "bf16": return t, None
   return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo is t minus t rounded as the bf16 cast rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
-def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # copy a repeat, for a kernel that finds tiles by their position
+def _plain(t): return _copy(t) if t.rep > 1 else t  # copy a repeat, for a kernel that finds tiles by their position
 def _copy(t): return Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t)  # t in a new tensor of its own
 def _root(t): return t if t.owner is None else t.owner  # the tensor that owns t's storage
 def _rows_free(e):
@@ -836,11 +833,14 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are realized first, not fused into the same kernel
 def _below(t, root):  # what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root
   return t.srcs if t.op not in WHOLE or root and t.op == "cast" else ()
-def _lazy(t, seen, root=True):  # the unrealized ops under t, t first
-  if t.op is None or id(t) in seen: return
-  seen.add(id(t))
-  yield t
-  for s in _below(t, root): yield from _lazy(s, seen, False)
+def _lazy(t, seen):  # the unrealized ops under t, t first
+  stack = [(t, True)]
+  while stack:
+    u, root = stack.pop()
+    if u.op is None or id(u) in seen: continue
+    seen.add(id(u))
+    yield u
+    stack.extend((s, False) for s in reversed(_below(u, root)))
 
 def _ops(t): return sum(1 for _ in _lazy(t, set()))  # how many ops a kernel for t would hold, at most
 
@@ -931,13 +931,12 @@ class Recording:
     if self.rt.log is not None: raise RuntimeError("cannot nest recordings on the same runtime")
     self.close()
     self.rt.log, self.rt.recorded, self.rt.recorded_bases = [], self.pins, sorted(self.rt.used)
+    self.made = self.rt.recorded_made = set()  # what the recording allocates: its results and intermediates
     self.active = True
     return self
   def __exit__(self, kind, *_):
-    bases = set(self.rt.recorded_bases)
     self.launches, self.rt.log = self.rt.log, None
-    self.rt.recorded, self.rt.recorded_bases, self.active = None, [], False
-    self.made = self.pins - bases  # what the recording allocated: its results and intermediates
+    self.rt.recorded, self.rt.recorded_bases, self.rt.recorded_made, self.active = None, [], None, False
     if kind is not None: self.close()
   def send(self, binding=None):
     """Queue the recorded launches. binding maps a Bound argument's key to its value for this replay; an argument
@@ -964,19 +963,27 @@ def _bindable(t):  # whether a replay can read t where it is, laid out as a new 
   tr, tc = -(-t.rows // 32), -(-t.cols // 32)
   return t.runs is not None or (t.offset, t.rep, t.stride, t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
 
+def _on_input(t, inputs):  # expose a recorded input view on this call's storage, without leaking its Bound address
+  if not isinstance(t.addr, Bound): return t
+  v = inputs[t.addr.key]._view(t.rows, t.cols, t.batch, t.offset, t.bstride, t.runs)
+  v.addr, v.rep = int(v.addr), t.rep
+  return v
+
 def jit(f):
   """Run f normally on the first call, record the second call's launches, then replay them.
   Later calls send the same launches with the new inputs' addresses and skip f's Python code.
 
   Keep input shapes and dtypes fixed, and a tensor by columns in the same layout. Don't replace tensors captured by
   f or read tensors back to the host inside f. Recorded assign operations can update captured tensors and inputs in
-  place, as a normal call would. An input laid out otherwise than a new tensor, such as a slice or a repeat, is
+  place. Keep written inputs separate from each other and from captured tensors f only reads. An input laid out
+  otherwise than a new tensor, such as a slice or a repeat, is
   copied first, and copied back if f writes it. Results and retained tensors, including .grad, reuse their buffers;
-  the next call overwrites their contents."""
-  signature, runs, wrote, out, rec = None, (), set(), None, None
+  the next call overwrites their contents. Recorded calls set an input's .grad without accumulating across calls.
+  Pass an input that needs a gradient once: a repeated one gets the gradient through its last position only."""
+  signature, runs, wrote, taken, out, rec, grads = None, (), set(), set(), None, None, ()
   @functools.wraps(f)
   def run(*xs):
-    nonlocal signature, runs, wrote, out, rec
+    nonlocal signature, runs, wrote, taken, out, rec, grads
     if not xs or not all(isinstance(x, Tensor) for x in xs): raise ValueError("jit inputs must be tensors, with at least one input")
     rt = xs[0].rt
     if any(x.rt is not rt for x in xs): raise ValueError("jit inputs must use the same runtime")
@@ -998,18 +1005,25 @@ def jit(f):
         with Recording(rt) as recording: result = f(*ins).realize()
       finally: written, rt.written = rt.written, None
       runs, rec, out, wrote = [x.runs for x in xs], recording, result, {i for i, t in enumerate(ins) if t.addr in written}
+      taken = rec.made | {a for a in written if not isinstance(a, Bound)}  # storage the recording makes, and captured storage f writes
       for i in wrote:
         if ins[i].owner is None: xs[i].assign(ins[i])  # a copy that f wrote
-      return out
+      grads = [t.grad for t in ins]  # backward gave the gradients to the stand-ins
+      for x, g in zip(xs, grads):
+        if g is not None: x.grad = _on_input(g, ins)
+      return _on_input(out, ins)
     if any(x.runs != r for x, r in zip(xs, runs)): raise ValueError("a jit input by columns must keep the layout it was recorded with")
-    # Copy an input that the recording's own results overwrite, and one a replay can't read in place
-    bound = [x if _bindable(x) and x.addr not in rec.made else _copy(x) for x in xs]
+    # Copy an input that the recording's own results overwrite, one that f only reads where this replay writes, and one
+    # a replay can't read in place
+    writes = taken | {xs[i].addr for i in wrote}
+    bound = [x if _bindable(x) and x.addr not in rec.made and (i in wrote or x.addr not in writes) else _copy(x) for i, x in enumerate(xs)]
     rec.send({i: t.addr for i, t in enumerate(bound)})
     for i in wrote:
       if bound[i] is not xs[i]: xs[i].assign(bound[i])
-    if isinstance(out.addr, Bound):  # f returned an input, or a view of one: return it on this call's input
-      return bound[out.addr.key]._view(out.rows, out.cols, out.batch, out.offset, out.bstride, out.runs)
-    return out
+    # A result or gradient that is an input, or a view of one, is on this call's input
+    for x, g in zip(xs, grads):
+      if g is not None: x.grad = _on_input(g, bound)
+    return _on_input(out, bound)
   return run
 
 # Compiled kernels by key. Fused entries hold (image, units, name); other entries hold an image.

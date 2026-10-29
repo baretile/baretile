@@ -23,9 +23,12 @@ DRAM banks. A custom command ring must be a power of two from 64 bytes through
 
 Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
 all workers and cancels queued work; call `rt.wait()` first if it must finish.
-Closing first requests cancellation and lets active multicasts finish their
-acknowledgements; the multicast helpers check for cancellation before issuing a
-new transfer. Closing then resets the cores and drains outstanding NoC requests
+Closing first cancels the dispatcher, so no other launch starts, and gives the
+running launch two seconds to finish. A worker stopped inside a Tensix program
+would leave its coprocessor blocked, and the next runtime's kernels would queue
+behind it. Then closing requests cancellation from the workers and lets active
+multicasts finish their acknowledgements; the multicast helpers check for
+cancellation before issuing a new transfer. Closing then resets the cores and drains outstanding NoC requests
 before releasing host DMA and DRAM memory. Closing again is harmless, and process
 exit closes every runtime still running.
 
@@ -38,14 +41,18 @@ dropped runtime is usually in a reference cycle through its cached number
 tensors, so call `close()` to release it promptly. If a multicast never finishes
 or the NoC never drains, closing resets the cores anyway and keeps the runtime's
 host page and DRAM for the rest of the process, so a new runtime can still take
-over a hung rectangle. If resetting the cores fails, the memory stays reserved
+over a hung rectangle. One whose kernel hung inside a Tensix program may need a
+chip reset. If resetting the cores fails, the memory stays reserved
 until a later close or takeover succeeds. Cleanup only stops its own rectangle.
 
 Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
 shutdown cannot establish their destination memory's lifetime. Custom multicast
-code must drain earlier requests, call `mcast_begin()` before issuing any packets,
-and call `mcast_done(expected_acks)` after issuing all packets. Only one core per
+code must drain earlier requests and call `mcast_begin()`. Then it reads
+`acks = NIU(WR_ACKS)` before issuing any packets, and calls `mcast_done(acks + n)`
+after issuing all of them, where `n` counts an acknowledgement for each packet
+and receiving tile. `mcast_done` waits for that counter value. `mcast` in
+`tensix.py` is an example. Only one core per
 tile may issue requests during that region. The dispatcher and generated kernels
 already use these helpers. Raw custom multicasts bypass cancellation tracking and
 can leave cleanup unable to establish completion.
@@ -81,8 +88,9 @@ It stages commands at `0x80040`, with room for 64 KiB.
 
 Kernel images start with four entry offsets. They can run at different L1
 addresses. The runtime loads an image once and reuses it until the kernel area
-fills. It then waits for queued work before evicting the loaded images. The
-worker firmware clears a kernel's `.bss` at launch. Initialized statics must be
+fills. It then waits for queued work before evicting the loaded images.
+`compile_kernel` starts each program with a stub that clears its `.bss` at every
+launch. Initialized statics must be
 const. A static pointer to data or a function still contains an absolute address,
 so the compiler rejects it: use constant integer offsets into an array instead.
 The compiler checks the linked ELF relocations before caching the flat image.
@@ -129,12 +137,14 @@ later calls.
 `tensor.jit(f)` runs the first call normally and records the second. Each input
 is recorded where it is, and its address in the launches is a `runtime.Bound`
 argument. Later calls resend the launches with the new inputs' addresses patched
-in, so a replay copies nothing and reads and writes the inputs as a normal call
-would, including inputs passed twice or written in place with `assign`, `put` or
+in. Inputs may be read more than once or written in place with `assign`, `put` or
 `realize(into=...)`. A replay copies an input first only when it is laid out
-otherwise than a new tensor of its shape, such as a slice or a repeat, or when
-it is storage that the recording's own results overwrite; a written copy goes
-back to the caller's tensor afterwards. A tensor by columns can't be copied, so
+otherwise than a new tensor of its shape, such as a slice or a repeat, when it
+is storage that the recording's own results overwrite, or when f only reads it
+and it shares storage with an input or captured tensor that f writes; a written
+copy goes back to the caller's tensor afterwards. Keep two written inputs in
+distinct storage, and keep written inputs separate from captured tensors f only
+reads. Those aliases are not supported by replay. A tensor by columns can't be copied, so
 it must keep the recorded layout. If kernels have been evicted, the recording
 reloads them and rebuilds its commands.
 
@@ -148,7 +158,9 @@ gives Bound arguments other values for one replay. Recordings on the same
 runtime cannot nest or replay inside another recording. The function must not
 read tensors back to the host or depend on changing Python state. Results reuse
 the same buffers, so a later call overwrites an earlier result. Copy a result if
-you need to keep it.
+you need to keep it. An input's `.grad` holds the latest call's gradient; replay
+does not accumulate it across calls. Pass each input that needs a gradient once,
+since passing it twice retains only the gradient through its last position.
 
 Decode works this way because a token's position is tensor data. Moving to the
 next position doesn't require a new shape or a new compiled program.
@@ -173,7 +185,9 @@ python3 -m baretile.viz models/llama.py /path/to/SmolLM-135M "The meaning of lif
 
 The script runs as it would under `python3`. If it creates a runtime, the wrapper
 writes `viz.html` in the current directory when the script returns or raises an
-exception, including Ctrl-C. The page includes each runtime's completed launches.
+exception, including Ctrl-C. The page includes the completed launches of each
+runtime still open when the script ends. A runtime the script closed, or replaced
+with an overlapping one, has no records left.
 From Python, call `viz.save(path, rt, since=saved)`. Call `rt.wait()` first to
 include all queued work. `save` doesn't wait, so you can also call it after a
 launch times out.

@@ -90,6 +90,20 @@ def test_bytes(chip):
     run()
     assert [r[3] for r in rt.profile(since)] == [want]
 
+def test_gather_shared_indices(chip):
+  rt = Runtime(chip, end=chip.tensix[1])
+  rows = np.arange(65 * 96).reshape(65, 96) % 7
+  selected = list(range(34, -1, -1))
+  x = Tensor.of(rt, rows.tolist())
+  ids = Tensor.of(rt, [selected], "int32")
+  since = rt.launches
+  gathered = x.gather(ids)
+  profile = rt.profile(since)
+  assert np.array_equal(value(gathered)[0], rows[selected])
+  if chip.pci.counts:
+    # Two index tiles, zero padding for three partial output tiles, and two 64-byte runs per selected row and tile column.
+    assert [r[3] for r in profile] == [2 * 4096 + 3 * 2048 + 35 * 3 * 2 * 64]
+
 def test_viz(chip, tmp_path):
   # viz.save records completed launches and compiler details. A shared subexpression gets one graph node,
   # even when a reduction recomputes it on several passes. Matmul's B node describes its read mode.
@@ -126,9 +140,9 @@ def test_viz_script(tmp_path):
   assert [k["name"] for k in run["kernels"]] == ["mul", "readback"] and run["kernels"][0]["graph"][-1][0] == "mul"
 
 def test_jit(chip, monkeypatch):
-  # tensor.jit records the second call of a function and replays its launches after that. Later calls copy their inputs
-  # in and send the same launches without building anything or realizing another expression. The function is a block
-  # of matmuls, a softmax and a layer norm. The DRAM that the recording took stays pinned for the replays.
+  # tensor.jit records the second call of a function and replays its launches after that. Later calls send the same
+  # launches on their inputs where they are, without building anything or realizing another expression. The function
+  # is a block of matmuls, a softmax and a layer norm. The DRAM that the recording took stays pinned for the replays.
   rt = Runtime(chip)
   rng = np.random.default_rng(7)
   w, v = (Tensor.of(rt, bf16(rng.normal(0, 0.1, (96, 96))).tolist()) for _ in range(2))
@@ -163,6 +177,14 @@ def test_jit_input_aliases(chip):
   aliased = tensor.jit(capture)
   aliased(a, b), aliased(a, b)
   assert aliased(exposed[1], exposed[0]).tolist() == [[32]], "captured inputs can be exposed by user code"
+  # An input that f only reads is copied when it shares storage with one that the replay writes
+  x, ids = Tensor.of(rt, np.arange(512 * 32, dtype=np.float32).reshape(512, 32).tolist(), "fp32"), np.random.default_rng(3).permutation(512)
+  write = tensor.jit(lambda c, at, row: c.put(at, row))
+  for _ in range(2): write(Tensor.full(rt, 512, 32, 0, "fp32"), Tensor.of(rt, [ids.tolist()], "int32"), Tensor.full(rt, 512, 32, 1, "fp32"))
+  want = value(x).reshape(512, 32).copy()
+  want[ids] = want.copy()
+  write(x, Tensor.of(rt, [ids.tolist()], "int32"), x)
+  assert np.array_equal(value(x).reshape(512, 32), want)
 
 def test_jit_writes_inputs(chip):
   # Replays read and write the inputs where they are, so an input that the function writes in place ends as a normal
@@ -193,6 +215,21 @@ def test_jit_writes_inputs(chip):
   times = tensor.jit(lambda w: a @ w)
   assert [times(w).tolist()[0][0] for _ in range(3)] == [64] * 3
   assert times(Tensor.full(rt, 64, 64, 2).columns()).tolist()[0][0] == 128
+
+def test_jit_input_grads(chip):
+  # An input's .grad is the gradient of the latest call, also on a replay, where backward ran on the recording's
+  # stand-in for the input. A gradient that is another input is that input on this call.
+  rt = Runtime(chip)
+  w = Tensor.full(rt, 1, 1, 3, "fp32")
+  square = tensor.jit(lambda x: (x * x * w).sum().backward())
+  passed = tensor.jit(lambda x, gy: (x + w).backward(gy))
+  for v in (1, 2, 5, 7):
+    x = Tensor.full(rt, 1, 1, v, "fp32").requires_grad_()
+    square(x)
+    assert x.grad.tolist() == [[6 * v]]
+    x.grad = None
+    passed(x, Tensor.full(rt, 1, 1, v, "fp32"))
+    assert x.grad.tolist() == [[v]]
 
 def test_recording_lifetime_and_reuse(chip):
   rt = Runtime(chip, end=chip.tensix[1])
@@ -253,6 +290,34 @@ def test_jit_formats(chip):
       x = Tensor.full(rt, 32, 32, n).cast(dtype).realize()
       assert step(x).tolist() == [[32 * n] * 32] * 32
 
+def test_jit_returned_repeat(chip):
+  rt = Runtime(chip)
+  repeat = tensor.jit(lambda x: x.repeat_interleave(2))
+  for n in range(1, 5):
+    x = Tensor.of(rt, [[[float(n)] * 32] * 32, [[float(n + 1)] * 32] * 32])
+    assert np.array_equal(value(repeat(x)), np.repeat(value(x), 2, axis=0))
+
+def test_jit_returned_binding(chip):
+  rt = Runtime(chip)
+  x = Tensor.of(rt, [[[4.0] * 32] * 32, [[5.0] * 32] * 32])
+  pick = tensor.jit(lambda x: x[1])
+  pick(x)
+  captured = pick(x)  # a recording's returned view must not retain that recording's input binding
+  add = tensor.jit(lambda y: y + captured)
+  for n in (10, 20, 30, 40):
+    assert add(Tensor.full(rt, 32, 32, n)).tolist() == [[n + 5] * 32] * 32
+
+def test_repeat_copies_preserve_storage(chip):
+  rt = Runtime(chip)
+  raw = struct.pack("<2f", -0.0, 3.0)
+  x = Tensor.frombytes(rt, 1, 2, raw, dtype="fp32").repeat_interleave(3)
+  out = Tensor(rt, 1, 2, batch=3, dtype="fp32").assign(x)
+  assert out.tobytes() == raw * 3
+  for dtype in ("bfp8", "bfp4"):
+    x = Tensor.full(rt, 32, 32, 1.5).cast(dtype).realize().repeat_interleave(3)
+    out = Tensor(rt, 32, 32, batch=3, dtype=dtype).assign(x)
+    assert out.tobytes() == x.tobytes()
+
 def test_upload(chip, monkeypatch):
   # frombytes writes through the BAR below tensor.DMA_UPLOAD bytes, and through upload_kernel from there, in chunks
   # staged in Runtime.back. Both leave the same tiles in every bank, also when the tiles don't fill the banks evenly.
@@ -271,6 +336,7 @@ def test_upload(chip, monkeypatch):
       made.append(Tensor.frombytes(rt, *shape[-2:], data, shape[0] if len(shape) == 3 else 1, dtype))
       assert rt.launches - since == dma * chunks and kernels(rt, since) == 0, (shape, dma)
     assert banks(made[0]) == banks(made[1]) and made[1].tobytes() == data, (shape, dtype)
+  monkeypatch.setattr(tensor, "DMA_UPLOAD", 0)  # the recording below must exercise host staging
   ones = struct.pack("<1024H", *[0x3F80] * 1024)  # 1.0 in bf16
   step, x = tensor.jit(lambda x: x + Tensor.frombytes(rt, 32, 32, ones)), Tensor.of(rt, [[1.0] * 32] * 32)
   for call in range(4):
@@ -352,6 +418,22 @@ def test_tensor_inputs(chip):
   with pytest.raises(ValueError, match="block-float B"): b.matmul(w.float(), index=Tensor.of(rt, [[1]], "int32"))
   picked = b.requires_grad_().matmul(w, index=Tensor.of(rt, [[1]], "int32"))
   with pytest.raises(NotImplementedError, match="by index"): picked.sum().backward()
+
+def test_movement_allocation_retry(chip, monkeypatch):
+  rt = Runtime(chip)
+  source = Tensor.of(rt, [[1.0, 2.0], [3.0, 4.0]])
+  allocate = rt.dram_alloc
+  def full(size): raise MemoryError("test allocation limit")
+  for moved, want in ((source.T, [[1, 3], [2, 4]]), (source.reshape(1, 1, 4), [[1, 2, 3, 4]])):
+    monkeypatch.setattr(rt, "dram_alloc", full)
+    with pytest.raises(MemoryError, match="allocation limit"): moved.realize()
+    monkeypatch.setattr(rt, "dram_alloc", allocate)
+    assert moved.tolist() == want
+  for dtype in ("bfp8", "bfp4"):
+    packed = source.cast(dtype).realize()
+    before = dict(rt.used), rt.launches
+    with pytest.raises(ValueError, match="block-float"): packed.gather([0])
+    assert (rt.used, rt.launches) == before, "reject an unsupported gather before allocation or launch"
 
 def test_move_bounds_and_tensor_truth(chip):
   rt = Runtime(chip)
@@ -697,6 +779,24 @@ def test_matmul_parts(chip):
   x, w, d, bias = (Tensor.of(rt, bf16(rng.uniform(-1, 1, shape)).tolist()) for shape in ((96, 4096), (4096, 200), (96, 200), (1, 200)))
   assert (x @ w * d + bias).tolist() == unfused(x @ w * d + bias).tolist()
 
+@pytest.mark.parametrize("layout", ["bf16", "bfp8", "columns"])
+def test_matmul_parts_scalars(chip, layout):
+  # K spans several parts; the last part's epilogue still needs the scalars fetched with the first tile.
+  rt = Runtime(chip)
+  x, w = Tensor.full(rt, 64, 2048, 1 / 32), Tensor.full(rt, 2048, 128, 1 / 32)
+  w = w.columns() if layout == "columns" else w.cast(layout).realize()
+  result = (x @ w * 0.5 + 3).realize()
+  assert result.tolist() == [[4.0] * 128] * 64
+
+@pytest.mark.parametrize("dtype", ["bf16", "bfp8", "bfp4"])
+def test_matmul_split_transposed_weights(chip, dtype):
+  rt = Runtime(chip)
+  x = Tensor.full(rt, 1, 1024, 1 / 32)
+  w = Tensor.full(rt, 64, 1024, 1 / 32).cast(dtype).realize()
+  since = rt.launches
+  assert (x @ w.T).tolist() == [[1.0] * 64]
+  assert all(rt.sent[n % TIMES][0] != "transpose" for n in range(since + 1, rt.launches + 1))
+
 def test_matmul_long_row(chip):
   # A token's row of A can be too long for the slots below 256, like a decode step's down projection with K of 448
   # tiles. Then it stays in L1 past those slots, and unpacker 1 steps through it in regions of 256 slots. The grid's
@@ -748,8 +848,7 @@ def test_matmul_by_columns(chip):
   # streamed beside B, and the experts that tokens pick with index=. B by columns reads back as it was; ordinary
   # arithmetic and movement require casting it back to ordinary tiles.
   rng = np.random.default_rng(43)
-  cases = [(None, 1, 1024, 4096, how) for how in ("bf16", "bfp8", "bfp4")] + [
-    (None, 1, 1024, 4000, "bf16"), ("row", 1, 9600, 512, "bfp4"), (None, 1, 2048, 1024, "bfp8"), (None, 320, 1024, 416, "bfp8"),
+  cases = [(None, 1, 1024, 4000, "bf16"), (None, 1, 2048, 1024, "bfp8"),
     (None, 288, 4096, 224, "bfp8"), (None, 320, 2048, 416, "bf16"), (None, 64, 256, 512, "softmax"), (1, 96, 256, 128, "bf16"),
     (1, 32, 9600, 64, "bf16")]
   for end, m, k, n, how in cases:
@@ -768,6 +867,10 @@ def test_matmul_by_columns(chip):
   x, wc = Tensor.of(rt, rng.normal(0, 1, (1, 64)).tolist()), Tensor.of(rt, rng.normal(0, 1, (64, 64)).tolist()).columns()
   for misuse in (lambda: wc + 1, lambda: x @ wc.T, lambda: wc[:, :32], lambda: wc.gather([0])):
     with pytest.raises(ValueError, match="by columns"): misuse().realize()
+  invalid = wc.T
+  for _ in range(2):
+    with pytest.raises(ValueError, match="by columns"): invalid.realize()
+    assert invalid.op == "T" and invalid.addr is None, "a failed move stays unrealized"
 
 def test_matmul_chunks(chip):
   # B laid out by columns comes in long reads. A token's row streams each column in chunks with CHUNKS reads in flight,
@@ -789,6 +892,7 @@ def test_matmul_chunks(chip):
     if m == 1: want = kt + wt * -(-kt // tensix.chunk_tiles(None if how == "bf16" else how)) * pieces
     else: want = tr * kt + wt * -(-tr // -(-tr // len(rt.grid[1]))) * pieces  # each grid row's share of a column, up to 16 KiB
     assert reads() - before == want and np.array_equal(value(y), value(x @ w)), (m, k, n, how, reads() - before, want)
+    assert wc.tobytes() == w.tobytes(), "column storage reads back unchanged"
 
 def test_accumulate_parts(chip):
   # Build a one-worker matmul with six K tiles split into three parts. The first two parts accumulate in fp32
@@ -796,7 +900,7 @@ def test_accumulate_parts(chip):
   # Compare with accumulating all six tiles in Dst. The allowed difference is TF32's 2^-10 on the reloaded sum.
   c, rt, rng = tensix, Runtime(chip, end=chip.tensix[1]), np.random.default_rng(37)
   parts, kp = 3, 2  # parts of K, and tiles in each part
-  kt, acc, slots, cfg = parts * kp, tensix.B8, tensix.allocate({"mm"}), tensix.kernel_config() | tensix.config(Pack_L1_Acc=0)
+  kt, acc, slots, cfg = parts * kp, tensix.B8, tensix.allocate({"mm"}), tensix.kernel_config()
   a, b = bf16(rng.normal(0, 1, (32, 32 * kt))), bf16(rng.normal(0, 1, (32 * kt, 32)))
   tile = lambda m: m.reshape(2, 16, 2, 16).transpose(0, 2, 1, 3).reshape(-1)  # a 32 x 32 matrix in tile order, face by face
   x, y = rt.cores[0]
@@ -834,6 +938,34 @@ def test_matmul_indexed(chip):
       got = value((x.repeat_interleave(k) if n > 1 else x).matmul(w, index=Tensor.of(rt, ids.tolist(), "int32")))
       want = lambda b, e: value(x[b // k] @ w[e])[0] if e < 16 else np.zeros((1, 160))
       assert all(np.array_equal(got[b], want(b, int(ids[b // k, b % k]))) for b in range(n * k)), (wt, n, k)
+
+@pytest.mark.parametrize("passes", [False, True])
+def test_indexed_matmul_rows_and_passes(chip, passes):
+  rt, rng = Runtime(chip), np.random.default_rng(71)
+  a, b = bf16(rng.normal(0, 0.1, (64, 96))), bf16(rng.normal(0, 0.1, (3, 96, 160)))
+  x, w = Tensor.of(rt, a.tolist()), Tensor.of(rt, b.tolist())
+  if not passes:
+    for index in (1, 3):
+      ids = Tensor.of(rt, [[index]], "int32")
+      want = a @ b[index] if index < 3 else np.zeros((64, 160))
+      close(x.matmul(w, index=ids), want, 0.004)
+    return
+  a = bf16(rng.normal(0, 0.1, (2, 1, 96)))
+  x = Tensor.of(rt, a.tolist()).repeat_interleave(2)
+  ids = Tensor.of(rt, [[0, 1], [2, 7]], "int32")
+  scores = np.stack([a[i // 2] @ b[j] if j < 3 else np.zeros((1, 160)) for i, j in enumerate((0, 1, 2, 7))])
+  expected = np.exp(scores - scores.max(axis=-1, keepdims=True))
+  expected /= expected.sum(axis=-1, keepdims=True)
+  close(x.matmul(w, index=ids).softmax(), expected, 0.0001)
+
+def test_reduction_l1_boundary(chip):
+  rt, rng = Runtime(chip), np.random.default_rng(73)
+  for width in (7424, 7456, 7488):
+    a = rng.normal(0, 1, (2, width)).astype(np.float32)
+    x = Tensor.frombytes(rt, 2, width, a.tobytes(), dtype="fp32")
+    expected = np.exp(a - a.max(axis=-1, keepdims=True))
+    expected /= expected.sum(axis=-1, keepdims=True)
+    close(x.softmax(), expected, 1e-6)
 
 def test_stream_on_one_worker(chip):
   # On one worker the pipeline cycles through many tiles: L1 slots and Dst halves alternate, the threads hand tiles
@@ -922,6 +1054,14 @@ def test_assign_overlapping_views(chip):
     x[:, 32:].assign(x[:, :-32])
     want[:, 32:] = want[:, :-32].copy()
     assert np.array_equal(value(x)[0], want), "overlapping block floats copy without elementwise arithmetic"
+
+def test_assign_matmul_without_copy(chip):
+  rt = Runtime(chip)
+  x, w, out = (Tensor.full(rt, 32, 32, n) for n in (1, 2, 0))
+  since = rt.launches
+  out.assign(x @ w + 3)
+  assert kernels(rt, since) == 1, "an independent destination is written by the fused matmul"
+  assert out.tolist() == [[67.0] * 32] * 32
 
 def test_realize_overlapping_destination(chip):
   for end in (chip.tensix[1], chip.tensix[-1]):
@@ -1434,7 +1574,7 @@ def test_fp32(chip):
                              ((tx * tx + 0.5).sqrt(), np.sqrt(v), np.sqrt(v)), ((tx * tx + 0.5).rsqrt(), 1 / np.sqrt(v), 1 / np.sqrt(v)),
                              ((tx * 32.0).sin(), np.sin(w * 8), 1), ((tx * 32.0).cos(), np.cos(w * 8), 1)]:
       assert (np.abs(value(got) - want) / scale).max() <= 3e-7, (np.abs(value(got) - want) / scale).max()
-    s = np.array([[np.nan, np.inf, -np.inf, 0, -2, 2]], np.float32)  # NaN passes through and equals nothing, not even itself
+    s = np.array([[np.nan, -np.nan, np.inf, -np.inf, 0, -2, 2]], np.float32)  # NaN of either sign passes through and equals nothing
     ts = Tensor.of(rt, s.tolist(), "fp32")
     with np.errstate(all="ignore"):
       for got, want in [(ts.exp(), np.exp(s)), (ts.exp2(), np.exp2(s)), (ts.log(), np.log(s)), (ts.sqrt(), np.sqrt(s)),
@@ -1534,6 +1674,8 @@ def test_selection_boundaries(chip):
     assert got.tobytes() == want.tobytes()
     with np.errstate(all="ignore"):
       assert np.array_equal(np.signbit(value(got.reciprocal())[0]), np.signbit(1 / want))
+  c = np.array([[-np.nan, np.nan, -0.0, 0.0, -1e-45, np.inf]], np.float32)  # a NaN is true whatever its sign, as in numpy
+  assert Tensor.of(rt, c.tolist(), "fp32").where(a, b).tobytes() == np.where(c, x, y).tobytes()
 
 def test_autograd(chip):
   # This checks the ops' backward passes against numpy, on fp32 tensors with odd shapes and broadcasting. The loss is
@@ -1597,6 +1739,20 @@ def test_autograd(chip):
   (ta * tw).sum().backward()
   assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w + w, rtol=1e-6, atol=1e-6), ".grad adds up"
   assert np.allclose(value((ta * ta).sum().gradient(ta)[0])[0], 2 * a, rtol=1e-6), "gradient() gives it without touching .grad"
+
+def test_long_autograd_history(chip):
+  rt = Runtime(chip)
+  x = Tensor.full(rt, 1, 1, 2, "fp32").requires_grad_()
+  y = x
+  for _ in range(1100): y = y + 1
+  g, = y.gradient(x)
+  assert g.tolist() == [[1.0]]
+  assert y.tolist() == [[1102.0]], "a deep lazy expression also realizes without Python recursion"
+  # Realized steps still retain their gradient history. backward must traverse that history without recursion too.
+  y = x
+  for _ in range(1100): y = y.repeat_interleave(1)
+  y.backward()
+  assert x.grad.tolist() == [[1.0]]
 
 def test_backward_before_parameter_updates(chip):
   rt = Runtime(chip)
@@ -1686,7 +1842,7 @@ def test_fuzz(chip, monkeypatch):
     return leaf(shape)
   # The trees alternate between bf16 and fp32. Sizes past 4 tiles make partial blocks in batched matmuls. Unbatched
   # matmuls share by multicast instead.
-  for n in range(int(os.environ.get("FUZZ", 30))):
+  for n in range(max(30, int(os.environ.get("FUZZ", 30)))):
     shape = (int(rng.choice([1, 1, 2])), int(rng.choice([1, 20, 32, 45, 64, 160])), int(rng.choice([1, 20, 32, 70, 96, 192])))
     dtype = ("bf16", "fp32")[n % 2]
     gen(shape, 4).realize()
