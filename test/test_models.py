@@ -554,7 +554,8 @@ def safetensors(path, tensors):  # writes {name: (dtype "BF16" or "F32", array o
 
 def test_llama_load(tmp_path):
   # A checkpoint split like Llama-3.1-8B's, in two files and an index, with its own lm_head and a float32 norm. The
-  # RoPE tables cover the 64 positions asked for, not the model's 131072.
+  # RoPE tables cover the 64 positions asked for, not the model's 131072. A family baretile doesn't run is refused by
+  # name, though its weights have the same names.
   rng, dim, ffn, vocab = np.random.default_rng(31), 64, 96, 40
   w = lambda r, c: (rng.standard_normal((r, c)).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
   parts = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(1, dim)[0],
@@ -567,9 +568,10 @@ def test_llama_load(tmp_path):
   weight_map = {k: f"model-0000{i + 1}-of-00002.safetensors" for i, file in enumerate(files) for k in file}
   (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
-  (tmp_path / "config.json").write_text(json.dumps({"hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1, "num_hidden_layers": 1,
-                                                    "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "max_position_embeddings": 131072,
-                                                    "rope_scaling": rope, "vocab_size": vocab, "intermediate_size": ffn}))
+  (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1,
+                                                    "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
+                                                    "max_position_embeddings": 131072, "rope_scaling": rope, "vocab_size": vocab,
+                                                    "intermediate_size": ffn}))
   c, weights = llama.load(str(tmp_path), 64)
   assert all(isinstance(x, llama.Weight) for x in weights.values())
   assert c.places == 64 and c.rope == rope and c.ffn == ffn and weights["cos"].bits().shape == (64, 4 * 32)
@@ -580,6 +582,8 @@ def test_llama_load(tmp_path):
   assert np.array_equal(weights["layers.0.input_layernorm"].bits()[0], gpt2.bf16_bits(norms["model.layers.0.input_layernorm.weight"]))
   out = llama.forward([3, 7], [0, 1], llama.arrays(weights), c, llama.kv_cache(c, 32, np.zeros))
   assert out.shape == (1, vocab) and np.isfinite(out).all()
+  (tmp_path / "config.json").write_text(json.dumps(json.loads((tmp_path / "config.json").read_text()) | {"model_type": "gemma2"}))
+  with pytest.raises(ValueError, match="'gemma2' isn't supported"): llama.load(str(tmp_path))
 
 def test_bpe_merge_order(tmp_path):
   # Vocabulary IDs need not order BPE merges. The whole piece only bypasses merges with ignore_merges; an explicit
@@ -785,7 +789,7 @@ def test_qwen3_moe(chip, tmp_path):
   want = llama.forward(ids, list(range(8)), llama.arrays(weights, c.precision), c, llama.kv_cache(c, 32, np.zeros), every=True)
   assert np.array_equal(got.argmax(-1), want.argmax(-1)) and np.abs(got - want).max() < 0.01 * np.ptp(want), np.abs(got - want).max() / np.ptp(want)
 
-FAMILIES = {"qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
+FAMILIES = {"llama": ("Llama", {}), "qwen3": ("Qwen3", dict(head_dim=64)), "qwen2": ("Qwen2", {}), "mistral": ("Mistral", dict(sliding_window=None)),
             "qwen2_moe": ("Qwen2Moe", dict(moe_intermediate_size=64, shared_expert_intermediate_size=96, num_experts=8, num_experts_per_tok=2)),
             "mixtral": ("Mixtral", dict(num_local_experts=8, num_experts_per_tok=2)),
             "gpt_oss": ("GptOss", dict(head_dim=32, num_local_experts=8, num_experts_per_tok=2, sliding_window=4,
@@ -1426,6 +1430,39 @@ def test_batched_decode(chip):
       want = llama.forward(s[-1:], [places[u]], w, c, np_kv[u])[0]
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
       s.append(int(want.argmax()))
+
+@pytest.mark.skipif("TTSIM" not in os.environ, reason="the server opens the device itself, and a card can't be open in two processes")
+def test_serve_command(tmp_path):
+  # python3 -m baretile.models.serve serves a model folder, which is what fetch makes of a Hugging Face ID, as in the
+  # README. A small random Llama answers a completion over HTTP.
+  import socket, subprocess, urllib.request
+  rng, dim, ffn, vocab = np.random.default_rng(5), 64, 128, 256
+  w = lambda *shape: (rng.normal(0, 0.1, shape).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+  weights = {"model.embed_tokens.weight": w(vocab, dim), "lm_head.weight": w(vocab, dim), "model.norm.weight": w(dim),
+             **{f"model.layers.0.{n}.weight": w(dim) for n in ("input_layernorm", "post_attention_layernorm")},
+             **{f"model.layers.0.self_attn.{n}_proj.weight": w(r, dim) for n, r in (("q", dim), ("k", 32), ("v", 32), ("o", dim))},
+             **{f"model.layers.0.mlp.{n}_proj.weight": w(*rc) for n, rc in (("gate", (ffn, dim)), ("up", (ffn, dim)), ("down", (dim, ffn)))}}
+  safetensors(tmp_path / "model.safetensors", {k: ("BF16", v) for k, v in weights.items()})
+  (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "hidden_size": dim, "num_attention_heads": 2, "num_key_value_heads": 1,
+                                                    "num_hidden_layers": 1, "rms_norm_eps": 1e-5, "rope_theta": 1e4, "max_position_embeddings": 64,
+                                                    "vocab_size": vocab, "intermediate_size": ffn}))
+  bytes_tokenizer(tmp_path)
+  with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+  root = pathlib.Path(__file__).parent.parent
+  server = subprocess.Popen([sys.executable, "-m", "baretile.models.serve", str(tmp_path), str(port), "1", "64"], cwd=root, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ | {"PYTHONPATH": str(root)})
+  try:
+    for line in server.stdout:  # it says when it's ready
+      if f"on port {port}" in line: break
+    else: pytest.fail("the server stopped before it was ready")
+    ask = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", json.dumps({"prompt": "Hi", "max_tokens": 3, "temperature": 0}).encode())
+    reply = json.load(urllib.request.urlopen(ask, timeout=600))
+    assert reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 3, reply
+  finally:
+    server.kill()
+    server.wait()
 
 def test_serve_timeout(tmp_path):
   # A non-streaming request that receives no text within wait seconds must get HTTP 504 and release its slot.
@@ -2395,8 +2432,8 @@ def test_cost(tmp_path):
           "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "mtp_num_hidden_layers": 1,
           "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10, "model_type": "qwen3_5_moe_text",
           "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "rope_type": "default"}}}
-  llama8b = {"hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "num_hidden_layers": 32, "rms_norm_eps": 1e-5,
-             "max_position_embeddings": 131072, "vocab_size": 128256, "intermediate_size": 14336, "rope_theta": 5e5}
+  llama8b = {"model_type": "llama", "hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "num_hidden_layers": 32,
+             "rms_norm_eps": 1e-5, "max_position_embeddings": 131072, "vocab_size": 128256, "intermediate_size": 14336, "rope_theta": 5e5}
   for name, j in (("qwen", qwen), ("llama", llama8b)): (tmp_path / name).mkdir(); (tmp_path / name / "config.json").write_text(json.dumps(j))
   c = llama.config(str(tmp_path / "qwen"))
   s, use = cost.shape(c, "experts"), dict(cost.USE)
