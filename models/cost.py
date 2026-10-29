@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh
-from baretile.kernels import attention_l1, attention_parts, attention_store, grid_parts
+from baretile.kernels import attention_plan, grid_parts
 from baretile.tensix import CHUNKS, tile_bytes
 from models import llama
 
@@ -132,14 +132,12 @@ def regroups(c, m):
   return sum(again(k, n) for l in range(c.layers) for k, n in matrices(l))
 
 def attention(c, entries, queries, rows, kv):
-  """Count bytes read by Tensor.attend for entries heads over rows keys. A unit handles up to two tile rows
-  of queries. Read values once and keys once if they fit in L1 between sweeps; reread keys beyond
-  attention_store's capacity. Account for the same splitting and grouped query heads as Tensor.attend."""
+  """Count bytes read by Tensor.attend for entries heads over rows keys, in the units and parts that
+  kernels.attention_plan gives it. Read values once and keys once if they fit in L1 between sweeps; reread keys
+  beyond what a part keeps."""
   ht, kt, wt = llama.head(c) // 32, -(-rows // 32), kv if kv in ("bfp8", "bfp4") else None
-  unit_rows = attention_l1(ht, queries, wt, 1)[0]
-  units = entries * -(-queries // (32 * unit_rows))
-  parts = attention_parts(ht, queries, wt, kt, units, WORKERS)
-  return units * (2 * kt + max(0, kt - parts * attention_store(ht, queries, wt, parts)[1])) * 32 * llama.head(c) * BYTES[kv]
+  _, units, parts, kept = attention_plan(ht, -(-queries // 32), entries, wt, kt, WORKERS)
+  return units * (2 * kt + max(0, kt - parts * kept)) * 32 * llama.head(c) * BYTES[kv]
 
 def past(kind, n): return float(np.interp(n, *zip(*CONTROL[kind])))  # CONTROL's cycles for kind at n tokens, flat past its counts
 

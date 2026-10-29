@@ -3,7 +3,7 @@
 import array, collections, functools, math, operator
 from baretile import bh
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
-from baretile.kernels import attention_l1, attention_parts, attention_store, link_flags
+from baretile.kernels import attention_plan, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
                              put_kernel, readback_kernel, storage_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
 
@@ -631,14 +631,12 @@ class Tensor:
     if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32"):
       raise ValueError(f"attend needs places as an int32 column with a row for each query: {places.shape} {places.dtype} for {self.shape}")
     wt = k.dtype if k.dtype in BFP else None
-    unit_rows = attention_l1(ht, self.rows, wt, parts or 1)[0]
-    units = self.batch * -(-ra // unit_rows)
-    P = parts or attention_parts(ht, self.rows, wt, kt, units, len(self.rt.cores))
+    R, units, P, kept = attention_plan(ht, ra, self.batch, wt, kt, len(self.rt.cores), parts)
     q, places = (_plain(t.realize()) for t in (self, places))
     k, v = k.realize(), v.realize()
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
     # the exact row count is an argument, so the key rounds it up to tiles
-    key = ("attend", ht, 32 * ra, rep, wt, fidelity, window, P, attention_store(ht, self.rows, wt, P)[1] > 0)
+    key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0)
     out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(), *places._where(), kt,
             self.rows, units=units * P, name="attention")
     part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)  # cols of part p, from tile at

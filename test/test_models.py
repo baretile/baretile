@@ -2149,9 +2149,13 @@ def test_chat_tools(tmp_path):
   http.shutdown()
 
 def test_attention_cost_units():
-  c = llama.model(dim=64, heads=1, kv=1, layers=1)
-  one = 2 * 32 * 64 * 2  # each unit reads one 32-row key tile and value tile for its head
-  assert [cost.attention(c, 1, queries, 32, "bf16") for queries in (1, 64, 65, 256)] == [one, one, 2 * one, 4 * one]
+  # cost.attention counts reads in kernels.attention_plan's units. A unit reads each key and value tile once for all its
+  # tile rows of queries. While there are fewer units than workers, a unit takes one tile row, so more workers share the
+  # work. With a unit for every worker, a unit takes up to 8 tile rows, and they share its reads.
+  c, n = llama.model(dim=64, heads=1, kv=1, layers=1), cost.WORKERS
+  units = lambda entries, queries: cost.attention(c, entries, queries, 32, "bf16") / (2 * 32 * 64 * 2)  # a unit reads a key and a value tile
+  assert [units(1, queries) for queries in (1, 64, 65, 256)] == [1, 2, 3, 8], "one tile row a unit"
+  assert [units(n, queries) for queries in (32, 256, 257, 1024)] == [n, n, 2 * n, 4 * n], "up to 8 tile rows a unit"
 
 def test_cost_fidelity():
   # Make DRAM negligible so the estimate exposes the phase cost, including TT's mixed MLP and attention phases.
@@ -2208,8 +2212,8 @@ def test_cost(tmp_path):
   # layer) and reads 2.95B a token, about 21.9 GB in the one-card formats. Its KV cache is 20 KB a token (10 attention
   # blocks with 2 KV heads of 256), and its Gated DeltaNet states are 66 MB a session (30 blocks of 32 heads of 128 x
   # 128 in fp32, plus the last 3 conv inputs). Llama-3.1-8B reads benchmark.py's 6.20 GB a token, within 2%. At 256
-  # tokens, a prompt chunk reads almost all the experts of each block, so larger chunks amortize those reads.
-  # At 32K tokens, attention's reads slow it down again.
+  # tokens, a prompt chunk reads almost all the experts of each block, so Qwen3.6's 4K-token prompt is over 6 times
+  # slower in chunks of 256 than of 2,048. At 32K tokens, attention's reads slow it down again.
   qwen = {"text_config": {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256, "num_hidden_layers": 40,
           "rms_norm_eps": 1e-6, "max_position_embeddings": 262144, "vocab_size": 248320, "num_experts": 256, "num_experts_per_tok": 8,
           "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512, "linear_num_key_heads": 16, "linear_num_value_heads": 32,
@@ -2237,7 +2241,7 @@ def test_cost(tmp_path):
   measured = cost.probed(card, str(tmp_path / "probe.json"))
   assert measured["bandwidth"] == 300e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
   slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
-  assert slow.rate < fast.rate and long.rate < fast.rate, (slow.rate, fast.rate, long.rate)
+  assert slow.rate * 6 < fast.rate and long.rate * 1.5 < fast.rate, (slow.rate, fast.rate, long.rate)
   # a chunk of 2,048 reads its activations again for each group of columns. 256 doesn't, since the accumulators fit
   assert cost.regroups(c, 256) == 0 < cost.regroups(c, 2048), cost.regroups(c, 2048)
   assert "a prompt of 8192 tokens" in cost.report(str(tmp_path / "qwen"), "experts", context="8192", kv="bfp8")

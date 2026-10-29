@@ -194,14 +194,17 @@ exponentials and weighted values. Values are read on the second sweep. Keys
 stay in L1 between sweeps when they fit. Scores stay local instead of being
 written as a full attention matrix in DRAM.
 
-Each unit handles at most 64 query rows, keeping their maxima in fp32 Dst.
-The SFPU subtracts those maxima after the full scores have accumulated. This
-avoids overflow from rounding a large maximum or subtracting it too early.
-Longer prompts use more units and reread K/V for each group of 64 query rows;
-the cost estimator counts those reads. This trades more prefill traffic for
-stable scores. Heads whose frames do not fit in L1 raise `ValueError` before
-allocation or launch. A supported frame with no space to retain keys streams
-them again for the second sweep.
+A unit handles up to 8 tile rows of one head's queries, and they share each
+key and value tile it reads, so larger units read K/V fewer times. Each row's
+maxima stay in fp32 in a quarter of a Dst accumulator tile, so Dst's two
+accumulators hold 8 rows. The SFPU spreads a row's maxima over a tile and
+subtracts them after the full scores have accumulated, which avoids overflow
+from rounding a large maximum or subtracting it too early. `attention_plan`
+gives units as many rows as still leave a unit for every worker, so a long
+prefill reads K/V once per 256 query rows and a short prompt still occupies the
+chip; `models/cost.py` uses the same plan. Heads whose frames do not fit in L1
+raise `ValueError` before allocation or launch. A supported frame with no space
+to retain keys streams them again for the second sweep.
 
 Decoding often has too few heads to occupy the workers. The implementation
 splits the keys into up to eight parts and combines their maxima, sums and
