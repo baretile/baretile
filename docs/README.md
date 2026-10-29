@@ -15,6 +15,7 @@ from the checkout with `TTSIM` set:
 python3 ramps/1_tensors.py
 python3 ramps/2_runtime.py
 python3 ramps/3_tensix.py
+python3 ramps/4_kernel.py
 ```
 
 1. [Tensors](../ramps/1_tensors.py): operations, fusion, shapes, formats, views,
@@ -23,6 +24,9 @@ python3 ramps/3_tensix.py
    DRAM and the NoC, the command queue, a tensor's tiles, and timeouts.
 3. [Tensix](../ramps/3_tensix.py): unpack, math and pack programs written by
    hand, including a matmul and the SFPU, compared with what `Tensor` compiles.
+4. [A kernel](../ramps/4_kernel.py): a tensor operation of your own, from its
+   BRISC and Tensix programs to a function tested against NumPy.
+   [Writing a kernel](kernels.md) walks through it.
 
 After the ramps, [baretile/models/gpt2.py](../baretile/models/gpt2.py) is a whole
 model in under 200 lines. It runs the same code on baretile tensors and NumPy arrays.
@@ -31,6 +35,7 @@ model in under 200 lines. It runs the same code on baretile tensors and NumPy ar
 
 | Page | What it covers |
 | --- | --- |
+| [Writing a kernel](kernels.md) | A tensor operation of your own, from its four programs to a tested function |
 | [Runtime](runtime.md) | Workers and the dispatcher, L1 layout, the command ring, DRAM allocation, `jit` and profiling |
 | [Compiler](compiler.md) | Tile layout and storage formats, fusion and reductions, unpack, math and pack, matmul and attention |
 | [Models, serving and adapters](models.md) | The model loaders, precision modes, the OpenAI-compatible server, tinygrad and PyTorch, training, and cost estimates |

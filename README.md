@@ -138,11 +138,13 @@ cd baretile
 python3 ramps/1_tensors.py
 python3 ramps/2_runtime.py
 python3 ramps/3_tensix.py
+python3 ramps/4_kernel.py
 ```
 
 The first covers tensor operations, fusion, formats, gradients and `jit`. The
 second runs C kernels on the workers and moves data over the NoC. The third
-programs the unpack, math and pack threads of a Tensix tile by hand.
+programs the unpack, math and pack threads of a Tensix tile by hand, and the
+fourth puts all four programs together into a tensor operation of your own.
 
 The [documentation](https://github.com/baretile/baretile/blob/main/docs/README.md)
 explains the runtime, the compiler, the models and the hardware, and includes a
