@@ -28,9 +28,11 @@ hangs.
   which adds the NoC latency, FPU and SFPU latency, and core jitter that ttsim leaves out.
   CI runs the kernel tests under it with a new seed each time, and the whole suite on all 140 Tensix tiles.
 - For a refactor of a kernel, the same compiled bytes. Run the suite once before
-  and once after with an empty cache (for example `XDG_CACHE_HOME=$(mktemp -d)`)
-  and compare the images it leaves in `baretile/` under that cache. Images are
-  named by the hash of their source.
+  and once after, each time with an empty cache (for example
+  `XDG_CACHE_HOME=$(mktemp -d)`), and compare the contents of the images it leaves
+  in `$XDG_CACHE_HOME/baretile`, for example with
+  `sha256sum $XDG_CACHE_HOME/baretile/* | cut -d' ' -f1 | sort`. Their names hash
+  the source, so they change with any edit to the C text.
 - Docs that stay true. If your change alters how something works, update the page
   in [docs/](docs) that describes it.
 
@@ -76,9 +78,9 @@ We use the same terms everywhere. A worker is a Tensix tile running a kernel, an
 BRISC and the TRISCs are its RISC-V cores. A tensor tile holds 32 by 32 values.
 "Tile column" refers to `Tensor.columns`.
 
-Keep commit subjects under 70 characters, for example "matmul: read B by
-columns" or "fix hang when the ring wraps". Add a short body when the reason
-needs explaining.
+Use one short commit subject under 70 characters and no body, for example
+"matmul: read B by columns" or "adapter: fix JIT input ownership". Put any
+longer explanation in the pull request.
 
 ## Reporting a bug
 
