@@ -493,6 +493,7 @@ class Runtime:
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
     self.log, self.pinned, self.pinned_freed = None, collections.Counter(), set()
     self.recorded, self.recorded_bases = None, []  # active recording pins and existing allocation bases
+    self.written = None  # while tensor.jit records a call: the allocations it writes in place
     try:
       (dx, dy), n = self.dispatcher, len(self.cores)
       chip.write(*end, 0, worker, start)
