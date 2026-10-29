@@ -73,7 +73,8 @@ L1. Reduce the prefill chunk size for these layouts.
 ## Serving
 
 The server accepts a folder or Hugging Face model ID. Its positional arguments
-are model, port, slots, positions, precision and optional KV format:
+are model, port, slots, positions, precision, optional KV format and optional
+connection limit:
 
 ```sh
 python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16
@@ -112,9 +113,15 @@ fp32, and repetition penalties must also be normal. Invalid requests get HTTP
 Each connection has 10 seconds to send its headers and body. Bodies require one
 nonnegative `Content-Length`, may contain at most 8 MiB, and cannot use chunked
 transfer encoding. Expired bodies get HTTP 408; oversized bodies get HTTP 413.
-At most 32 connections have active handlers; additional connections get HTTP
-503. `serve.server` exposes these limits as `input_wait`, `body_limit` and
-`connections`.
+Each connection has a handler thread. By default at most 4 × (slots + 8)
+connections have handlers, 48 for four slots, and one client address may hold a
+quarter of them, which is more than the slots. So one client can use every slot,
+but its idle sockets can't take every handler. Past the total limit a connection
+gets HTTP 503; past its address's share, HTTP 429. Behind a proxy all clients
+share its address, so raise the limit there. The seventh argument sets the total,
+for example `python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16 "" 64`,
+where `""` keeps the precision's KV format. `serve.server` exposes these limits as
+`input_wait`, `body_limit`, `connections` and `per_client`.
 
 EOS tokens and sampling defaults are resolved per field from the generation
 config, then the selected text-model config, then the outer model config. An
@@ -124,9 +131,10 @@ The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request
 gets HTTP 429 when no slot is free. A non-streaming request that receives no text
 for 600 seconds gets HTTP 504. A stream that times out releases its slot.
-A sampling failure ends the affected request with an error and frees its slot;
-other requests continue. If the engine fails, pending requests end with an error
-and new requests get HTTP 503.
+A failure in a request's own work on the host, such as sampling or checking its
+output constraint, ends that request with an error and frees its slot; other
+requests continue. A failure on the chip, including reading logits back, stops
+the engine: pending requests end with an error and new requests get HTTP 503.
 
 ## Reusing a conversation
 
@@ -138,7 +146,10 @@ produced its state.
 Sessions are saved in spare DRAM on the chip. The server evicts old sessions
 before allocating a new snapshot. When device space is insufficient, it reads
 the snapshot directly into host memory. The host cache has a size limit too; a
-snapshot that cannot fit is dropped without failing the request. Prompt snapshots
+snapshot that cannot fit is dropped without failing the request. Restoring a
+snapshot from host memory uploads all of it before changing the slot. If DRAM
+can't hold it, the server frees what it uploaded, drops the snapshot and
+prefills the prompt as if there were no snapshot. Prompt snapshots
 include the prediction layer's final cache update when speculation is enabled.
 The response's usage field counts the prompt tokens that were reused.
 
@@ -151,7 +162,10 @@ sampling requests do too, so they can read much more data back to the host.
 
 Chat templates are written in Python, so a model with a new template may need
 code in `serve.py`. Qwen tool calls are returned in `tool_calls`, and reasoning
-goes in `reasoning_content`. Streams buffer partial reasoning markers so delimiter
+goes in `reasoning_content`. Each tool needs a function with a nonempty name. Its
+`parameters`, if not null, must be an object, with `properties` mapping names to
+schemas; other tool shapes get HTTP 400, as do bodies nested too deeply for
+Python's JSON parser. Streams buffer partial reasoning markers so delimiter
 characters do not leak into either field. `tool_choice` and JSON response formats constrain
 which tokens can be sampled. `test_chat_tools` and `test_serve` have example
 requests to start from when adding a model or client.
@@ -168,7 +182,11 @@ stop.
 `serve.formatted` documents the supported subset. String patterns, formats and
 numeric bounds are not enforced. Generation allows at most one whitespace
 character between tokens and 32 characters per number; integer schemas use
-spellings without fractions or exponents.
+spellings without fractions or exponents. Arrays and objects nest at most 32
+deep (`serve.NESTING`). A deeper bracket is never sampled, and if no other token
+fits, the request ends with an error. Schemas nest at most 32 levels,
+counting each subschema and reference, and an enum or constant value only as
+deep as its level leaves; deeper ones get HTTP 400.
 
 ## tinygrad and PyTorch
 
