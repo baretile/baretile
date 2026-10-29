@@ -2,7 +2,7 @@
 # code generation and tensors; test_models.py covers models, serving and adapters. They run on the simulator that
 # python3 -m baretile.chip ttsim downloads, or the libttsim.so that TTSIM names. On a machine with a card and no TTSIM,
 # they open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
-import functools, gc, pytest
+import functools, gc, os, pytest
 import numpy as np
 from baretile import pci
 from baretile.chip import Chip
@@ -26,6 +26,12 @@ def hold(rt):
   rt.chip.write32(x, y, DATA, 0)
   rt.launch(_held(), (1,), units=1, name="hold")
   return lambda: rt.chip.write32(x, y, DATA, 1)
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):  # with SKIPS=fail, a test that skips fails, for a CI job that must run all it selects
+  report = (yield).get_result()
+  if report.skipped and os.environ.get("SKIPS") == "fail":
+    report.outcome, report.longrepr = "failed", f"it skipped, with SKIPS=fail: {report.longrepr}"
 
 @pytest.fixture
 def no_gc():  # Python collects only where the test calls gc.collect()

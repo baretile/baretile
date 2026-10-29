@@ -74,6 +74,40 @@ jobs:
         env:
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
           TINYGRAD: ${{ runner.temp }}/tinygrad
+  # The comparisons with transformers, PyTorch, tiktoken and safetensors skip in the test job, which doesn't install
+  # them. This job installs pinned versions and runs those tests, and SKIPS=fail turns a skip into a failure, so a
+  # missing package can't pass for a green run. The PyTorch frontend also needs the pinned tinygrad.
+  references:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install clang, lld and the Python packages
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy pytest transformers==5.20.2 tiktoken==0.13.0 safetensors==0.8.0
+      - name: Check out tinygrad
+        run: |
+          git init -q "$RUNNER_TEMP/tinygrad"
+          git -C "$RUNNER_TEMP/tinygrad" fetch -q --depth 1 https://github.com/tinygrad/tinygrad 002630241913a57abccf646b092878ec8a9b882f
+          git -C "$RUNNER_TEMP/tinygrad" checkout -q FETCH_HEAD
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/baretile
+          key: kernels-references-${{ github.sha }}
+          restore-keys: kernels-
+      - run: python -m baretile.chip ttsim
+      - run: >-
+          python -m pytest -s -rs test/test_models.py::test_train test/test_models.py::test_llama_frequencies
+          test/test_models.py::test_tokenizer test/test_models.py::test_hf_families test/test_models.py::test_qwen3_moe
+          test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4 test/test_models.py::test_torch_frontend
+        env:
+          SKIPS: fail
+          TINYGRAD: ${{ runner.temp }}/tinygrad
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
   # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
   # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. The other job runs the suite on all 140
