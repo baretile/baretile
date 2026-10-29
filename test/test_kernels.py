@@ -1119,6 +1119,30 @@ def test_attend(chip):
     if lo == 200:
       assert read == 2 * (1 + 2 + 16 + 16) + 8, read
 
+def test_attention_unit_rows(chip):
+  # With one worker, a unit takes up to 8 tile rows of queries, which share each key and value tile it reads. The
+  # rows' largest scores share Dst's two accumulator tiles, a quarter of a tile each. The cases cover 8 rows, a last
+  # unit of 3, a sliding window over a bfp8 cache, a repeat, a unit of 3 rows in parts, and scores whose maximum
+  # bf16 can't hold.
+  rt, rng = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(44)
+  for e, rows, hd, keys, rep, fmt, window, parts, R in ((1, 256, 64, 256, 1, "bf16", 0, None, 8), (2, 330, 64, 320, 2, "bf16", 0, None, 8),
+                                                         (1, 100, 128, 200, 1, "bfp8", 50, None, 4), (1, 96, 64, 128, 1, "bf16", 0, 2, 3)):
+    q, k, v = (bf16(rng.normal(0, 1, shape)) for shape in ((e, rows, hd), (e // rep, keys, hd), (e // rep, keys, hd)))
+    places = np.clip(np.arange(rows) + keys - rows + rng.integers(-8, 8, rows), 0, keys - 1)[None, :, None].repeat(e, 0)
+    mask = np.where((np.arange(keys) > places) | ((np.arange(keys) <= places - window) if window else False), np.float32(-1e9), np.float32(0))
+    tq, tk, tv = (Tensor.of(rt, x.tolist()) for x in (q, k, v))
+    if fmt != "bf16": tk, tv = (x.cast(fmt).realize() for x in (tk, tv)); k, v = value(tk), value(tv)
+    if rep > 1: tk, tv = tk.repeat_interleave(rep), tv.repeat_interleave(rep)
+    got = value(tq.attend(tk, tv, Tensor.of(rt, places.tolist(), "int32"), window, parts=parts))
+    s = q @ np.repeat(k, rep, 0).transpose(0, 2, 1) + mask
+    p = np.exp(s - s.max(-1, keepdims=True))
+    close(got, p / p.sum(-1, keepdims=True) @ np.repeat(v, rep, 0), 0.011)
+    assert any(key[:4] == ("attend", hd // 32, -(-rows // 32), R) for key in tensor.kernels), "a unit of R tile rows"
+  q = Tensor.of(rt, [[10000] * 64] * 256)
+  k = Tensor.of(rt, [[10000] * 64] * 64)
+  v = Tensor.of(rt, [[1] * 64] * 32 + [[5] * 64] * 32)
+  assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[31]] * 256, "int32"))), np.ones((1, 256, 64)))
+
 def test_attention_extremes(chip):
   rt = Runtime(chip)
   # Both signs exceed the old bf16 maximum's precision. Empty parts and masked keys must contribute no weight,
@@ -1146,7 +1170,7 @@ def test_attention_capacity(chip):
       with pytest.raises(ValueError, match="fit in L1"): q.attend(k, v, pos, parts=parts)
     assert rt.launches == before and rt.used == used, "reject before allocating or submitting an output"
   assert attention_store(42, 1, None, 1)[1] == 0
-  assert attention_parts(42, 1, None, 2, 1, len(rt.cores)) >= 1
+  assert attention_parts(42, 1, None, 2, 1, len(rt.cores)) == 1
   q, k = Tensor.of(rt, [[0] * 1344]), Tensor.of(rt, [[0] * 1344] * 32)
   v = Tensor.of(rt, [[1] * 1344] * 32)
   assert np.array_equal(value(q.attend(k, v, Tensor.of(rt, [[31]], "int32"))), np.ones((1, 1, 1344)))
