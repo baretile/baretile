@@ -161,11 +161,20 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 LLAMA="$SMOLLM_DIR" \
   test/test_models.py::test_token_accuracy
 ```
 
-The ordinary `python3 -m baretile.models.llama model "prompt"` demonstration follows NumPy's
-choices. It is not the autonomous test. The independent reference checks are
-tracked in [#5](https://github.com/baretile/baretile/issues/5), and the full
-checkpoint autonomous runner in [#6](https://github.com/baretile/baretile/issues/6).
-They must implement the gates above before release qualification.
+The ordinary `python3 -m baretile.models.llama model "prompt"` demonstration
+follows NumPy's choices, so it isn't the autonomous test. `test/generation.py` is:
+it feeds the chip its own picks for the three prompts, compares every step with
+transformers at the same prefix, and exits with an error when a step misses its
+gate. In `bf16` that's the SmolLM gate above, and in `tt` the Llama one. It needs
+PyTorch and transformers, and writes each step's errors to the report:
+
+```sh
+python3 test/generation.py "$SMOLLM_DIR" smollm-generation.json 32 bf16
+python3 test/generation.py "$LLAMA_DIR" llama-generation.json 32 tt
+```
+
+Running the independent reference checks in CI is tracked in
+[#5](https://github.com/baretile/baretile/issues/5).
 
 On a card, complete [bring-up](bring-up.md) first and run with `TTSIM` unset
 in the root environment described there. These existing commands report B2

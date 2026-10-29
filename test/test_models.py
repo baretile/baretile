@@ -825,6 +825,25 @@ def test_hf_families(chip, tmp_path, family):
   ties = [want[r].max() - want[r][got[r].argmax()] <= 0.001 * np.ptp(want[r]) for r in range(len(ids))]  # its best, or one bf16 can't tell from it
   assert rel(got) < 0.02 and all(ties), (rel(got), ties)
 
+def test_autonomous_generation(chip, tmp_path, monkeypatch):
+  # test/generation.py feeds the chip its own picks and holds each step to the first workload's gates against
+  # transformers: on the logits in bf16, and on the five best at tt's precision. A small random Llama passes both. With a
+  # gate of 0 it fails, and the report keeps the failing step's logits.
+  torch, transformers = pytest.importorskip("torch"), pytest.importorskip("transformers")
+  import generation
+  torch.manual_seed(0)
+  config = transformers.LlamaConfig(hidden_size=128, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                                    vocab_size=256, max_position_embeddings=128, rope_theta=1e4, tie_word_embeddings=False)
+  transformers.LlamaForCausalLM(config).to(torch.bfloat16).float().save_pretrained(tmp_path)
+  bytes_tokenizer(tmp_path)
+  rt = Runtime(chip)
+  report = generation.check(rt, str(tmp_path), steps=4)
+  assert report["passed"] and [len(p["tokens"]) for p in report["prompts"]] == [4, 4, 4], report
+  assert generation.check(rt, str(tmp_path), steps=3, mode="tt", prompts=generation.PROMPTS[:1])["passed"]
+  monkeypatch.setattr(generation, "ERROR", 0)
+  report = generation.check(rt, str(tmp_path), steps=2, prompts=generation.PROMPTS[:1])
+  assert not report["passed"] and "chip_top" in report["prompts"][0]["steps"][0], report
+
 def test_qwen3_5_moe(chip, tmp_path, monkeypatch):
   # Qwen3.5-MoE's language model (also Qwen3.6's) from Hugging Face's files, against transformers in float32 with
   # random bf16 weights: a 100-token prompt (two DeltaNet chunks of 64), then replayed decode steps. numpy must be
