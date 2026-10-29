@@ -140,12 +140,14 @@ range. The RISC-V and Tensix settings give the probability of skipping a turn.
 Set `TTSIM_CHAOS_SEED` to repeat a run. `TTSIM_CHAOS_UNHARVESTED=1` enables all
 140 Tensix tiles, so you can check the code with a larger grid.
 
-CI builds ttsim-chaos this way for every push and pull request. It runs `test/test_kernels.py`
-and the model-specific DeltaNet and MoE kernel checks (`test_delta_step`,
-`test_delta_pieces` and `test_moe`)
-with the four delay settings above and the run number as the seed, so each run
-tries other timings, and it runs the whole suite with `TTSIM_CHAOS_UNHARVESTED=1`.
-The log prints the seed, which repeats a failure.
+CI builds ttsim-chaos this way for every push and pull request. With the four
+delay settings above and the run number as the seed, so each run tries other
+timings, it runs `test/test_device.py` and `test/test_kernels.py`, and the
+model-specific DeltaNet and MoE kernel checks (`test_delta_step`,
+`test_delta_pieces` and `test_moe`). The device tests cover the runtime's
+takeover, cancellation, shutdown and host memory, where timing bugs hide. None of
+them depends on exact simulated timing. CI also runs the whole suite with
+`TTSIM_CHAOS_UNHARVESTED=1`. The log prints the seed, which repeats a failure.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
