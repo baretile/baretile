@@ -295,9 +295,17 @@ def test_takeover(chip):
     rt.launch(me), rt.wait()
     assert [chip.read32(x, y, rt.args()) for x, y in rt.cores] == [x | y << 6 for x, y in rt.cores]
 
+@pytest.fixture
+def no_gc():  # Python collects only where the test calls gc.collect()
+  collecting = gc.isenabled()
+  gc.disable()
+  yield
+  if collecting: gc.enable()
+
 def test_runtime_shared_dram(chip):
   a = Runtime(chip, end=chip.tensix[1])
   b = Runtime(chip, start=chip.tensix[2], end=chip.tensix[3])
+  free = list(chip.dram_holes)  # runtimes of earlier tests elsewhere on the chip can still hold some
   first, second = a.dram_alloc(64), b.dram_alloc(128)
   assert first != second and a.holes is b.holes
   for xy in bh.DRAM:
@@ -315,41 +323,37 @@ def test_runtime_shared_dram(chip):
   assert chip.read32(*c.cores[0], c.args()) == 111
   assert chip.read(*bh.DRAM[0], second, 128) == bytes([22]) * 128
   c.close(), b.close()
-  assert a.holes == [(0, bh.DRAM_BANK_SIZE)]
+  assert a.holes == free
 
-def test_takeover_during_collection(chip, monkeypatch):
+def test_takeover_during_collection(chip, monkeypatch, no_gc):
   # Takeover owns only the old resources. Collecting the Runtime cycle during its drain must not close it again in
   # the middle of the same close, release allocations twice, or remove the rectangle twice.
-  collecting = gc.isenabled()
-  gc.disable()
-  try:
-    old = Runtime(chip, end=chip.tensix[1])
-    addr = old.dram_alloc(64)
-    old.cycle = old
-    owner, resources = weakref.ref(old), old.resources
-    del old
-    wait, halt, collected, stopped = chip.wait, chip.halt, False, 0
-    def poll(cond, what, timeout=2.0):
-      nonlocal collected
-      if not collected:
-        collected = True
-        gc.collect()
-      return wait(cond, what, timeout)
-    def stop(*args):
-      nonlocal stopped
-      if not resources.closed: stopped += 1
-      return halt(*args)
-    with monkeypatch.context() as patch:
-      patch.setattr(chip, "wait", poll)
-      patch.setattr(chip, "halt", stop)
-      replacement = Runtime(chip, end=chip.tensix[1])
-    gc.collect()
-    assert collected and stopped == 1 and owner() is None and resources.closed
-    assert replacement.dram_alloc(64) == addr
-    replacement.close()
-    assert chip.dram_holes == [(0, bh.DRAM_BANK_SIZE)]
-  finally:
-    if collecting: gc.enable()
+  old = Runtime(chip, end=chip.tensix[1])
+  free = list(chip.dram_holes)
+  addr = old.dram_alloc(64)
+  old.cycle = old
+  owner, resources = weakref.ref(old), old.resources
+  del old
+  wait, halt, collected, stopped = chip.wait, chip.halt, False, 0
+  def poll(cond, what, timeout=2.0):
+    nonlocal collected
+    if not collected:
+      collected = True
+      gc.collect()
+    return wait(cond, what, timeout)
+  def stop(*args):
+    nonlocal stopped
+    if not resources.closed: stopped += 1
+    return halt(*args)
+  with monkeypatch.context() as patch:
+    patch.setattr(chip, "wait", poll)
+    patch.setattr(chip, "halt", stop)
+    replacement = Runtime(chip, end=chip.tensix[1])
+  gc.collect()
+  assert collected and stopped == 1 and owner() is None and resources.closed
+  assert replacement.dram_alloc(64) == addr
+  replacement.close()
+  assert chip.dram_holes == free
 
 def test_displaced_runtime_rejects_work(chip):
   a = Runtime(chip, end=chip.tensix[1])
@@ -400,33 +404,39 @@ def test_collected_runtime_keeps_dma_until_stopped(chip, monkeypatch):
     assert pages[0]() is None and halted[0] is True
     assert all(chip.read32(*xy, bh.SOFT_RESET) == bh.ALL_CORES for xy in cores)
 
-def test_collection_during_another_runtimes_access(chip, monkeypatch):
+def test_collection_during_another_runtimes_access(chip, monkeypatch, no_gc):
   # Python can collect a dropped runtime's reference cycle in the middle of another runtime's chip access. Stopping
   # it there would move the shared TLB window under that access and send its bytes to the collected runtime's tiles.
-  collecting = gc.isenabled()
-  gc.disable()
-  try:
-    dropped = Runtime(chip, end=chip.tensix[1])
-    dropped.cycle, resources = dropped, dropped.resources
-    with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]) as rt:
-      del dropped
-      x, y = rt.cores[0]
-      chip.write(x, y, DATA, bytes(16))
-      write, collected = chip.pci.write, []
-      def collect_first(off, data):  # where CPython may run a pending collection: entering the next Python call
-        if not collected and off < bh.TLB_WINDOW:
-          collected.append(1)
-          gc.collect()
-        return write(off, data)
-      with monkeypatch.context() as patch:
-        patch.setattr(chip.pci, "write", collect_first)
-        chip.write(x, y, DATA, bytes([0x55]) * 16)
-      assert collected and chip.read(x, y, DATA, 16) == bytes([0x55]) * 16
-      assert not resources.closed, "the collected runtime waits for a safe point"
-  finally:
-    if collecting: gc.enable()
+  dropped = Runtime(chip, end=chip.tensix[1])
+  dropped.cycle, resources = dropped, dropped.resources
+  with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]) as rt:
+    del dropped
+    x, y = rt.cores[0]
+    chip.write(x, y, DATA, bytes(16))
+    write, collected = chip.pci.write, []
+    def collect_first(off, data):  # where CPython may run a pending collection: entering the next Python call
+      if not collected and off < bh.TLB_WINDOW:
+        collected.append(1)
+        gc.collect()
+      return write(off, data)
+    with monkeypatch.context() as patch:
+      patch.setattr(chip.pci, "write", collect_first)
+      chip.write(x, y, DATA, bytes([0x55]) * 16)
+    assert collected and chip.read(x, y, DATA, 16) == bytes([0x55]) * 16
+    assert not resources.closed, "the collected runtime waits for a safe point"
   with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]):
     assert resources.closed and resources not in chip.taken.values()
+
+def test_dropped_runtime_gives_memory_back(chip, no_gc):
+  # A dropped runtime in a reference cycle still holds its DRAM until Python collects it. An allocation that finds no
+  # room collects, stops it and tries again.
+  dropped = Runtime(chip, end=chip.tensix[1])
+  dropped.cycle = dropped
+  with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]) as rt:
+    room = max(n for _, n in chip.dram_holes)
+    dropped.dram_alloc(room)
+    del dropped
+    rt.dram_alloc(room)  # MemoryError if the dropped runtime still held it
 
 def test_takeover_after_hung_multicast(chip):
   # A kernel that never sees its multicast's acknowledgements never leaves the multicast region. Closing it can't
@@ -446,12 +456,7 @@ def test_takeover_after_hung_multicast(chip):
       assert fresh.dram_alloc(64) != addr, "the hung runtime's DRAM may still be written"
   assert page() is not None and rt.used == {addr: 64}, "nor may its host page be released"
   with pytest.raises(RuntimeError, match="closed"): rt.launch(bytes(16))
-  # The kernel never issued its multicast, so the tests that follow can have the memory back
-  import baretile.runtime as runtime
-  runtime._stranded.discard(rt.resources)
-  chip.dram_holes.extend(rt.used.items())
-  runtime._merge_holes(chip.dram_holes)
-  rt.used.clear()
+  rt.resources.release()  # the kernel never issued its multicast, so the tests that follow can have the memory back
 
 @pytest.mark.parametrize("kind,tag", [("OUTSTANDING", 1), ("OUTSTANDING", 15), ("OUTGOING", 3), ("CMD", 2)])
 def test_runtime_close_drains_all_transactions(chip, monkeypatch, kind, tag):
@@ -487,7 +492,6 @@ def test_runtime_close_during_dispatcher_multicast(chip, monkeypatch):
     assert all(chip.read32(*xy, MCAST_STATE) == 0 for xy in [*fresh.cores, fresh.dispatcher])
     fresh.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))
     fresh.wait()
-
 
 @pytest.mark.parametrize("received", [2, 4, 6])
 def test_runtime_close_during_worker_multicast(chip, monkeypatch, received):
@@ -526,7 +530,6 @@ def test_runtime_close_during_worker_multicast(chip, monkeypatch, received):
   assert chip.read32(*first, bh.NIU + bh.NIU_REGS["WR_ACKS"]) == (acks + 6) % 2**32
   for xy in rt.cores[1:]:
     for packet in range(3): assert chip.read(*xy, DATA + packet * bh.MAX_PACKET, len(source)) == source
-
 
 def test_runtime_startup_and_shutdown_failures(chip, monkeypatch):
   # Failed startup releases the new DMA page. Failed shutdown keeps its page and allocations until a retry.
@@ -681,6 +684,7 @@ def test_launch_number_wrap(chip, monkeypatch):
   import baretile.runtime as runtime
   # Accelerate the real dispatcher's counter; the host keeps an unbounded count across its 32-bit status wrap.
   start = 2**32 - 2
+  assert "launches = 0," in runtime.DISPATCHER
   monkeypatch.setattr(runtime, "DISPATCHER", runtime.DISPATCHER.replace("launches = 0,", f"launches = {start}u,"))
   with Runtime(chip, end=chip.tensix[2], ring=256) as rt:
     rt.launches = start

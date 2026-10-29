@@ -1,6 +1,6 @@
 # PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
 # BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, gc, mmap, os, pathlib, time, weakref
+import array, ctypes, mmap, os, pathlib, time, weakref
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
@@ -13,6 +13,7 @@ class Sim:
   NIU_MST_RD_DATA_WORD_RECEIVED for profiling. ttsim-chaos implements it; released ttsim stops if you read
   it."""
   lib, dma, clocks, counts = None, [], 0, False  # dma: (bus address, size, host address, weak buffer reference). clocks: chip cycles so far
+  next_bus = 1 << 32  # where alloc puts the next page: never an address a released page had
   def __init__(self, path, bdf=0):
     Sim.load(path)
     self.lib, self.bdf = Sim.lib, bdf
@@ -48,7 +49,6 @@ class Sim:
     return buf.raw
   def write(self, off, data): self.lib.libttsim_pci_mem_wr_bytes(self.bar0 + off, bytes(data), len(data))
 
-  next_bus = 1 << 32
   def alloc(self, size):
     """Allocate host memory that the device can reach. Returns (memoryview, bus address). Sim makes up the bus
     addresses, 4 GiB apart. The last memoryview releases the mapping, as it does on a card."""
@@ -121,13 +121,8 @@ class Card:
     status, ring, launch times and transfer staging."""
     if size > 1 << 21: raise ValueError("Card.alloc gives at most one 2 MiB hugepage")
     MAP_HUGETLB, MAP_LOCKED, MAP_HUGE_2MB = 0x40000, 0x2000, 21 << 26  # 2 MiB pages, even if the host's default differs
-    # Cached scalar tensors refer back to their Runtime, so dropping a Runtime can leave a reference cycle.
-    # Collect those cycles before giving up: an unused Runtime may still hold a hugepage.
-    for tries in (1, 0):
-      try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED | MAP_HUGE_2MB); break
-      except OSError:
-        if not tries: raise MemoryError("no free 2 MiB hugepage for DMA memory. Try: echo 4 > /proc/sys/vm/nr_hugepages") from None
-        gc.collect()
+    try: buf = mmap.mmap(-1, 1 << 21, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE | MAP_HUGETLB | MAP_LOCKED | MAP_HUGE_2MB)
+    except OSError: raise MemoryError("no free 2 MiB hugepage for DMA memory. Try: echo 4 > /proc/sys/vm/nr_hugepages") from None
     with open("/proc/self/pagemap", "rb") as f:
       f.seek(ctypes.addressof(ctypes.c_char.from_buffer(buf)) // mmap.PAGESIZE * 8)
       pfn = int.from_bytes(f.read(8), "little") & ((1 << 55) - 1)

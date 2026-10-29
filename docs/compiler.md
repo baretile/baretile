@@ -29,7 +29,7 @@ matmul. Tile column `j` goes in bank `j % 8`, with consecutive tiles along the
 dimension K that the matmul sums over. A worker can then read several tiles in
 a single request. For block floats, exponents are stored together before the
 values. Use this layout for matmul's B. You can also read it back to the host.
-Cast to bf16 to use ordinary operations on the result.
+Other operations raise `ValueError`; cast to bf16 first.
 
 | Format | Bytes per tile | Notes |
 | --- | ---: | --- |
@@ -49,7 +49,9 @@ BRISC kernel to round instead.
 A fused kernel allocates L1 slots for inputs and intermediate results. Two
 frames alternate so BRISC can fetch the next tile while Tensix computes. The
 semaphore that counts intermediates can hold fifteen reports, so a kernel can
-have at most fifteen operations. The compiler splits larger expressions.
+have at most fifteen operations. The compiler splits larger expressions, and
+also those with several indexed matmuls or with block-float weights in more than
+one format, which one kernel can't unpack.
 
 Reductions make passes over a line of tiles. Softmax first finds the maximum,
 then adds up the exponentials, then divides by that sum. A kernel can reduce
@@ -59,27 +61,26 @@ is computed first. Inputs can stay in L1 across passes when there is room.
 Batch indexing, tile-aligned slices, `split` and `repeat_interleave` can share
 storage through a view's batch, strides and offset. A shape-changing `reshape`
 copies through `move_kernel`; an identical-shape reshape returns its input.
-Other movement also copies when it cannot use a view.
+Other movement also copies when it cannot use a view. `move` checks that the
+source positions it selects stay inside the input's logical shape, and its
+offset and strides must fit signed 32-bit integers. Padding outside the selected
+output bounds reads no source data. Negative `pad` widths crop, and the cropped
+elements get zero gradients. `pad` takes at most three integer pairs.
+
+Casting block floats to bf16 decodes them on the chip into ordinary tiles, and
+casting column storage to its own dtype restores ordinary tile order. Further
+casts and movement use those tiles. Column copies keep their gradients.
+Block-float casts take a straight-through gradient in bf16: backward treats the
+quantizer as an identity, while matmul's input gradient uses the stored,
+quantized weights.
+
 `gather` reads rows by index, and `put` writes them. The models use these for
-embeddings and KV caches. `put` can also update bfp8 and bfp4 caches.
-Casting block floats to bf16 decodes them on the chip into ordinary tiles;
-casting column storage to its own dtype also restores ordinary tile order.
-Further casts and movement use those tiles. Column copies preserve gradients.
-Block-float casts use a straight-through gradient in bf16: backward treats the
-quantizer as an identity, while matmul uses the stored, quantized weights for
-its input gradient. This approximates the quantizer's derivative.
-Matmul with `dtype="int32"` accumulates in fp32 and then converts the result.
-Expressions with several indexed matmuls or mixed block-float weights are split
-into supported kernels before fusion.
-`move` checks that its selected source positions stay inside the input's logical
-shape. Its offset and strides must fit signed 32-bit integers. Padding outside
-the selected output bounds reads no source data. Negative `pad` widths crop
-elements; their gradients are zero. Padding accepts at most three integer pairs.
-`assign` preserves the original source when source and destination views overlap
-with different layouts. `realize(into=...)` also computes through a temporary
-when its destination overlaps a matmul input or a differently laid out input.
-`put` snapshots overlapping source rows and indices before writing, and keeps
-singleton rows replicated across their physical tiles for later broadcasting.
+embeddings and KV caches. `put` can also update bfp8 and bfp4 caches. It copies
+source rows and indices that overlap its destination before writing, and keeps
+singleton rows replicated across their tiles for later broadcasting. `assign`
+copies its source first when source and destination overlap with different
+layouts, and `realize(into=...)` computes into a temporary when its destination
+overlaps a matmul input or an input laid out differently.
 
 Autograd walks the expression backwards and builds tensor operations for the
 gradients. `backward()` queues the forward value and every leaf gradient before
@@ -133,6 +134,7 @@ a wait loop, another core may be waiting for it, and both will stop.
 The matrix unit computes `Dst[8x16] += SrcB[8x16] @ SrcA[16x16]`. The operand
 names are easy to reverse: the left matrix A goes to SrcB, and B goes to SrcA.
 A pair of 32 by 32 tiles takes sixteen `MVMUL` instructions per fidelity phase.
+A matmul with `dtype="int32"` accumulates in fp32 and then converts the result.
 
 For a matrix with several tile rows, workers share A across grid rows and B down
 grid columns. Three buffers let them rotate through inputs without a separate

@@ -1514,6 +1514,7 @@ void kmain(volatile unsigned *a) {{
     unsigned t = a[0] + u;
     int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
     int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
+    // where the tile starts in x
     unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr, col = e % xc;
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{

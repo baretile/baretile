@@ -1,6 +1,6 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import atexit, bisect, collections, functools, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys, tempfile, time, weakref
+import atexit, bisect, collections, functools, gc, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -113,7 +113,8 @@ static inline void tensix_idle(void) {{
 """
 
 CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax", "-fno-jump-tables",
-         "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld", "-Wl,--emit-relocs,-e,0"]
+         "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld",
+         "-Wl,--emit-relocs,-e,0"]  # keep relocations for _position_independent_image; the image starts at 0, with no _start
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "baretile")  # compiled images, by what made them
 
 @functools.cache
@@ -244,7 +245,7 @@ void brisc_loop(void) {{
     CFG[{bh.CFG_IC_INVALIDATE}] = 0xF;  // drop the cached instructions of BRISC and the TRISCs
     l1_settle({bh.TENSIX_CFG:#x});
     l1_settle({SYNC:#x});  // the SYNC counters are zero before any core of the kernel looks at them
-    TRISCS[0] = phase ^= 1;  // a worker can first participate at launch zero, or skip a whole launch-number cycle
+    TRISCS[0] = phase ^= 1;  // a phase, not the launch number: the TRISCs see only the launches this worker runs, and a number can recur after a wrap
     run(0);
     noc_wait();  // what the kernel sent has landed before we report done
     for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != phase) asm volatile("fence" ::: "memory");
@@ -306,7 +307,8 @@ void loop(void) {{
   unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
   unsigned ready = 0, ready_n = 0, ready_end = 0, prepared = 0;  // the next launch, and whether its arguments are ready
-  // the launch the workers are on, the ring pointer past it, the report count once it's done, and when its go went
+  // the launch the workers are on, the ring pointer past it, the report count once it's done, when its go went, and
+  // whether it's still running
   unsigned running = 0, running_end = 0, reports = 0, began = 0, active = 0;
   unsigned long long times = ring + size;  // launch n's [go, last report, flits read] at times + n % TIMES * 16
   unsigned words = 0;  // the flits the workers read, up to the last launch done
@@ -349,7 +351,6 @@ void loop(void) {{
       running = ready; running_end = ready_end; reports += ready_n; active = 1; prepared = 0;
     }}
     if (complete) {{  // after the next go: better the host hears late than the next launch starts late
-      while (NIU(OUTGOING)) {{}}  // wait until the last launch's times and status have left the outbox
       OUT[4] = end; OUT[5] = done; OUT[8] = took; OUT[9] = finished; OUT[10] = read;
       l1_settle({OUTBOX + 16:#x});
       // its times, then the status that says it's done, in that order
@@ -374,7 +375,10 @@ def _merge_holes(holes):
 # that finds no room, or process exit stops it instead.
 _open, _stranded = set(), set()
 
-def _reap(chip):  # stop the runtimes on chip that were collected without close(). True if any memory came back
+def _reap(chip, collect=False):
+  """Stop the runtimes on chip that were dropped without close(), and return whether any memory came back. A dropped
+  Runtime is usually in a reference cycle through its cached number tensors, so with collect, collect cycles first."""
+  if collect: gc.collect()
   freed = False
   for resources in [r for r in _open if r.chip is chip and r.owner() is None]:
     try: freed |= resources.close()
@@ -433,17 +437,20 @@ class _Resources:
     if not settled:
       _stranded.add(self)
       return False
+    self.release()
+    return True
+  def release(self):  # give the DRAM and the host DMA pages back, once the card can no longer reach them
+    _stranded.discard(self)
     self.chip.dram_holes.extend(self.used.items())
     _merge_holes(self.chip.dram_holes)
     self.used.clear()
     for view in self.views: view.release()
     self.views = ()
-    return True
 
 class Runtime:
   """Run kernels on the Tensix rectangle from start to end, using the available tiles by default. The last tile
   dispatches work to the others. Kernels stay in L1 until the kernel area fills. The dispatcher reads
-  commands from host memory and executes them in order. A new Runtime halts any older runtime that overlaps
+  commands from host memory and executes them in order. A new Runtime closes any older runtime that overlaps
   its rectangle. Close a runtime to stop its workers and release its memory; a closed runtime cannot be reused."""
   def __init__(self, chip, start=None, end=None, ring=1 << 20):
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
@@ -456,7 +463,7 @@ class Runtime:
     if len(cores) < 2: raise ValueError("a rectangle needs a dispatcher and at least one worker")
     self.chip, self.launches, self.wptr = chip, 0, 0
     self.queued = collections.deque()  # (launch, workers) for each launch that may not be done yet
-    # DRAM: holes lists free (address, size) ranges; used maps address to size.
+    # DRAM: holes is the chip's list of free (address, size) ranges; used maps this runtime's addresses to sizes.
     # freed pairs an address with the last queued launch that could use it.
     self.holes, self.used, self.freed = chip.dram_holes, {}, []
     # loaded maps each kernel image in L1 to its address, and room is where the next one goes
@@ -492,15 +499,19 @@ class Runtime:
     for theirs in list(chip.taken.values()):
       if theirs.cores & set(cores): theirs.close()
     chip.halt(*end, start)
-    buf, bus = chip.pci.alloc(1 << 21)  # status, command ring, times, then transfer staging
+    try: buf, bus = chip.pci.alloc(1 << 21)  # status, command ring, times, then transfer staging
+    except MemoryError:
+      if not _reap(chip, collect=True): raise  # a dropped runtime may hold the hugepage
+      buf, bus = chip.pci.alloc(1 << 21)
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))
     chip.taken[start, end] = self.resources
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
-    # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
+    # log holds the launches while a Recording records. pinned counts the recordings that keep each allocation, which
+    # dram_free then leaves until the last of them closes (pinned_freed)
     self.log, self.pinned, self.pinned_freed = None, collections.Counter(), set()
-    self.recorded, self.recorded_bases = None, []  # active recording pins and existing allocation bases
+    self.recorded, self.recorded_bases = None, []  # the active recording's pins, and the allocations from before it
     self.written = None  # while tensor.jit records a call: the allocations it writes in place
     try:
       (dx, dy), n = self.dispatcher, len(self.cores)
@@ -533,6 +544,8 @@ class Runtime:
     Closing twice is harmless; tensors and recordings from this runtime can no longer run."""
     self.resources.close()
 
+  @property
+  def closed(self): return not self.resources.active  # closed, or replaced by an overlapping runtime
   def __enter__(self): self.check(); return self
   def __exit__(self, *_): self.close()
 
@@ -548,7 +561,7 @@ class Runtime:
       self.loaded[kernel], self.room = self.room, self.room + len(kernel)  # compile_kernel makes it a multiple of 16
     return self.loaded[kernel]
   # whether loading kernel would evict the others
-  def evicts(self, kernel): self.check(); return kernel not in self.loaded and self.room + len(kernel) > ZEROS
+  def evicts(self, kernel): return kernel not in self.loaded and self.room + len(kernel) > ZEROS
 
   def evict(self):  # forget the loaded kernels, once the launches that use them are done
     self.wait()
@@ -584,7 +597,6 @@ class Runtime:
     return b"".join(cmds), sent
 
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
-    self.check()
     units = len(self.cores) if units is None else units
     try: units = operator.index(units)
     except TypeError: raise ValueError("launch units must be an integer in [1, 2**32 - 1]") from None
@@ -655,7 +667,6 @@ class Runtime:
     return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()), key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are on each of its workers. some kernels write results there
-    self.check()
     return ARGS + self.launches % 2 * ARGS_SIZE
 
   def dram_alloc(self, size):
@@ -673,13 +684,13 @@ class Runtime:
       if resources.active and (rt := resources.owner()) is not None and rt.freed:
         rt.wait()
         return self.dram_alloc(size)
-    if _reap(self.chip): return self.dram_alloc(size)  # and so can stopping runtimes that were collected
+    if _reap(self.chip, collect=True): return self.dram_alloc(size)  # and so can stopping runtimes that were dropped
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):
     """Release an allocation after the launches queued so far have finished, then merge adjacent free ranges.
     Keep allocations made during recording, since replay uses the same addresses."""
-    if not self.resources.active: return  # shutdown already released all allocations after stopping the workers
+    if not self.resources.active: return  # closing released or stranded all of the runtime's allocations
     if addr in self.pinned: self.pinned_freed.add(addr); return
     self.freed.append((self.launches, addr))
     self.reclaim()
@@ -693,7 +704,6 @@ class Runtime:
   def unpin(self, addresses):
     """Release one recording's ownership, preserving live tensors and queued launches."""
     for addr in addresses:
-      if addr not in self.pinned: continue  # runtime shutdown may have already released all of its allocations
       self.pinned[addr] -= 1
       if not self.pinned[addr]:
         del self.pinned[addr]
@@ -738,7 +748,6 @@ class Runtime:
   def report(self, core, launch):
     """Describe an unfinished worker: active cores, SYNC and FLAGS, and outstanding NoC requests by transaction
     ID. On hardware, include each core's program counter."""
-    self.check()
     x, y = core
     words = lambda addr, n: struct.unpack(f"<{n}I", self.chip.read(x, y, addr, 4 * n))
     niu = lambda off: self.chip.read32(x, y, bh.NIU + off)
