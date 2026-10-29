@@ -58,6 +58,10 @@ GPT2=/path/to/gpt2/model.safetensors python3 -m pytest -s test -k gpt2_model
 LLAMA=/path/to/SmolLM-135M python3 -m pytest -s test -k llama_model
 ```
 
+Those follow NumPy's choices. To have the chip generate from its own and hold it
+to the [first workload](workload.md#correctness-gates)'s gates against
+transformers, run `python3 test/generation.py /path/to/SmolLM-135M`.
+
 `LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` runs n
 random expressions in the kernel fuzz test instead of 30, when n is more.
 `TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases include
