@@ -10,7 +10,7 @@ import codecs, collections, functools, json, math, os, queue, re, select, shutil
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
-from baretile import bh
+from baretile import bh, pci
 from baretile.kernels import topk_room
 from baretile.tensix import tile_bytes
 from baretile.tensor import Tensor, jit
@@ -1091,7 +1091,7 @@ class ScopedRedirect(urllib.request.HTTPRedirectHandler):
     if redirected is not None and origin(req.full_url) != origin(newurl): redirected.remove_header("Authorization")
     return redirected
 
-def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
+def fetch(model, cache=str(pci.CACHE / "hub")):
   """Return a local model folder, downloading a Hugging Face ID if needed. Fetch config, tokenizer, optional
   chat and generation settings, and safetensors weights or indexed shards. HF_ENDPOINT changes the server;
   HF_TOKEN authorizes gated downloads. Mark completed downloads with .done and reuse them."""

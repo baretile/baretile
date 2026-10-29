@@ -1,6 +1,7 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
-import ast, collections, ctypes, gc, mmap, os, pathlib, random, struct, sys, threading, time, weakref, pytest
+import ast, collections, ctypes, gc, hashlib, mmap, os, pathlib, random, shutil, struct, sys, threading, time, weakref, pytest
 from baretile import bh, pci
+from baretile.chip import check
 from baretile.hello import hello
 from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Runtime, compile_kernel
 
@@ -275,6 +276,59 @@ def test_preflight(tmp_path, monkeypatch):
   monkeypatch.setattr(pci.os, "geteuid", lambda: 1000)
   levels = collections.Counter(level for level, _ in pci.preflight(bdf))
   assert levels == {"fail": 3, "warn": 1, "ok": 2}, levels
+
+def test_fetch_ttsim(tmp_path, monkeypatch):
+  # fetch_ttsim downloads the simulator once, and only with the expected SHA-256. A server in a thread stands in for
+  # GitHub.
+  import http.server
+  library, gets = os.urandom(1024), []
+  class Release(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+      gets.append(self.path)
+      self.send_response(200), self.send_header("Content-Length", str(len(library))), self.end_headers()
+      self.wfile.write(library)
+    def log_message(self, *_): pass
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Release)
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  try:
+    path = tmp_path / "ttsim" / "libttsim_bh.so"
+    monkeypatch.setattr(pci, "TTSIM_URL", f"http://127.0.0.1:{server.server_address[1]}/libttsim_bh.so")
+    monkeypatch.setattr(pci, "TTSIM_PATH", path)
+    monkeypatch.setattr(pci, "TTSIM_SHA256", "0" * 64)
+    with pytest.raises(RuntimeError, match="SHA-256"): pci.fetch_ttsim()
+    assert not path.parent.exists() or not any(path.parent.iterdir()), "a download that doesn't check out leaves nothing"
+    monkeypatch.setattr(pci, "TTSIM_SHA256", hashlib.sha256(library).hexdigest())
+    assert pci.fetch_ttsim() == pci.fetch_ttsim() == path and path.read_bytes() == library and len(gets) == 2
+  finally: server.shutdown(); server.server_close()
+
+def test_setup_checks(tmp_path, monkeypatch):
+  # open_device takes TTSIM's simulator, then a card, then the simulator that fetch_ttsim downloaded. check says what's
+  # missing for each, without opening the device.
+  bdf, downloaded = "0000:01:00.0", tmp_path / "libttsim_bh.so"
+  (tmp_path / "devices").mkdir()
+  downloaded.write_bytes(b"ttsim")
+  monkeypatch.setattr(pci, "SYS", str(tmp_path))
+  monkeypatch.setattr(pci, "TTSIM_PATH", downloaded)
+  monkeypatch.setattr(pci, "TTSIM_SHA256", hashlib.sha256(b"ttsim").hexdigest())
+  monkeypatch.setenv("TTSIM", "/elsewhere/libttsim.so")
+  assert pci.simulator() == "/elsewhere/libttsim.so"
+  monkeypatch.delenv("TTSIM")
+  assert pci.simulator() == str(downloaded)
+  assert check()[-1] == ("ok", f"the simulator at {downloaded} is the tested ttsim release")
+  downloaded.write_bytes(b"another build")
+  assert check()[-1][0] == "warn"
+  downloaded.unlink()
+  assert pci.simulator() is None
+  level, message = check()[-1]
+  assert level == "fail" and "python3 -m baretile.chip ttsim" in message, message
+  card = tmp_path / "devices" / bdf
+  card.mkdir()
+  for name, text in (("vendor", f"{bh.VENDOR:#x}\n"), ("device", f"{bh.DEVICE:#x}\n")): (card / name).write_text(text)
+  downloaded.write_bytes(b"ttsim")
+  assert pci.simulator() is None, "a card comes before the downloaded simulator"
+  assert all(message.startswith(bdf) for _, message in check()[3:]), "then check runs the card's preflight"
+  monkeypatch.setattr(shutil, "which", lambda name: None)
+  assert [level for level, _ in check()[:2]] == ["fail", "fail"], "no clang, no lld"
 
 def test_release(tmp_path, monkeypatch):
   # release binds tt-kmd to a card that no driver has, through a fake sysfs. It leaves a driven card alone, and asks

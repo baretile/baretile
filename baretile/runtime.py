@@ -115,7 +115,7 @@ static inline void tensix_idle(void) {{
 CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax", "-fno-jump-tables",
          "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld",
          "-Wl,--emit-relocs,-e,0"]  # keep relocations for _position_independent_image; the image starts at 0, with no _start
-CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "baretile")  # compiled images, by what made them
+CACHE = pci.CACHE  # compiled images, by what made them. pruning leaves the downloads in its subdirectories alone
 
 @functools.cache
 def _clang_version(): return subprocess.run(["clang", "--version"], capture_output=True, check=True).stdout

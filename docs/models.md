@@ -113,7 +113,7 @@ multiple of 32 that the model's RoPE tables cover, and leave room for the answer
 as well as the prompt. The engine also reserves positions at the end for
 inactive slots.
 
-Downloads go to `~/.cache/baretile/hub`. `HF_TOKEN` supplies access to a gated
+Downloads go to `$XDG_CACHE_HOME/baretile/hub`, `~/.cache/baretile/hub` by default. `HF_TOKEN` supplies access to a gated
 model, and `HF_ENDPOINT` changes the download endpoint. A redirect to another
 origin (scheme, host or port) doesn't get the token. Completed downloads are
 reused. The server binds to all interfaces on the

@@ -1,7 +1,14 @@
 # PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
 # BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, fcntl, gc, mmap, os, pathlib, time, weakref
+import array, ctypes, fcntl, gc, hashlib, mmap, os, pathlib, time, urllib.request, weakref
 from baretile import bh
+
+CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "baretile")  # what baretile builds and downloads
+# The ttsim release that baretile is tested with: its Blackhole library, the library's SHA-256, and where fetch_ttsim
+# puts it. open_device uses it when TTSIM isn't set and there's no card.
+TTSIM_URL = "https://github.com/tenstorrent/ttsim/releases/download/v1.11.5/libttsim_bh.so"
+TTSIM_SHA256 = "9471430de59a0316facdf7716c2e526727a9d0ee397c204cc8eece85b6a52432"
+TTSIM_PATH = CACHE / "ttsim" / "v1.11.5" / "libttsim_bh.so"
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
 HUGEPAGES = "/sys/kernel/mm/hugepages/hugepages-2048kB"  # the kernel's pool of 2 MiB pages; tests replace it too
@@ -165,8 +172,31 @@ def _claim(take, name):  # take() claims a device for one opener, or returns Fal
 def find_cards():
   """List the Blackholes on the PCI bus by their sysfs names (domain:bus:device.function)."""
   ids = lambda bdf: [int(pathlib.Path(SYS, "devices", bdf, f).read_text(), 16) for f in ("vendor", "device")]
-  if cards := [bdf for bdf in sorted(os.listdir(f"{SYS}/devices")) if ids(bdf) == [bh.VENDOR, bh.DEVICE]]: return cards
-  raise RuntimeError("no Blackhole on the PCI bus. Set TTSIM=/path/to/libttsim.so to use the simulator")
+  devices = sorted(os.listdir(f"{SYS}/devices")) if os.path.isdir(f"{SYS}/devices") else []
+  if cards := [bdf for bdf in devices if ids(bdf) == [bh.VENDOR, bh.DEVICE]]: return cards
+  raise RuntimeError("no Blackhole on the PCI bus. To use the simulator instead, run python3 -m baretile.chip ttsim, "
+                     "or set TTSIM=/path/to/libttsim.so")
+
+def fetch_ttsim():
+  """Download the tested ttsim release's Blackhole library to TTSIM_PATH, unless it's there already, and return the
+  path. The download must have TTSIM_SHA256."""
+  if TTSIM_PATH.exists(): return TTSIM_PATH
+  with urllib.request.urlopen(TTSIM_URL, timeout=60) as r: data = r.read()
+  if (got := hashlib.sha256(data).hexdigest()) != TTSIM_SHA256: raise RuntimeError(f"{TTSIM_URL} has SHA-256 {got}, not {TTSIM_SHA256}")
+  TTSIM_PATH.parent.mkdir(parents=True, exist_ok=True)
+  part = TTSIM_PATH.with_name(TTSIM_PATH.name + ".part")
+  part.write_bytes(data)
+  os.replace(part, TTSIM_PATH)  # whole or not at all, if two processes fetch it at once
+  return TTSIM_PATH
+
+def simulator():
+  """The libttsim.so that open_device opens: TTSIM's, else the one fetch_ttsim downloaded if there's no card. None
+  means a card."""
+  if "TTSIM" in os.environ: return os.environ["TTSIM"]
+  if not TTSIM_PATH.exists(): return None
+  try: find_cards()
+  except RuntimeError: return str(TTSIM_PATH)
+  return None
 
 def preflight(bdf):
   """Check what Card needs, from sysfs, without touching the card. Return [(level, message)], where level is "ok",
@@ -204,11 +234,12 @@ def release(bdf):
 
 def open_device(n=0):
   """Open chip n. With TTSIM=/path/to/libttsim.so that's chip n of the simulator, which has several in a multi-chip
-  build. Otherwise it's the n-th Blackhole on the PCI bus. Only one Chip at a time may have a device open."""
-  sim = "TTSIM" in os.environ
-  found = Sim.chips(os.environ["TTSIM"]) if sim else find_cards()
+  build. Otherwise it's the n-th Blackhole on the PCI bus, or with none there, the simulator that fetch_ttsim
+  downloaded. Only one Chip at a time may have a device open."""
+  sim = simulator()
+  found = Sim.chips(sim) if sim else find_cards()
   if not 0 <= n < len(found): raise ValueError(f"open_device({n}): there are {len(found)} chips")
-  return Sim(os.environ["TTSIM"], found[n]) if sim else Card(found[n])
+  return Sim(sim, found[n]) if sim else Card(found[n])
 
 def reset(bdf, timeout=10.0):
   """Reset a card whose NoC or firmware has hung, following tt-kmd's ASIC reset. Close all processes using the

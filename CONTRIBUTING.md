@@ -6,12 +6,11 @@ you can remove or reuse something instead.
 
 ## Setting up
 
-Follow [Try it](README.md#try-it) to get ttsim, then install the test
-dependencies:
+Follow [Try it](README.md#try-it) to set up clang, lld and ttsim, then install
+the test dependencies:
 
 ```sh
 python3 -m pip install numpy pytest ruff
-export TTSIM=/absolute/path/to/libttsim.so
 python3 -m pytest -s test
 ruff check
 ```

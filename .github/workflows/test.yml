@@ -48,11 +48,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
           python -m pip install numpy pytest ruff
-      # The one-chip library, and the two-chip one that test_two_chips copies a tensor between
-      - name: Download ttsim
+      # The two-chip library that test_two_chips copies a tensor between. The one-chip library comes from
+      # baretile.chip ttsim below, as it does for someone trying baretile
+      - name: Download two-chip ttsim
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh.so --pattern libttsim_bh_x2.so --dir "$RUNNER_TEMP/ttsim"
+        run: gh release download v1.11.5 --repo tenstorrent/ttsim --pattern libttsim_bh_x2.so --dir "$RUNNER_TEMP/ttsim"
       # The adapter calls tinygrad's internal APIs, so its tests run on this tinygrad commit. Move the pin and the
       # adapter together.
       - name: Check out tinygrad
@@ -66,10 +67,11 @@ jobs:
           path: ~/.cache/baretile
           key: kernels-${{ github.sha }}
           restore-keys: kernels-
+      - run: python -m baretile.chip ttsim
+      - run: python -m baretile.chip check
       - run: ruff check
       - run: python -m pytest -s test
         env:
-          TTSIM: ${{ runner.temp }}/ttsim/libttsim_bh.so
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
           TINYGRAD: ${{ runner.temp }}/tinygrad
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One

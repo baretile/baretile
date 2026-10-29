@@ -7,12 +7,11 @@ do when a kernel hangs.
 ## Running the tests
 
 Run these from the checkout with Python 3.12 or later, clang and ld.lld on
-`PATH`. Set `TTSIM` to a Blackhole `libttsim.so` (see the
-[README](../README.md#try-it) for where to get one). You'll need NumPy and
-pytest for the tests.
+`PATH`. They use the simulator that `python3 -m baretile.chip ttsim` downloads, or
+the `libttsim.so` that `TTSIM` names. You'll need NumPy and pytest for the tests.
 
 ```sh
-export TTSIM=/absolute/path/to/libttsim.so
+python3 -m baretile.chip ttsim
 python3 -m pytest -s test
 ```
 
