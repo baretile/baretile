@@ -33,7 +33,7 @@ def need_tinygrad(name="tinygrad"):
   if os.environ["TINYGRAD"] not in sys.path: sys.path.insert(0, os.environ["TINYGRAD"])
   return importlib.import_module(name)
 
-def adapter_on(chip):
+def adapter_on(chip):  # the tinygrad adapter, on a runtime of its own over the whole chip
   need_tinygrad()
   from adapters import tinygrad_baretile as adapter
   if adapter.RT is None or adapter.RT.closed: adapter.RT = Runtime(chip)
@@ -229,6 +229,7 @@ def test_tinygrad_fallback_dtypes(chip):
 
 @pytest.mark.parametrize("size", [4, 64])
 def test_tinygrad_jit_reset_host_state(chip, size):
+  # State that a host upload replaced, small enough to upload at once or not, makes TinyJit record again.
   adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   state = Tensor.zeros(size, device="BARETILE").contiguous().realize()
@@ -245,6 +246,7 @@ def test_tinygrad_jit_reset_host_state(chip, size):
   assert len(calls) == 3 and step.replay, "record again after replacing the uploaded host state"
 
 def test_tinygrad_jit_reads_cpu_state(chip):
+  # A captured CPU tensor is read on every call, so TinyJit never replays a recording that froze its value.
   adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   captured, calls = Tensor([0.0, 0.0], device="CPU").realize(), []
@@ -258,6 +260,7 @@ def test_tinygrad_jit_reads_cpu_state(chip):
   assert len(calls) == 4 and add.replay is False
 
 def test_tinygrad_jit_capture_setup_failure(chip):
+  # A recording that fails before it starts leaves no recording behind, so later TinyJits still record.
   adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   step = TinyJit(lambda x: (x + 1).realize())
@@ -270,6 +273,7 @@ def test_tinygrad_jit_capture_setup_failure(chip):
   for n in range(4): assert fresh(Tensor([float(n)], device="BARETILE")).tolist() == [n + 1]
 
 def test_tinygrad_padded_constant_replays(chip):
+  # A pad with a value runs on the chip and replays: the padded constant isn't taken for a uniform one.
   adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   calls = []
@@ -283,6 +287,7 @@ def test_tinygrad_padded_constant_replays(chip):
 
 @pytest.mark.parametrize("op,expected", [("mul", [[16777217, 1], [5, -3]]), ("sum", [16777218, 2]), ("max", [16777217, 5])])
 def test_tinygrad_integer_precision(chip, op, expected):
+  # int32 products, sums and maxima above 2^24 are exact, as in tinygrad, since they run on the host.
   adapter_on(chip)
   from tinygrad import Tensor, dtypes
   values = [[16777217, 1], [5, -3]]
@@ -1183,6 +1188,7 @@ def test_llama_8b_shapes(chip):
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
 def test_benchmark_bad_stack():
+  # An unknown stack is a ValueError, also under python -O.
   import subprocess
   run = subprocess.run([sys.executable, "-O", benchmark.__file__, "bad-stack", "unused-model", "unused-reference"],
                        capture_output=True, text=True, timeout=60)

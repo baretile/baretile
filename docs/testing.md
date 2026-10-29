@@ -57,10 +57,11 @@ GPT2=/path/to/gpt2/model.safetensors python3 -m pytest -s test -k gpt2_model
 LLAMA=/path/to/SmolLM-135M python3 -m pytest -s test -k llama_model
 ```
 
-`LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` raises the
-number of random expressions in the kernel fuzz test above its default of 30. `TTSIM2=/path/to/libttsim.so`
-enables the two-chip test. ttsim's releases include that library as
-`libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2` target.
+`LLAMA8B=1` enables a test at Llama-3.1-8B block dimensions. `FUZZ=n` runs n
+random expressions in the kernel fuzz test instead of 30, when n is more.
+`TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases include
+that library as `libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2`
+target.
 
 `llama.accuracy` compares generated choices with Tenstorrent reference tokens:
 

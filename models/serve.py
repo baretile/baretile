@@ -618,7 +618,7 @@ def described(tools):
 
 def calls(text, tools=()):
   """Parse Qwen XML tool calls into (preceding text, OpenAI tool_calls). Encode arguments as JSON. Keep
-  schema-declared strings as text; parse other values as JSON when possible. tools have the shapes described by checks."""
+  schema-declared strings as text; parse other values as JSON when possible. tools have the shapes that described checks."""
   head, mark, rest = text.partition("<tool_call>")
   props = lambda f: (f.get("parameters") or {}).get("properties") or {}
   schema = {function(t)["name"]: props(function(t)) for t in tools or ()}
