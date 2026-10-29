@@ -5,6 +5,10 @@ them over HTTP. [adapters/](../adapters) lets tinygrad scripts, and PyTorch
 through tinygrad, run on baretile. These are layer 4: they use `Tensor` and add
 the kernels that only they need.
 
+The [first P150a workload](workload.md) fixes the initial release target,
+checkpoint revisions and acceptance checks. The capabilities described here
+are broader than that target; hardware qualification is still pending.
+
 ## Running a model
 
 `models/gpt2.py` and `models/llama.py` can run the same model operations with
