@@ -83,6 +83,44 @@ explain the layout and precision limits.
 To see the kernels a script launched and what each one computes, run it with
 `python3 -m baretile.viz script.py` and open the `viz.html` it writes.
 
+## Run a model
+
+Install baretile with NumPy for the models, then serve a model by its Hugging
+Face ID:
+
+```sh
+python3 -m pip install 'baretile[models]'
+python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000
+```
+
+The server downloads the model the first time, or takes a local folder instead,
+puts it on the chip, and says when it's ready. Then ask it for a completion from
+another terminal:
+
+```sh
+curl http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"prompt": "The meaning of life is", "max_tokens": 4, "temperature": 0}'
+```
+
+On ttsim the answer's text is `" a question that has"`, after about half a minute
+a token, since the simulator runs every core of the chip. The server speaks
+OpenAI's completions and chat completions API, so OpenAI's clients work with it
+too.
+
+[Models](https://github.com/baretile/baretile/blob/main/docs/models.md#running-a-model)
+lists the families baretile runs and how each one is checked, and
+[serving](https://github.com/baretile/baretile/blob/main/docs/models.md#serving)
+covers the server's options. To generate from a local checkpoint and compare
+each token with NumPy's choice:
+
+```sh
+python3 -m baretile.models.llama /path/to/SmolLM-135M "The meaning of life is" 6
+```
+
+tinygrad scripts run on baretile through
+[baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
+and PyTorch runs through tinygrad's torch frontend.
+
 ## Learn baretile
 
 The [ramps](https://github.com/baretile/baretile/tree/main/ramps) teach baretile
@@ -103,53 +141,19 @@ The [documentation](https://github.com/baretile/baretile/blob/main/docs/README.m
 explains the runtime, the compiler, the models and the hardware, and includes a
 map of the code.
 
-## Models
+## Contributing
 
-Install NumPy for the model code and pytest for the tests:
+The tests run on ttsim. They need NumPy and pytest, and some comparisons also
+need PyTorch and transformers, which pytest skips without:
 
 ```sh
 python3 -m pip install numpy pytest
 python3 -m pytest -s test
 ```
 
-The tests run small GPT-2, Llama, mixture-of-experts and Gated DeltaNet models
-and compare their results with NumPy. Some comparisons need PyTorch and
-transformers, and pytest skips them if those packages aren't installed. Tests
-that need checkpoint files are opt-in.
-
-To generate text from a local SmolLM-135M checkpoint:
-
-```sh
-python3 -m baretile.models.llama /path/to/SmolLM-135M "The meaning of life is" 6
-```
-
-You'll need the model's config, tokenizer and safetensors weights in that folder.
-The command runs baretile and NumPy side by side. It prints when they choose
-different tokens, then continues with NumPy's choice.
-
-The loader also handles Llama, Mistral, Qwen2, Qwen2-MoE, Qwen3, Qwen3-MoE,
-Mixtral, gpt-oss and the Qwen3.5/3.6 text models. Most tests use small models. Full checkpoints need
-separate checks, which
+Tests that need checkpoint files are opt-in, and
 [testing](https://github.com/baretile/baretile/blob/main/docs/testing.md#optional-checks)
-lists.
-
-To serve a model through an OpenAI-compatible HTTP API:
-
-```sh
-python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000
-```
-
-This downloads the model if you don't already have it. You can also pass a local
-folder. Requests decode together, and the server can reuse a cached prompt when
-you send the next turn of a conversation.
-[Serving](https://github.com/baretile/baretile/blob/main/docs/models.md#serving)
-has an example request.
-
-tinygrad scripts run on baretile through
-[baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
-and PyTorch runs through tinygrad's torch frontend.
-
-## Contributing
+lists them.
 
 [CONTRIBUTING.md](https://github.com/baretile/baretile/blob/main/CONTRIBUTING.md)
 explains how to run the checks, what the code should look like and how to

@@ -385,16 +385,22 @@ DEFAULTS = dict(head_dim=None, rope=None, partial=None, sliding=None, layer_type
                 shared=0, dense=(), norm_topk=True, limit=None, conv=None, kh=None, vh=None, kd=None, vd=None, mtp=0, tied=False, precision=None)
 def model(**c): return SimpleNamespace(**DEFAULTS | c)  # a config with the given fields, and DEFAULTS for the rest
 
+# The model_type of each family that config reads, or of a multimodal model's text_config. Another one, such as Gemma's,
+# may have weights of the same names but compute differently, so it's refused rather than run wrong.
+TYPES = ("llama", "mistral", "mixtral", "qwen2", "qwen2_moe", "qwen3", "qwen3_moe", "qwen3_5_text", "qwen3_5_moe_text", "gpt_oss")
+
 def config(folder, places=4096):
   """Read config.json, selecting the text config for a multimodal model. Cap places at the model's maximum when
-  sizing RoPE tables."""
+  sizing RoPE tables. Raise ValueError for a model type outside TYPES."""
   j = read_json(os.path.join(folder, "config.json"))
   j = j.get("text_config", j)
+  if (model_type := j.get("model_type")) not in TYPES:
+    raise ValueError(f"{folder}: model type {model_type!r} isn't supported. baretile runs {', '.join(TYPES)}")
   rope = j.get("rope_parameters") or (j.get("rope_scaling") or {}) | {"rope_theta": j["rope_theta"]}  # transformers 5, else the older two
   theta, kind = rope.pop("rope_theta"), rope.pop("type", None)  # older configs say type instead of rope_type
   partial = rope.pop("partial_rotary_factor", j.get("partial_rotary_factor"))
   for k in ("mrope_section", "mrope_interleaved"): rope.pop(k, None)  # Qwen3.5's. A text token's three positions are all the same
-  qwen35 = j.get("model_type", "").startswith(("qwen3_5", "qwen3_next"))  # its RMSNorms scale by 1 + w (centered), and its attention is gated
+  qwen35 = model_type.startswith("qwen3_5")  # its RMSNorms scale by 1 + w (centered), and its attention is gated
   rope.setdefault("rope_type", kind or "default")
   if rope["rope_type"] not in ("default", "llama3", "yarn"): raise ValueError(f"RoPE scaling {rope} isn't supported")
   experts, layers = j.get("num_experts") or j.get("num_local_experts") or 0, j["num_hidden_layers"]
@@ -406,7 +412,7 @@ def config(folder, places=4096):
                moe=j.get("moe_intermediate_size") or (experts and j.get("intermediate_size")) or 0,
                shared=j.get("shared_expert_intermediate_size") or 0, norm_topk=j.get("norm_topk_prob", True),
                dense=[l for l in range(layers) if l in j.get("mlp_only_layers", []) or (l + 1) % j.get("decoder_sparse_step", 1)],
-               limit=j.get("swiglu_limit", 7.0 if j.get("model_type") == "gpt_oss" else None),  # gpt-oss clamps its GLU
+               limit=j.get("swiglu_limit", 7.0 if model_type == "gpt_oss" else None),  # gpt-oss clamps its GLU
                gated=j.get("attn_output_gate", qwen35), centered=qwen35, conv=j.get("linear_conv_kernel_dim"),  # Qwen3.5's
                kh=j.get("linear_num_key_heads"), vh=j.get("linear_num_value_heads"),
                kd=j.get("linear_key_head_dim"), vd=j.get("linear_value_head_dim"),

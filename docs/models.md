@@ -16,9 +16,31 @@ operations with baretile tensors or NumPy arrays. The generation scripts compare
 the two at each step. They feed NumPy's chosen token to both versions on the next
 step, so one disagreement won't make the rest of the comparison useless.
 
-`llama.load` reads a local Hugging Face config and safetensors weights. It
-handles dense Llama-family models, several mixtures of experts, and the text
-models of Qwen3.5 and Qwen3.6. The tokenizer reads byte-level BPE data from
+`llama.load` reads a local Hugging Face config and safetensors weights. It runs
+these families, by the `model_type` in `config.json`, or in its `text_config` for
+a model that also sees images:
+
+| Family | `model_type` | For example | Checked on ttsim |
+| --- | --- | --- | --- |
+| Llama 3, SmolLM | `llama` | Llama-3.1-8B-Instruct, SmolLM-135M | Against transformers |
+| Mistral | `mistral` | Mistral-7B | Against transformers |
+| Mixtral | `mixtral` | Mixtral-8x7B | Against transformers |
+| Qwen2, Qwen2.5 | `qwen2` | Qwen2.5-0.5B | Against transformers |
+| Qwen2-MoE | `qwen2_moe` | Qwen1.5-MoE-A2.7B | Against transformers |
+| Qwen3 | `qwen3` | Qwen3-0.6B | Against transformers |
+| Qwen3-MoE | `qwen3_moe` | Qwen3-30B-A3B | Against transformers |
+| Qwen3.5, Qwen3.6 | `qwen3_5_moe_text`, `qwen3_5_text` | Qwen3.6-35B-A3B | The mixtures of experts against transformers; the dense models not compared |
+| gpt-oss | `gpt_oss` | gpt-oss-20b | Against transformers |
+
+The comparisons use small models with random weights, in `test_hf_families`,
+`test_qwen3_moe` and `test_qwen3_5_moe`. They need PyTorch and transformers,
+and skip without them. SmolLM-135M's real checkpoint is checked against NumPy
+when `LLAMA` names it (`test_llama_model`). None of these models has run on a
+card yet. Another `model_type` fails at load with a `ValueError` that names it,
+since a family such as Gemma has weights of the same names but computes
+differently.
+
+The tokenizer reads byte-level BPE data from
 `tokenizer.json`. It uses the file's merge order and `ignore_merges` setting;
 files without a merge list use token IDs as ranks, as in tiktoken. Split, Digits
 and ByteLevel pre-tokenizers run in their configured order. Bytes missing from
