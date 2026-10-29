@@ -114,9 +114,10 @@ def test_viz(chip, tmp_path):
 
 @pytest.mark.skipif("TTSIM" not in os.environ, reason="the script opens the device again, and a card can't be open in two processes")
 def test_viz_script(tmp_path):
-  # The command runs the script and writes one viz.html containing its runtimes.
+  # The command runs the script and writes one viz.html containing the runtimes still open at the end. The second
+  # runtime replaces the first, whose records went with it.
   (tmp_path / "script.py").write_text("from baretile import pci\nfrom baretile.chip import Chip\nfrom baretile.runtime import Runtime\n"
-                                      "from baretile.tensor import Tensor\nrt = Runtime(Chip(pci.open_device()))\n"
+                                      "from baretile.tensor import Tensor\nchip = Chip(pci.open_device())\nRuntime(chip)\nrt = Runtime(chip)\n"
                                       "print((Tensor.of(rt, [[1.0, 2.0]]) * 3).tolist())\n")
   out = subprocess.run([sys.executable, "-m", "baretile.viz", "script.py"], cwd=tmp_path, capture_output=True, text=True, timeout=300,
                        env=os.environ | {"PYTHONPATH": str(pathlib.Path(__file__).parent.parent)})
@@ -222,7 +223,9 @@ def test_recording_lifetime_and_reuse(chip):
   with first: out = (x + 1).realize()
   first.send()
   assert out.tolist() == [[3]]
-  with first: out = (x * 2).realize()
+  with first:  # a launch that fails its checks isn't recorded, so the recording still replays
+    out = (x * 2).realize()
+    with pytest.raises(ValueError, match="arguments"): rt.launch(bytes(16), (-1,))
   first.send()
   assert out.tolist() == [[4]]
   go = hold(rt)
@@ -447,6 +450,29 @@ def test_disjoint_runtime_tensors(chip):
     assert x.tolist() == [[1, 2]] and y.tolist() == [[7, 8]]
     left, right = (x + 10).realize(), (y * 2).realize()
     assert left.tolist() == [[11, 12]] and right.tolist() == [[14, 16]]
+
+def test_dram_in_reference_cycle(chip, no_gc):
+  # A tensor in a reference cycle holds its DRAM until Python collects it, as a parameter does after backward(). An
+  # allocation that finds no room collects and tries again.
+  with Runtime(chip, end=chip.tensix[1]) as rt:
+    t = Tensor(rt, 32, 256)  # 2 KiB in each bank
+    t.cycle = t
+    for _, n in list(rt.holes): rt.dram_alloc(n)  # take the rest of DRAM
+    del t
+    assert rt.dram_alloc(2048) is not None
+
+def test_takeover_during_tensix_kernel(chip):
+  # A runtime taken over in the middle of a Tensix kernel lets that launch finish first. A worker stopped inside a
+  # Tensix program would leave its coprocessor blocked, and the next runtime's kernels would queue behind it.
+  rt, rng = Runtime(chip, end=chip.tensix[1]), np.random.default_rng(1)
+  q, k, v = (Tensor.of(rt, rng.normal(0, 1, (1, n, 64)).tolist()) for n in (32, 768, 768))
+  places = Tensor.of(rt, [[[767]] * 32], "int32")
+  rt.wait()
+  q.attend(k, v, places).realize()
+  for _ in range(170): chip.pci.tick()  # on ttsim, about 60% of the attention launch
+  rt = Runtime(chip, end=chip.tensix[1])
+  a = Tensor.of(rt, [[1.0, 2.0]])
+  assert (a + a).tolist() == [[2.0, 4.0]]
 
 def test_tensors_and_recordings_reject_closed_runtime(chip):
   rt = Runtime(chip, end=chip.tensix[1])

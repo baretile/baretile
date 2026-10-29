@@ -1,7 +1,8 @@
 # Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings and
 # graphs of fused expressions. It contains its own data and needs a browser with JavaScript enabled.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args]
-# The page includes every runtime created by the script.
+# The page includes the runtimes still open when the script ends. Closing a runtime, or replacing it with an
+# overlapping one, discards its launch records.
 import json, pathlib, runpy, struct, sys
 from baretile import pci, tensor
 from baretile.runtime import TIMES, Runtime
@@ -9,7 +10,7 @@ from baretile.runtime import TIMES, Runtime
 def save(path, *runtimes, since=0):
   """Write completed launches after since for each runtime, limited to its last TIMES launch records.
   This doesn't wait for queued work. Call rt.wait() first to include it, or save the completed work after
-  a timeout or interrupt."""
+  a timeout or interrupt. A closed or replaced runtime raises RuntimeError, since its records went with it."""
   made = {v if isinstance(v, bytes) else v[0]: (k, v) for k, v in tensor.kernels.items()}  # what each image was compiled from
   data = json.dumps([_runtime(rt, since, made) for rt in runtimes]).replace("</", "<\\/")  # nothing in it can close the script tag
   pathlib.Path(path).write_text(pathlib.Path(__file__).with_name("viz.html").read_text().replace("{data}", data))
@@ -72,6 +73,8 @@ if __name__ == "__main__":
   sys.path.insert(0, str(pathlib.Path(sys.argv[0]).resolve().parent))  # what python3 puts first for a script
   try: runpy.run_path(sys.argv[0], run_name="__main__")
   finally:
-    if runtimes:
-      save("viz.html", *runtimes)
-      print(f"wrote viz.html for {len(runtimes)} runtime{'s' * (len(runtimes) > 1)}. Open it in a browser")
+    # A closed or replaced runtime's launch records went with its host memory, so the page holds the open ones
+    if live := [rt for rt in runtimes if not rt.closed]:
+      save("viz.html", *live)
+      print(f"wrote viz.html for {len(live)} runtime{'s' * (len(live) > 1)}. Open it in a browser")
+    elif runtimes: print("no viz.html: the script closed its runtimes, and their launch records went with them", file=sys.stderr)

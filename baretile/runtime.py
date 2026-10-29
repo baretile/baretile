@@ -376,14 +376,12 @@ def _merge_holes(holes):
 _open, _stranded = set(), set()
 
 def _reap(chip, collect=False):
-  """Stop the runtimes on chip that were dropped without close(), and return whether any memory came back. A dropped
-  Runtime is usually in a reference cycle through its cached number tensors, so with collect, collect cycles first."""
+  """Stop the runtimes on chip that were dropped without close(). A dropped Runtime is usually in a reference cycle
+  through its cached number tensors, so with collect, collect cycles first."""
   if collect: gc.collect()
-  freed = False
   for resources in [r for r in _open if r.chip is chip and r.owner() is None]:
-    try: freed |= resources.close()
+    try: resources.close()
     except Exception: pass  # still open, and a later reap, takeover or exit tries again
-  return freed
 
 @atexit.register
 def _exit():  # stop every runtime still running when Python exits, since the card would outlive the host pages
@@ -407,12 +405,23 @@ class _Resources:
     self.active, self.closed, self.started = True, False, False
     _open.add(self)
   def close(self):
-    """Stop the rectangle and release its memory, returning whether the memory came back. If a multicast never
-    finishes or the NoC never drains, stop the cores anyway and keep the memory for the rest of the process, so
-    that another runtime can still take the tiles. If halting fails, the memory stays reserved and close can be retried."""
-    if self.closed: return False
+    """Stop the rectangle and release its memory. The running launch may finish first, and later ones never start.
+    If a multicast never finishes or the NoC never drains, stop the cores anyway and keep the memory for the rest of
+    the process. A hung Tensix program may still need a device reset. If halting fails, the memory stays reserved
+    and close can be retried."""
+    if self.closed: return
     self.active, settled = False, True
     if self.started:
+      # A worker stopped inside a Tensix program leaves its coprocessor blocked, and the next runtime's kernels queue
+      # behind it. So the dispatcher is cancelled first, which stops it before its next go, and the running launch gets
+      # a while to finish. Only then are the workers cancelled, since a kernel's own multicast would spin once they are.
+      mail = lambda x, y: struct.unpack("<8I", self.chip.read(x, y, MAILBOX, 32))
+      finished = lambda m: m[4] == m[0] or m[7] >= m[3]  # the worker reported the launch done, or it had no part in it
+      try:
+        self.chip.write32(*self.end, MCAST_STATE, 1)
+        self.chip.wait(lambda: self.chip.read32(*self.end, MCAST_STATE + 4) == 0, "finish the dispatcher's multicast")
+        self.chip.wait(lambda: all(finished(mail(x, y)) for x, y in self.cores - {self.end}), "finish the running launch")
+      except TimeoutError: pass  # a hung kernel stops where it is
       try:
         self.chip.write32(*self.end, MCAST_STATE, 1, self.start)
         self.chip.wait(lambda: all(self.chip.read32(x, y, MCAST_STATE) == 1 and self.chip.read32(x, y, MCAST_STATE + 4) == 0
@@ -434,11 +443,8 @@ class _Resources:
     del self.chip.taken[self.start, self.end]
     _open.discard(self)
     self.closed = True
-    if not settled:
-      _stranded.add(self)
-      return False
-    self.release()
-    return True
+    if not settled: _stranded.add(self)
+    else: self.release()
   def release(self):  # give the DRAM and the host DMA pages back, once the card can no longer reach them
     _stranded.discard(self)
     self.chip.dram_holes.extend(self.used.items())
@@ -464,8 +470,8 @@ class Runtime:
     self.chip, self.launches, self.wptr = chip, 0, 0
     self.queued = collections.deque()  # (launch, workers) for each launch that may not be done yet
     # DRAM: holes is the chip's list of free (address, size) ranges; used maps this runtime's addresses to sizes.
-    # freed pairs an address with the last queued launch that could use it.
-    self.holes, self.used, self.freed = chip.dram_holes, {}, []
+    # freed pairs an address with the last queued launch that could use it, in launch order.
+    self.holes, self.used, self.freed = chip.dram_holes, {}, collections.deque()
     # loaded maps each kernel image in L1 to its address, and room is where the next one goes
     self.start, self.end, self.loaded, self.room = start, end, {}, KERNELS
     # how many times the loaded kernels were evicted. A recorded command names its kernels by address, so a replay
@@ -501,7 +507,7 @@ class Runtime:
     chip.halt(*end, start)
     try: buf, bus = chip.pci.alloc(1 << 21)  # status, command ring, times, then transfer staging
     except MemoryError:
-      if not _reap(chip, collect=True): raise  # a dropped runtime may hold the hugepage
+      _reap(chip, collect=True)  # a dropped runtime may hold the hugepage
       buf, bus = chip.pci.alloc(1 << 21)
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))
@@ -512,6 +518,7 @@ class Runtime:
     # dram_free then leaves until the last of them closes (pinned_freed)
     self.log, self.pinned, self.pinned_freed = None, collections.Counter(), set()
     self.recorded, self.recorded_bases = None, []  # the active recording's pins, and the allocations from before it
+    self.recorded_made = None  # what the active recording allocates, including storage freed and reused since it began
     self.written = None  # while tensor.jit records a call: the allocations it writes in place
     try:
       (dx, dy), n = self.dispatcher, len(self.cores)
@@ -540,8 +547,9 @@ class Runtime:
     if not self.resources.active: raise RuntimeError("runtime is closed or was replaced by an overlapping runtime")
 
   def close(self):
-    """Stop all workers, cancel queued work and release memory. Call wait() first to finish queued work.
-    Closing twice is harmless; tensors and recordings from this runtime can no longer run."""
+    """Stop all workers, cancel queued work and release memory. The running launch gets a while to finish; call
+    wait() first to finish all queued work. Closing twice is harmless; tensors and recordings from this runtime can
+    no longer run."""
     self.resources.close()
 
   @property
@@ -571,7 +579,7 @@ class Runtime:
     """Queue a compiled kernel, loading it if needed. Divide units between workers in order; the default is one
     unit per worker. Workers receive [first unit, unit count, *args]. name identifies the launch in
     profiles."""
-    self.check()
+    block = self.block([(kernel, args, units, name)])  # checks the launch before a recording keeps it
     if self.log is not None:
       self.log.append((kernel, args, units, name))
       # Raw kernel arguments can contain pointers inside an allocation. Conservatively retain any allocation
@@ -582,7 +590,7 @@ class Runtime:
         if i >= 0:
           addr = self.recorded_bases[i]
           if addr <= value < addr + self.used.get(addr, 0): self.pin(addr)
-    self.send(*self.block([(kernel, args, units, name)]))
+    self.send(*block)
 
   def block(self, launches):
     """Convert [(kernel, args, units, name)] to commands for send, plus (name, worker count, kernel) per launch. Load
@@ -602,7 +610,8 @@ class Runtime:
     except TypeError: raise ValueError("launch units must be an integer in [1, 2**32 - 1]") from None
     if not 1 <= units < 2**32: raise ValueError("launch units must be in [1, 2**32 - 1]")
     n = min(units, len(self.cores))
-    body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
+    try: body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
+    except struct.error: raise ValueError("launch arguments must be integers in [0, 2**32 - 1]") from None
     if len(body) > ARGS_SIZE: raise ValueError(f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}")
     length = -(-(16 + len(body)) // 64) * 64
     if length > len(self.ring): raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
@@ -669,9 +678,10 @@ class Runtime:
   def args(self):  # where the last launch's arguments are on each of its workers. some kernels write results there
     return ARGS + self.launches % 2 * ARGS_SIZE
 
-  def dram_alloc(self, size):
+  def dram_alloc(self, size, collect=True):
     """Allocate size bytes in each of the 8 DRAM banks, at the same address, from the first free hole that's big
-    enough."""
+    enough. If none is, wait for the runtimes on the chip that have queued frees, then collect garbage, stop dropped
+    runtimes and try once more."""
     self.check()
     size = max(64, -(-size // 64) * 64)  # NoC transfers to DRAM want 64-byte alignment
     for i, (addr, room) in enumerate(self.holes):
@@ -679,12 +689,15 @@ class Runtime:
         self.holes[i:i + 1] = [(addr + size, room - size)] if room > size else []
         self.used[addr] = size
         self.pin(addr)
+        if self.recorded_made is not None: self.recorded_made.add(addr)
         return addr
     for resources in self.chip.taken.values():  # another runtime's completed launches can free shared space too
       if resources.active and (rt := resources.owner()) is not None and rt.freed:
         rt.wait()
-        return self.dram_alloc(size)
-    if _reap(self.chip, collect=True): return self.dram_alloc(size)  # and so can stopping runtimes that were dropped
+        return self.dram_alloc(size, collect)
+    if collect:  # garbage can hold DRAM too: tensors in reference cycles, as a parameter is after backward(), and dropped runtimes
+      _reap(self.chip, collect=True)
+      return self.dram_alloc(size, False)
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):
@@ -714,12 +727,12 @@ class Runtime:
   def finished(self): return self.launches - (self.launches - self.read_status(1)) % 2**32  # launches done, from the status
 
   def reclaim(self):  # freed DRAM that no unfinished launch can use goes back into the holes
-    done = self.finished()
+    done, freed = self.finished(), False
     while self.queued and self.queued[0][0] <= done: self.queued.popleft()
-    for launches, addr in [f for f in self.freed if f[0] <= done]:
-      self.freed.remove((launches, addr))
+    while self.freed and self.freed[0][0] <= done:
+      addr, freed = self.freed.popleft()[1], True
       self.holes.append((addr, self.used.pop(addr)))
-      _merge_holes(self.holes)
+    if freed: _merge_holes(self.holes)
 
   def read_status(self, i): self.check(); return int.from_bytes(self.status[4 * i:4 * i + 4], "little")
 
@@ -734,6 +747,7 @@ class Runtime:
     """Poll completion status in host memory until launch number `launch` is done, by default the last one
     queued, then reclaim memory freed by completed launches. On timeout, report the current launch and its
     unfinished workers."""
+    if launch is not None and launch > self.launches: raise ValueError(f"launch {launch} was never queued; the last one queued is {self.launches}")
     launch = self.launches if launch is None else launch
     try: self.until(lambda: self.finished() >= launch, f"finish launch {launch}", timeout)
     except TimeoutError as e:
@@ -741,6 +755,7 @@ class Runtime:
       if current == (self.launches + 1) % 2**32: raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
       n = next((n for launch, n in self.queued if launch % 2**32 == current), 0)
       stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
+      if not stuck: raise TimeoutError(f"{e}: the dispatcher is on launch {current}, whose workers all finished, so it missed a report") from None
       reports = "".join(f"\n  {self.report(c, current)}" for c in stuck[:4])
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{reports}") from None
     self.reclaim()
@@ -755,7 +770,7 @@ class Runtime:
     if mail[0] != launch: return f"{core}: never saw the go of launch {launch} (its last: {mail[0]})"
     left = ["BRISC"] if mail[4] != launch else []
     left += [name for name, done in zip(("TRISC0", "TRISC1", "TRISC2"), triscs[1:]) if done != triscs[0]]
-    lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none: its report to the dispatcher is lost'}",
+    lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none'}",
              "SYNC " + ", ".join(f"{name} {v}" for name, v in zip(SYNC_NAMES, sync)) + "; FLAGS set: "
              + (", ".join(f"{i}={v}" for i, v in enumerate(flags) if v) or "none"),
              f"NoC requests in flight by id: {({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "

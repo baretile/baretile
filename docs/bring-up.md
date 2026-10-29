@@ -34,10 +34,10 @@ Use the Python environment that has the test dependencies.
 
 1. Run `python3 -m baretile.chip`. Check ARC status, the clock, available columns
    and DRAM training before loading worker programs.
-2. Run `python3 -m pytest -s test/test_device.py -k 'config_space or arc'`, then
-   `python3 -m pytest -s test/test_device.py -k 'dma or l1 or dram'`. These test
-   register access and memory transfers that the host drives, including DRAM at
-   the top of each bank.
+2. Run `python3 -m pytest -s test/test_device.py::test_config_space test/test_device.py::test_arc`,
+   then `python3 -m pytest -s test/test_device.py::test_dma test/test_device.py::test_l1 test/test_device.py::test_dram`.
+   These test register access and memory transfers that the host drives,
+   including DRAM at the top of each bank. Nothing runs on the workers yet.
 3. Run `python3 -m baretile.hello`, then the rest of `test/test_device.py`.
    `test_host_memory` checks that a worker can read and write host memory, which
    the dispatcher's commands, uploads and readback depend on. Investigate launch

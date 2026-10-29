@@ -1,6 +1,6 @@
 # PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
 # BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, mmap, os, pathlib, time, weakref
+import array, ctypes, fcntl, gc, mmap, os, pathlib, time, weakref
 from baretile import bh
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
@@ -14,8 +14,10 @@ class Sim:
   it."""
   lib, dma, clocks, counts = None, [], 0, False  # dma: (bus address, size, host address, weak buffer reference). clocks: chip cycles so far
   next_bus = 1 << 32  # where alloc puts the next page: never an address a released page had
+  opened = weakref.WeakValueDictionary()  # bdf: its Sim. two Chips on one chip would hand out the same TLBs and DRAM
   def __init__(self, path, bdf=0):
     Sim.load(path)
+    _claim(lambda: Sim.opened.setdefault(bdf, self) is self, f"ttsim chip {bdf:#x}")
     self.lib, self.bdf = Sim.lib, bdf
     self.bar0 = self.cfg_read(0x10) & ~0xF | self.cfg_read(0x14) << 32  # the TLB windows and registers that baretile uses
 
@@ -25,7 +27,6 @@ class Sim:
       Sim.lib = lib = ctypes.CDLL(path)
       lib.libttsim_pci_config_rd32.restype = ctypes.c_uint32
       lib.libttsim_pci_config_rd32.argtypes = [ctypes.c_uint32] * 2
-      lib.libttsim_pci_config_wr32.argtypes = [ctypes.c_uint32] * 3
       lib.libttsim_pci_mem_rd_bytes.argtypes = lib.libttsim_pci_mem_wr_bytes.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32]
       lib.libttsim_clock.argtypes = [ctypes.c_uint32]
       # the devices reach host memory through these callbacks, so they must stay referenced as long as the library lives
@@ -41,7 +42,6 @@ class Sim:
     return [bdf for bdf in range(0, 1 << 16, 8) if Sim.lib.libttsim_pci_config_rd32(bdf, 0) == bh.DEVICE << 16 | bh.VENDOR]
 
   def cfg_read(self, off): return self.lib.libttsim_pci_config_rd32(self.bdf, off)
-  def cfg_write(self, off, val): self.lib.libttsim_pci_config_wr32(self.bdf, off, val)
 
   def read(self, off, n):
     buf = ctypes.create_string_buffer(n)
@@ -84,10 +84,14 @@ class Card:
     self.sys = f"{SYS}/devices/{bdf}"
     if os.path.exists(f"{self.sys}/iommu_group/type") and (kind := pathlib.Path(self.sys, "iommu_group/type").read_text().strip()) != "identity":
       raise RuntimeError(f"the IOMMU translates DMA from {bdf} ({kind}), but Card gives the card physical addresses. Boot with iommu=pt")
+    # The lock on config space makes this the card's only Card, in any process. It goes when cfg closes
+    self.cfg = os.fdopen(os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0)
+    _claim(lambda: _flock(self.cfg), bdf)
     if os.path.exists(f"{self.sys}/driver"): _write(f"{self.sys}/driver/unbind", bdf)
     _write(f"{self.sys}/enable", "1")
-    self.cfg = os.fdopen(os.open(f"{self.sys}/config", os.O_RDWR | os.O_SYNC), "r+b", buffering=0)
-    self.cfg_write(0x04, self.cfg_read(0x04) | 0x6)  # memory decode, and bus mastering so the device can reach host memory
+    # Memory decode, and bus mastering so the device can reach host memory. Two bytes, since writing Status back would
+    # clear its error bits
+    os.pwrite(self.cfg.fileno(), (self.cfg_read(0x04) & 0xFFFF | 0x6).to_bytes(2, "little"), 0x04)
     # Set Max Read Request Size in the PCI Express capability to 4 KiB, so the device reads host memory in requests of
     # up to 4 KiB. kmd sets it up the same way.
     if at := self.capability(0x10):
@@ -101,7 +105,6 @@ class Card:
     # An earlier user may have set them.
     for i in range(32): self.write(bh.TLB_STRIDED + 4 * i, bytes(4))
   def cfg_read(self, off): return int.from_bytes(os.pread(self.cfg.fileno(), 4, off), "little")
-  def cfg_write(self, off, val): os.pwrite(self.cfg.fileno(), val.to_bytes(4, "little"), off)
   def capability(self, cap):  # the offset of a PCI capability in config space, or 0
     at, seen = self.cfg_read(0x34) & 0xFC, set()
     while at:
@@ -149,6 +152,16 @@ def _store(addr, data):
 def _write(path, s):
   with open(path, "w") as f: f.write(s)
 
+def _flock(f):  # whether this process now holds f's exclusive lock
+  try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError: return False
+  return True
+
+def _claim(take, name):  # take() claims a device for one opener, or returns False if another opener has it
+  if take(): return
+  gc.collect()  # a Chip dropped in this process may still hold the device from a reference cycle
+  if not take(): raise RuntimeError(f"{name} is already open, in this process or another. Share its Chip, or close its runtimes and drop it")
+
 def find_cards():
   """List the Blackholes on the PCI bus by their sysfs names (domain:bus:device.function)."""
   ids = lambda bdf: [int(pathlib.Path(SYS, "devices", bdf, f).read_text(), 16) for f in ("vendor", "device")]
@@ -191,8 +204,11 @@ def release(bdf):
 
 def open_device(n=0):
   """Open chip n. With TTSIM=/path/to/libttsim.so that's chip n of the simulator, which has several in a multi-chip
-  build. Otherwise it's the n-th Blackhole on the PCI bus."""
-  return Sim(os.environ["TTSIM"], Sim.chips(os.environ["TTSIM"])[n]) if "TTSIM" in os.environ else Card(find_cards()[n])
+  build. Otherwise it's the n-th Blackhole on the PCI bus. Only one Chip at a time may have a device open."""
+  sim = "TTSIM" in os.environ
+  found = Sim.chips(os.environ["TTSIM"]) if sim else find_cards()
+  if not 0 <= n < len(found): raise ValueError(f"open_device({n}): there are {len(found)} chips")
+  return Sim(os.environ["TTSIM"], found[n]) if sim else Card(found[n])
 
 def reset(bdf, timeout=10.0):
   """Reset a card whose NoC or firmware has hung, following tt-kmd's ASIC reset. Close all processes using the
