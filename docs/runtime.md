@@ -125,7 +125,10 @@ finish before reusing that space. A recording keeps its memory for later calls.
 `tensor.jit(f)` runs the first call normally and records the second. Later calls
 copy inputs into independent recorded buffers and resend the launches. Repeated
 or overlapping arguments keep their original values, and replay does not overwrite
-the caller's inputs. If kernels have
+the caller's inputs. An input that the function writes in place, with `assign`,
+`put` or `realize(into=...)`, is copied back to the caller's tensor after each
+call, as a normal call would leave it; its storage can't be another input's too.
+A tensor by columns can't be copied, so each call must pass the one recorded. If kernels have
 been evicted, the recording reloads them and rebuilds its commands.
 
 Keep the number of inputs, their runtime, shapes and dtypes fixed from the first

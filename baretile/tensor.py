@@ -189,6 +189,7 @@ class Tensor:
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
     self.realize()
+    _writes(self)
     if x.addr == self.addr: x = Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
     if ids.addr == self.addr: ids = Tensor(self.rt, ids.rows, ids.cols, dtype=ids.dtype).assign(ids)
     return self.realize().run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
@@ -346,6 +347,7 @@ class Tensor:
       if not (into.op is None and into.rep == 1 and not into.runs and (into.shape, into.dtype) == (self.shape, self.dtype)):
         raise ValueError("realize needs a realized destination of the same shape and dtype, not a repeat or a tensor by columns")
       if self.op is None: raise ValueError("realize writes into a destination only from an unrealized tensor. assign copies a realized one")
+      _writes(into)
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
@@ -389,6 +391,7 @@ class Tensor:
     self._same_runtime(x)
     if not (self.op is None and self.rep == 1 and (x.shape, x.dtype) == (self.shape, self.dtype)):
       raise ValueError("assign requires a realized tensor with rep=1 and an x of the same shape and dtype")
+    _writes(self)
     if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     reads = [x] if x.op is None else [s for t in _lazy(x, set()) for s in t.srcs]
     if any(t.addr == self.addr and _layout(t) != _layout(self) for t in reads):
@@ -936,17 +939,25 @@ class Recording:
       self.block = (*self.rt.block(self.launches), evictions)
     self.rt.send(*self.block[:2])
 
+def _writes(t):  # while jit records, note that t's allocation is written in place
+  if t.rt.written is not None: t.rt.written.add(t.addr)
+
 def jit(f):
   """Run f normally on the first call, record the second call's launches, then replay them.
   Later calls copy inputs into the recorded buffers and skip f's Python code.
 
   Keep input shapes and dtypes fixed. Don't replace tensors captured by f or read tensors back to
-  the host inside f. Recorded assign operations can update captured tensors in place. Results and
-  retained tensors, including .grad, reuse their buffers; the next call overwrites their contents."""
-  signature, inputs, out, rec = None, (), None, None
+  the host inside f. Recorded assign operations can update captured tensors in place. An input that f
+  writes in place is copied back to the caller's tensor after each call, so don't pass its storage
+  as another input too. Results and retained tensors, including .grad, reuse their buffers; the next
+  call overwrites their contents."""
+  signature, inputs, out, rec, back = None, (), None, None, ()
+  def shared(xs):  # an input that f writes in place shares its storage with another input, which f then wouldn't see change
+    if any(x.addr == xs[i].addr for i in back for j, x in enumerate(xs) if j != i):
+      raise ValueError("jit copies an input that f writes in place back to the caller, so its storage can't be another input's too")
   @functools.wraps(f)
   def run(*xs):
-    nonlocal signature, inputs, out, rec
+    nonlocal signature, inputs, out, rec, back
     if not xs or not all(isinstance(x, Tensor) for x in xs): raise ValueError("jit inputs must be tensors, with at least one input")
     rt = xs[0].rt
     if any(x.rt is not rt for x in xs): raise ValueError("jit inputs must use the same runtime")
@@ -959,17 +970,28 @@ def jit(f):
       if x.rt is not runtime: raise ValueError("jit inputs must use the recorded runtime")
       if (x.shape, x.dtype) != (shape, dtype): raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
     if rec is None:
-      canonical = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x).requires_grad_(x.requires_grad) for x in xs]
-      with Recording(rt) as recording: result = f(*canonical).realize()
-      inputs, rec, out = canonical, recording, result
+      xs = [x.realize() if x.op is not None else x for x in xs]
+      # A tensor by columns can't be copied, but it's only ever a matmul's B, so nothing in f can write it
+      canonical = [x if x.runs else Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x).requires_grad_(x.requires_grad) for x in xs]
+      rt.written = set()
+      try:
+        with Recording(rt) as recording: result = f(*canonical).realize()
+      finally: written, rt.written = rt.written, None
+      inputs, rec, out, back = canonical, recording, result, [i for i, x in enumerate(canonical) if x.addr in written]
+      shared(xs)
+      for i in back: xs[i].assign(inputs[i])  # leave the caller's tensors as a normal call would
       return out
-    sources = [x.realize() if x.op is not None else x for x in xs]
+    xs = [x.realize() if x.op is not None else x for x in xs]
+    shared(xs)
+    if any(to.runs and x is not to for x, to in zip(xs, inputs)):
+      raise ValueError("jit can't copy a tensor by columns, so each call must pass the one it recorded")
     addresses = {x.addr for x in inputs}
     # A prior result can expose a canonical input. Snapshot every such source before copying any inputs.
-    sources = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x) if x.addr in addresses else x for x in sources]
+    sources = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x) if x.addr in addresses and not x.runs else x for x in xs]
     for x, to in zip(sources, inputs):
       if x is not to: to.assign(x)
     rec.send()
+    for i in back: xs[i].assign(inputs[i])
     return out
   return run
 
