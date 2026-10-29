@@ -15,25 +15,23 @@ tt-metal, tt-umd or LLK.
 
 ## Try it
 
-You'll need Python 3.12 or later, clang with a RISC-V target, lld, and the
-Blackhole library from [ttsim](https://github.com/tenstorrent/ttsim). ttsim's
-[releases](https://github.com/tenstorrent/ttsim/releases) include it as
-`libttsim_bh.so`. You can also build it in a ttsim checkout:
+You'll need Linux, Python 3.12 or later, and clang with a RISC-V target and lld
+(`apt install clang lld` on Debian and Ubuntu). Install baretile, download the
+simulator and check the setup:
 
 ```sh
-./make.py src/_out/release_bh/libttsim.so
+python3 -m pip install baretile
+python3 -m baretile.chip ttsim
+python3 -m baretile.chip check
 ```
 
-We test with ttsim v1.11.5. CI uses its prebuilt `libttsim_bh.so` and
-`libttsim_bh_x2.so`, and builds [ttsim-chaos](https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos)
-from source.
-
-Clone baretile and run its first two commands:
+`chip ttsim` downloads the Blackhole library of
+[ttsim](https://github.com/tenstorrent/ttsim) v1.11.5, the release baretile is
+tested with, into baretile's cache. With no card on the PCI bus, baretile uses it.
+`chip check` says what's missing and how to fix it. Then run the first two
+commands:
 
 ```sh
-git clone https://github.com/baretile/baretile
-cd baretile
-export TTSIM=/absolute/path/to/libttsim.so
 python3 -m baretile.chip
 python3 -m baretile.hello
 ```
@@ -44,15 +42,17 @@ With 120 Tensix tiles, `baretile.hello` prints:
 119 Tensix workers computed fib(30) = {832040}, and one tile dispatched the work
 ```
 
-Keep `TTSIM` set for the examples below. Without it, baretile tries to open a
-Blackhole on the PCI bus. That needs root and takes the card away from its kernel
-driver. See [bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
-before running on a card.
+baretile needs only the standard library. The models and the server also need
+NumPy, so install `'baretile[models]'` for those. The ramps and the tests are in
+the repository.
 
-`pip install baretile` installs the `baretile` package from PyPI. It needs only
-the standard library, and that's enough for the commands above and the tensor
-example below. The models and the server also need NumPy, so install
-`'baretile[models]'` for those. The ramps and the tests are in the repository.
+To use another ttsim build, such as
+[ttsim-chaos](https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos),
+set `TTSIM=/absolute/path/to/libttsim.so`. It comes before a card and before the
+downloaded release. On a machine with a Blackhole and no `TTSIM`, baretile opens
+the card, which needs root and takes the card away from its kernel driver. See
+[bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
+before running on a card.
 
 ## Tensors
 
@@ -125,9 +125,11 @@ and PyTorch runs through tinygrad's torch frontend.
 
 The [ramps](https://github.com/baretile/baretile/tree/main/ramps) teach baretile
 from the top down. Each one is a script that explains its steps and checks
-their results:
+their results. They're in the repository:
 
 ```sh
+git clone https://github.com/baretile/baretile
+cd baretile
 python3 ramps/1_tensors.py
 python3 ramps/2_runtime.py
 python3 ramps/3_tensix.py

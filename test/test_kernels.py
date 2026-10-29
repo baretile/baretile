@@ -133,7 +133,7 @@ def test_viz(chip, tmp_path):
   assert matmul["graph"] == [["in 0", "1x32x64", []], ["read B", "transposed", [0]], ["matmul", "", [0, 1]]]
   assert "graph" not in empty and "text" not in empty and empty["launches"] == 1
 
-@pytest.mark.skipif("TTSIM" not in os.environ, reason="the script opens the device again, and a card can't be open in two processes")
+@pytest.mark.skipif(pci.simulator() is None, reason="the script opens the device again, and a card can't be open in two processes")
 def test_viz_script(tmp_path):
   # The command runs a script, or with -m a module, and writes one viz.html containing the runtimes still open at the
   # end. The second runtime replaces the first, whose records went with it.

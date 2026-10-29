@@ -16,7 +16,7 @@ python3 -m baretile.chip check
 ```
 
 It reads sysfs without touching the card, so it runs without root too. It
-reports whether you're root, whether the IOMMU passes DMA addresses through,
+checks clang and lld, then reports whether you're root, whether the IOMMU passes DMA addresses through,
 how many 2 MiB hugepages are free, whether the PCIe link runs at the card's
 best speed and width, and which driver has the card, with tt-kmd's firmware
 version. It exits with an error if anything would stop baretile. Configure the

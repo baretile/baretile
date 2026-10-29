@@ -2,7 +2,7 @@
 import importlib, json, math, os, pathlib, struct, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
-from baretile import tensor
+from baretile import pci, tensor
 from baretile.tensor import Tensor
 from baretile.runtime import Runtime
 from conftest import bf16, value
@@ -1148,7 +1148,7 @@ assert np.abs(got - want).max() < 0.02 * np.ptp(want) and got.argmax() == want.a
 print("ok")
 """
 
-@pytest.mark.skipif("TTSIM" not in os.environ, reason="a ramp opens the device itself, and a card can't be open in two processes")
+@pytest.mark.skipif(pci.simulator() is None, reason="a ramp opens the device itself, and a card can't be open in two processes")
 @pytest.mark.parametrize("ramp", sorted(p.name for p in (pathlib.Path(__file__).parent.parent / "ramps").glob("*.py")))
 def test_ramp(ramp):
   # Run separately because each ramp opens its own device and ttsim allows one instance per process.
@@ -1431,7 +1431,7 @@ def test_batched_decode(chip):
       assert np.abs(got[u] - want).max() < 0.03 * np.abs(want).max(), (i, u, np.abs(got[u] - want).max())
       s.append(int(want.argmax()))
 
-@pytest.mark.skipif("TTSIM" not in os.environ, reason="the server opens the device itself, and a card can't be open in two processes")
+@pytest.mark.skipif(pci.simulator() is None, reason="the server opens the device itself, and a card can't be open in two processes")
 def test_serve_command(tmp_path):
   # python3 -m baretile.models.serve serves a model folder, which is what fetch makes of a Hugging Face ID, as in the
   # README. A small random Llama answers a completion over HTTP.

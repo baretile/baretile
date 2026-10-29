@@ -1,7 +1,7 @@
 # NoC access through PCIe TLB windows. Chip also reads ARC telemetry and coordinate tables,
 # resets Tensix cores, and transfers data through Ethernet links.
-import struct, time
-from baretile import bh
+import hashlib, importlib.util, pathlib, shutil, struct, subprocess, time
+from baretile import bh, pci
 
 def tlb_config(**fields):
   cfg = 0
@@ -147,17 +147,40 @@ class Chip:
     self.wait(free, f"free Ethernet channel {ch}'s TX queue", timeout)
     for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
 
-# Report firmware, clock, Tensix tiles, DRAM banks and ARC telemetry. Run this before loading kernels on a new
-# card, or set TTSIM to inspect the simulator. For a card, check runs pci.preflight without opening it, release gives
-# it back to tt-kmd (pci.release), and reset calls pci.reset before opening it.
+def check():
+  """Check what baretile needs, without opening the device: clang and lld to build kernels, NumPy for the models, and
+  the simulator or a card, which pci.preflight checks. Return [(level, message)], where level is "ok", "warn" or
+  "fail". baretile can't run after a fail."""
+  targets = subprocess.run(["clang", "--print-targets"], capture_output=True, text=True).stdout if shutil.which("clang") else ""
+  found = [("ok", "clang builds for RISC-V") if "riscv32" in targets else
+           ("fail", "baretile builds kernels with clang for riscv32. Install clang, with its RISC-V target"),
+           ("ok", "ld.lld links the kernels") if shutil.which("ld.lld") else ("fail", "ld.lld isn't on PATH. Install lld"),
+           ("ok", "NumPy is there for baretile.models") if importlib.util.find_spec("numpy") else
+           ("warn", "baretile.models needs NumPy: pip install 'baretile[models]'")]
+  if path := pci.simulator():
+    try: tested = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() == pci.TTSIM_SHA256
+    except OSError as e: return found + [("fail", f"can't read the simulator at {path}: {e.strerror}")]
+    return found + [("ok", f"the simulator at {path} is the tested ttsim release") if tested else
+                    ("warn", f"the simulator at {path} isn't the tested release, {pci.TTSIM_URL}")]
+  try: bdf = pci.find_cards()[0]
+  except RuntimeError as e: return found + [("fail", str(e))]
+  return found + [(level, f"{bdf}: {message}") for level, message in pci.preflight(bdf)]
+
+# Report firmware, clock, Tensix tiles, DRAM banks and ARC telemetry. Run this before loading kernels on a new card,
+# or on the simulator. check runs check() without opening the device, and ttsim downloads the tested simulator
+# (pci.fetch_ttsim). For a card, release gives it back to tt-kmd (pci.release), and reset calls pci.reset before
+# opening it.
 if __name__ == "__main__":
   import os, sys
-  from baretile import pci
   command = sys.argv[1] if len(sys.argv) > 1 else None
-  if command not in (None, "check", "release", "reset"): sys.exit("usage: python3 -m baretile.chip [check | release | reset]")
-  if command and "TTSIM" in os.environ: sys.exit(f"{command} is for a card. ttsim has no driver, and a new process starts it fresh")
+  if command not in (None, "check", "ttsim", "release", "reset"): sys.exit("usage: python3 -m baretile.chip [check | ttsim | release | reset]")
+  if command in ("release", "reset") and "TTSIM" in os.environ:
+    sys.exit(f"{command} is for a card. ttsim has no driver, and a new process starts it fresh")
+  if command == "ttsim":
+    print(f"ttsim is at {pci.fetch_ttsim()}. baretile uses it when TTSIM isn't set and there's no card")
+    sys.exit()
   if command == "check":
-    found = pci.preflight(pci.find_cards()[0])
+    found = check()
     for level, message in found: print(f"{level:5s}{message}")
     sys.exit(any(level == "fail" for level, _ in found))
   if command == "release":

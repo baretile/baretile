@@ -1,6 +1,7 @@
 # Shared chip fixture and tensor helpers. test_device.py covers the device and runtime; test_kernels.py covers
-# code generation and tensors; test_models.py covers models, serving and adapters. Set TTSIM to libttsim.so to
-# use the simulator. Otherwise tests open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
+# code generation and tensors; test_models.py covers models, serving and adapters. They run on the simulator that
+# python3 -m baretile.chip ttsim downloads, or the libttsim.so that TTSIM names. On a machine with a card and no TTSIM,
+# they open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
 import functools, gc, pytest
 import numpy as np
 from baretile import pci
