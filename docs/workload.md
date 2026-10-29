@@ -10,13 +10,14 @@ results. Hardware correctness and performance remain unverified.
 
 ## Fixed inputs
 
-Use these exact revisions, including their tokenizers:
+Use these exact revisions, including their tokenizers. [workload.sha256](workload.sha256)
+holds the checksum of every file.
 
-| Input | Revision | File checksums |
-| --- | --- | --- |
-| [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/tree/0e9e39f249a16976918f6564b8830bc894c89659) | `0e9e39f249a16976918f6564b8830bc894c89659` | [Llama](workload-llama.sha256) |
-| [HuggingFaceTB/SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M/tree/1d461723eec654e65efdc40cf49301c89c0c92f4) | `1d461723eec654e65efdc40cf49301c89c0c92f4` | [SmolLM](workload-smollm.sha256) |
-| [Tenstorrent reference tokens](https://github.com/tenstorrent/tt-metal/blob/9f98dee9c5a4227b3fd866aa6662e02ba2b362af/models/tt_transformers/tests/reference_outputs/Llama-3.1-8B-Instruct.refpt) and book text | tt-metal `9f98dee9c5a4227b3fd866aa6662e02ba2b362af` | [Reference](workload-reference.sha256) |
+| Input | Revision |
+| --- | --- |
+| [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/tree/0e9e39f249a16976918f6564b8830bc894c89659) | `0e9e39f249a16976918f6564b8830bc894c89659` |
+| [HuggingFaceTB/SmolLM-135M](https://huggingface.co/HuggingFaceTB/SmolLM-135M/tree/1d461723eec654e65efdc40cf49301c89c0c92f4) | `1d461723eec654e65efdc40cf49301c89c0c92f4` |
+| [Tenstorrent reference tokens](https://github.com/tenstorrent/tt-metal/blob/9f98dee9c5a4227b3fd866aa6662e02ba2b362af/models/tt_transformers/tests/reference_outputs/Llama-3.1-8B-Instruct.refpt) and book text | tt-metal `9f98dee9c5a4227b3fd866aa6662e02ba2b362af` |
 
 The reference contains 1,024 book tokens and their next-token predictions.
 Use its first 512 tokens verbatim as the prompt, including its initial BOS
@@ -35,7 +36,6 @@ export WORKLOAD_DIR=/absolute/path/to/workload-files
 export LLAMA_DIR="$WORKLOAD_DIR/Llama-3.1-8B-Instruct"
 export SMOLLM_DIR="$WORKLOAD_DIR/SmolLM-135M"
 export REF_DIR="$WORKLOAD_DIR/reference"
-export CHECKSUM_DIR="$PWD/docs"
 mkdir -p "$REF_DIR"
 
 hf download meta-llama/Llama-3.1-8B-Instruct \
@@ -51,7 +51,7 @@ hf download HuggingFaceTB/SmolLM-135M \
   config.json generation_config.json tokenizer.json tokenizer_config.json \
   special_tokens_map.json model.safetensors
 
-export TT_REFERENCE_URL=https://raw.githubusercontent.com/tenstorrent/tt-metal/9f98dee9c5a4227b3fd866aa6662e02ba2b362af/models/tt_transformers/tests
+TT_REFERENCE_URL=https://raw.githubusercontent.com/tenstorrent/tt-metal/9f98dee9c5a4227b3fd866aa6662e02ba2b362af/models/tt_transformers/tests
 curl --fail --location --max-time 120 \
   "$TT_REFERENCE_URL/reference_outputs/Llama-3.1-8B-Instruct.refpt" \
   --output "$REF_DIR/Llama-3.1-8B-Instruct.refpt"
@@ -59,9 +59,7 @@ curl --fail --location --max-time 120 \
   "$TT_REFERENCE_URL/tale-of-two-cities.txt.bz2" \
   --output "$REF_DIR/tale-of-two-cities.txt.bz2"
 
-(cd "$LLAMA_DIR" && sha256sum --check "$CHECKSUM_DIR/workload-llama.sha256")
-(cd "$SMOLLM_DIR" && sha256sum --check "$CHECKSUM_DIR/workload-smollm.sha256")
-(cd "$REF_DIR" && sha256sum --check "$CHECKSUM_DIR/workload-reference.sha256")
+(cd "$WORKLOAD_DIR" && sha256sum --check) < docs/workload.sha256
 ```
 
 Stop if any checksum fails. Use clean model directories: an extra
