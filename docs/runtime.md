@@ -122,25 +122,29 @@ finish before reusing that space. A recording keeps its memory for later calls.
 
 ## Recording repeated work
 
-`tensor.jit(f)` runs the first call normally and records the second. Later calls
-copy inputs into independent recorded buffers and resend the launches. Repeated
-or overlapping arguments keep their original values, and replay does not overwrite
-the caller's inputs. An input that the function writes in place, with `assign`,
-`put` or `realize(into=...)`, is copied back to the caller's tensor after each
-call, as a normal call would leave it; its storage can't be another input's too.
-A tensor by columns can't be copied, so each call must pass the one recorded. If kernels have
-been evicted, the recording reloads them and rebuilds its commands.
+`tensor.jit(f)` runs the first call normally and records the second. Each input
+is recorded where it is, and its address in the launches is a `runtime.Bound`
+argument. Later calls resend the launches with the new inputs' addresses patched
+in, so a replay copies nothing and reads and writes the inputs as a normal call
+would, including inputs passed twice or written in place with `assign`, `put` or
+`realize(into=...)`. A replay copies an input first only when it is laid out
+otherwise than a new tensor of its shape, such as a slice or a repeat, or when
+it is storage that the recording's own results overwrite; a written copy goes
+back to the caller's tensor afterwards. A tensor by columns can't be copied, so
+it must keep the recorded layout. If kernels have been evicted, the recording
+reloads them and rebuilds its commands.
 
 Keep the number of inputs, their runtime, shapes and dtypes fixed from the first
-call. Replay copies input storage without arithmetic, including block-float
-matmul weights. A failed call can be retried; a failed recording releases its abandoned
+call. A failed call can be retried; a failed recording releases its abandoned
 allocations. Deleting a JIT callable releases its recording's allocations once
-queued work finishes. Live tensors and other recordings still keep their storage.
-`Recording.close()` releases a manual recording explicitly; reusing its context
-replaces the old launches and cached commands. Recordings on the same runtime
-cannot nest or replay inside another recording. The function must not read tensors back to
-the host or depend on changing Python state. Results reuse the same buffers, so
-a later call overwrites an earlier result. Copy a result if you need to keep it.
+queued work finishes. Live tensors and other recordings still keep their
+storage. `Recording.close()` releases a manual recording explicitly; reusing its
+context replaces the old launches and cached commands. `Recording.send(binding)`
+gives Bound arguments other values for one replay. Recordings on the same
+runtime cannot nest or replay inside another recording. The function must not
+read tensors back to the host or depend on changing Python state. Results reuse
+the same buffers, so a later call overwrites an earlier result. Copy a result if
+you need to keep it.
 
 Decode works this way because a token's position is tensor data. Moving to the
 next position doesn't require a new shape or a new compiled program.

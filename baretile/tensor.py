@@ -1,7 +1,8 @@
 # Build tensor expressions and compile them into kernels. Fuse operations where possible; compute inputs
 # separately when fusion would exceed a kernel's limits or require a different layout or dtype.
-import array, collections, functools, math, operator
+import array, collections, functools, math, operator, struct
 from baretile import bh
+from baretile.runtime import Bound
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
 from baretile.kernels import attention_plan, link_flags
 from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
@@ -811,6 +812,8 @@ def _parts(t):  # an fp32 matmul operand as bf16 (hi, lo), lo None for bf16. a t
   return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo is t minus t rounded as the bf16 cast rounds, in one kernel
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _plain(t): return (t + 0).realize() if t.rep > 1 else t  # copy a repeat, for a kernel that finds tiles by their position
+def _copy(t): return Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t)  # t in a new tensor of its own
+def _root(t): return t if t.owner is None else t.owner  # the tensor that owns t's storage
 def _rows_free(e):
   """Whether the kernel needs only the output row count, supplied as an argument. Row reductions, transposed B
   and indexed B also need input row counts."""
@@ -912,13 +915,14 @@ def _input(t, inputs):  # the index of a realized tensor among a kernel's inputs
 
 class Recording:
   """Record launches and keep their DRAM allocations for replay. Rebuild commands when a kernel has been
-  evicted from L1. If the kernels don't fit together, replay reloads them in batches."""
-  def __init__(self, rt): self.rt, self.launches, self.block, self.pins, self.active = rt, None, None, set(), False
+  evicted from L1. If the kernels don't fit together, replay reloads them in batches. A replay can give each Bound
+  argument another value, so the same launches read and write other tensors."""
+  def __init__(self, rt): self.rt, self.launches, self.block, self.pins, self.made, self.active = rt, None, None, set(), set(), False
   def close(self):
     """Release this recording's allocations after queued replays finish. Live tensors keep their storage."""
     if self.active: raise RuntimeError("cannot close an active recording")
     self.rt.unpin(self.pins)
-    self.launches, self.block, self.pins = None, None, set()
+    self.launches, self.block, self.pins, self.made = None, None, set(), set()
   def __del__(self):
     if not self.active: self.close()
   def __enter__(self):
@@ -928,36 +932,49 @@ class Recording:
     self.active = True
     return self
   def __exit__(self, kind, *_):
+    bases = set(self.rt.recorded_bases)
     self.launches, self.rt.log = self.rt.log, None
     self.rt.recorded, self.rt.recorded_bases, self.active = None, [], False
+    self.made = self.pins - bases  # what the recording allocated: its results and intermediates
     if kind is not None: self.close()
-  def send(self):
+  def send(self, binding=None):
+    """Queue the recorded launches. binding maps a Bound argument's key to its value for this replay; an argument
+    whose key is missing keeps its recorded value."""
     if self.active or self.launches is None: raise RuntimeError("recording is not ready for replay")
     if self.rt.log is not None: raise RuntimeError("cannot replay while recording on the same runtime")
+    binding = binding or {}
     if self.block is None or self.block[2] != self.rt.evictions:
-      evictions = self.rt.evictions
-      self.block = (*self.rt.block(self.launches), evictions)
-    self.rt.send(*self.block[:2])
+      evictions, take = self.rt.evictions, lambda v: Bound(binding.get(v.key, v), v.key) if isinstance(v, Bound) else v
+      cmds, sent = self.rt.block([(kernel, tuple(map(take, args)), units, name) for kernel, args, units, name in self.launches])
+      # If block had to evict, it already sent part of the commands, and the new eviction count makes the next replay rebuild
+      self.block = (cmds, sent, evictions, self.rt.bound(cmds, self.launches) if len(sent) == len(self.launches) else None)
+      return self.rt.send(cmds, sent)
+    cmds, sent, _, bound = self.block
+    if bound:  # the block holds the values it was built with
+      cmds = bytearray(cmds)
+      for at, v in bound: struct.pack_into("<I", cmds, at, binding.get(v.key, v))
+    self.rt.send(cmds, sent)
 
 def _writes(t):  # while jit records, note that t's allocation is written in place
   if t.rt.written is not None: t.rt.written.add(t.addr)
 
+def _bindable(t):  # whether a replay can read t where it is, laid out as a new tensor of its shape or by columns
+  tr, tc = -(-t.rows // 32), -(-t.cols // 32)
+  return t.runs is not None or (t.offset, t.rep, t.stride, t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
+
 def jit(f):
   """Run f normally on the first call, record the second call's launches, then replay them.
-  Later calls copy inputs into the recorded buffers and skip f's Python code.
+  Later calls send the same launches with the new inputs' addresses and skip f's Python code.
 
-  Keep input shapes and dtypes fixed. Don't replace tensors captured by f or read tensors back to
-  the host inside f. Recorded assign operations can update captured tensors in place. An input that f
-  writes in place is copied back to the caller's tensor after each call, so don't pass its storage
-  as another input too. Results and retained tensors, including .grad, reuse their buffers; the next
-  call overwrites their contents."""
-  signature, inputs, out, rec, back = None, (), None, None, ()
-  def shared(xs):  # an input that f writes in place shares its storage with another input, which f then wouldn't see change
-    if any(x.addr == xs[i].addr for i in back for j, x in enumerate(xs) if j != i):
-      raise ValueError("jit copies an input that f writes in place back to the caller, so its storage can't be another input's too")
+  Keep input shapes and dtypes fixed, and a tensor by columns in the same layout. Don't replace tensors captured by
+  f or read tensors back to the host inside f. Recorded assign operations can update captured tensors and inputs in
+  place, as a normal call would. An input laid out otherwise than a new tensor, such as a slice or a repeat, is
+  copied first, and copied back if f writes it. Results and retained tensors, including .grad, reuse their buffers;
+  the next call overwrites their contents."""
+  signature, runs, wrote, out, rec = None, (), set(), None, None
   @functools.wraps(f)
   def run(*xs):
-    nonlocal signature, inputs, out, rec, back
+    nonlocal signature, runs, wrote, out, rec
     if not xs or not all(isinstance(x, Tensor) for x in xs): raise ValueError("jit inputs must be tensors, with at least one input")
     rt = xs[0].rt
     if any(x.rt is not rt for x in xs): raise ValueError("jit inputs must use the same runtime")
@@ -969,29 +986,27 @@ def jit(f):
     for x, (runtime, shape, dtype) in zip(xs, signature):
       if x.rt is not runtime: raise ValueError("jit inputs must use the recorded runtime")
       if (x.shape, x.dtype) != (shape, dtype): raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
+    xs = [x.realize() if x.op is not None else x for x in xs]
     if rec is None:
-      xs = [x.realize() if x.op is not None else x for x in xs]
-      # A tensor by columns can't be copied, but it's only ever a matmul's B, so nothing in f can write it
-      canonical = [x if x.runs else Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x).requires_grad_(x.requires_grad) for x in xs]
+      # Record on each input where it is, under an address bound to its position. Copy those a replay couldn't read in place.
+      ins = [x._view(x.rows, x.cols, x.batch, 0, x.bstride, x.runs) if _bindable(x) else _copy(x) for x in xs]
+      for i, (x, t) in enumerate(zip(xs, ins)): t.addr, t.requires_grad = Bound(t.addr, i), x.requires_grad
       rt.written = set()
       try:
-        with Recording(rt) as recording: result = f(*canonical).realize()
+        with Recording(rt) as recording: result = f(*ins).realize()
       finally: written, rt.written = rt.written, None
-      inputs, rec, out, back = canonical, recording, result, [i for i, x in enumerate(canonical) if x.addr in written]
-      shared(xs)
-      for i in back: xs[i].assign(inputs[i])  # leave the caller's tensors as a normal call would
+      runs, rec, out, wrote = [x.runs for x in xs], recording, result, {i for i, t in enumerate(ins) if t.addr in written}
+      for i in wrote:
+        if ins[i].owner is None: xs[i].assign(ins[i])  # a copy that f wrote
       return out
-    xs = [x.realize() if x.op is not None else x for x in xs]
-    shared(xs)
-    if any(to.runs and x is not to for x, to in zip(xs, inputs)):
-      raise ValueError("jit can't copy a tensor by columns, so each call must pass the one it recorded")
-    addresses = {x.addr for x in inputs}
-    # A prior result can expose a canonical input. Snapshot every such source before copying any inputs.
-    sources = [Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x) if x.addr in addresses and not x.runs else x for x in xs]
-    for x, to in zip(sources, inputs):
-      if x is not to: to.assign(x)
-    rec.send()
-    for i in back: xs[i].assign(inputs[i])
+    if any(x.runs != r for x, r in zip(xs, runs)): raise ValueError("a jit input by columns must keep the layout it was recorded with")
+    # Copy an input that the recording's own results overwrite, and one a replay can't read in place
+    bound = [x if _bindable(x) and x.addr not in rec.made else _copy(x) for x in xs]
+    rec.send({i: t.addr for i, t in enumerate(bound)})
+    for i in wrote:
+      if bound[i] is not xs[i]: xs[i].assign(bound[i])
+    if isinstance(out.addr, Bound):  # f returned an input, or a view of one: return it on this call's input
+      return bound[out.addr.key]._view(out.rows, out.cols, out.batch, out.offset, out.bstride, out.runs)
     return out
   return run
 

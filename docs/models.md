@@ -211,16 +211,22 @@ Unsupported operations fall back to tinygrad's CPU device. These include
 The adapter preserves the logical dtype through fallback; uint16 values and
 bfloat16 storage use different conversions, and boolean results stay 0 or 1.
 
-`TinyJit` captures the second eligible call into private input buffers, so
-swapping inputs between calls does not overwrite the caller's tensors. Results
-reuse their recorded storage on subsequent calls. Assigning a captured BARETILE
-weight or other buffer invalidates the recording; the next eligible call records
-again. A mixed-device call also discards the recording before running normally.
-Calls that materialize data on the host, bind symbolic variables, pass repeated
-or partial input buffers, store into input buffers, or return an input or a view
-of one execute normally, including aliases inside returned containers.
-Discarded recordings release their allocations after queued work completes. Keep captured
-CPU tensors constant, or pass changing values as BARETILE inputs.
+`TinyJit` records the second eligible call and replays its launches from the
+third. A replay reads each input, and each BARETILE buffer the call captured,
+where it is at that call, so new inputs, a weight or learning rate assigned
+between calls, and buffers that another `TinyJit` updates all replay without
+recording again. What the call stores into a captured buffer is copied back
+into that buffer's storage, and an input that is a result of the recording is
+copied before the replay reads it. Results reuse their recorded storage on
+subsequent calls. A call records again when a buffer the recording reads now
+has another layout, shape or dtype, or when a buffer the recording made or
+uploaded has changed. A mixed-device call discards the recording before running
+normally. Calls that materialize data on the host, bind symbolic
+variables, pass repeated or partial input buffers, store into input buffers, or
+return an input or a view of one execute normally, including aliases inside
+returned containers. Discarded recordings release their allocations after
+queued work completes. Keep captured CPU tensors constant, or pass changing
+values as BARETILE inputs.
 
 PyTorch uses tinygrad's `extra/torch_backend`, which needs a tinygrad checkout,
 PyTorch, a C++ compiler and ninja. `test_torch_frontend` exercises that path.

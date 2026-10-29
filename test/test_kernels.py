@@ -164,18 +164,25 @@ def test_jit_input_aliases(chip):
   assert aliased(exposed[1], exposed[0]).tolist() == [[32]], "captured inputs can be exposed by user code"
 
 def test_jit_writes_inputs(chip):
-  # An input that the function writes in place ends as a normal call would leave it, on the first call, the recorded
-  # one and the replays alike. Its storage can't be another input's too, since the function wouldn't see that one
-  # change. A tensor by columns can't be copied in, so the replays take the one recorded.
+  # Replays read and write the inputs where they are, so an input that the function writes in place ends as a normal
+  # call would leave it, on every call, also when it is passed twice. A slice is copied in and back out. A tensor by
+  # columns is read in place too, so any with the recorded layout will do.
   rt = Runtime(chip)
   x, y = Tensor.full(rt, 1, 1, 0, "fp32"), Tensor.full(rt, 1, 1, 10, "fp32")
   step = tensor.jit(lambda t: t.assign(t + 1))
   assert [step(x).tolist() for _ in range(4)] == [[[1]], [[2]], [[3]], [[4]]] and x.tolist() == [[4]]
   assert step(y).tolist() == [[11]] and (x.tolist(), y.tolist()) == ([[4]], [[11]])
+  rt.wait()
+  launches = rt.launches
+  step(x)
+  assert rt.launches == launches + 1, "a replay on a tensor of its own sends just the recorded launch"
   add = tensor.jit(lambda t, u: t.assign(t + u))
   add(x, y), add(x, y)
-  with pytest.raises(ValueError, match="storage"): add(x, x)
-  assert add(x, y).tolist() == [[37]] and (x.tolist(), y.tolist()) == ([[37]], [[11]])
+  assert add(x, x).tolist() == [[54]] and add(x, y).tolist() == [[65]] and (x.tolist(), y.tolist()) == ([[65]], [[11]])
+  rows = Tensor.full(rt, 64, 32, 0, "fp32")
+  bump = tensor.jit(lambda t: t.assign(t + 1))
+  for _ in range(3): bump(rows[32:64, :])
+  assert value(rows).reshape(64, 32)[[0, 32], 0].tolist() == [0, 3]
   cache = Tensor.full(rt, 64, 32, 0, "fp32")
   write = tensor.jit(lambda c, ids, row: c.put(ids, row))
   for i in range(4): write(cache, Tensor.of(rt, [[i]], "int32"), Tensor.full(rt, 1, 32, i + 1, "fp32"))
@@ -184,7 +191,7 @@ def test_jit_writes_inputs(chip):
   w = Tensor.full(rt, 64, 64, 1).columns()
   times = tensor.jit(lambda w: a @ w)
   assert [times(w).tolist()[0][0] for _ in range(3)] == [64] * 3
-  with pytest.raises(ValueError, match="by columns"): times(Tensor.full(rt, 64, 64, 2).columns())
+  assert times(Tensor.full(rt, 64, 64, 2).columns()).tolist()[0][0] == 128
 
 def test_recording_lifetime_and_reuse(chip):
   rt = Runtime(chip, end=chip.tensix[1])
