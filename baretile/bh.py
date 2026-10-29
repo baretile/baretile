@@ -102,7 +102,6 @@ NIU_REGS = {  # offsets from NIU
   "OUTGOING": 0x280}  # writes with transaction id 0 whose data the NIU hasn't read out of L1 yet
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
            "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
-           "POST": 0x02 | 1 << 7,  # an unacknowledged write on a static VC (class 0), so writes to the same tile stay in order
            "ATOMIC": 0x11 | 1 << 7,  # acknowledged on static VC class 0; completion remains visible after a core stops
            "STATIC": 1 << 7,  # choose VC class 0, preserving request order between the same two tiles
            # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0 of the 16-byte line. OR in i for word i.

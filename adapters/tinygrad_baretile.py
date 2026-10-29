@@ -528,7 +528,7 @@ class BaretileAllocator(Allocator):
 class BaretileDevice(Compiled):
   def __init__(self, device): super().__init__(device, BaretileAllocator(self), [], None)
   def synchronize(self, timeout=None):
-    if RT is not None and RT.resources.active: RT.wait(60 if timeout is None else timeout / 1000)  # tinygrad's timeouts are in milliseconds
+    if RT is not None and not RT.closed: RT.wait(60 if timeout is None else timeout / 1000)  # tinygrad's timeouts are in milliseconds
 
 # inline a tinygrad function as its body, which stores its outputs. precompiled functions too, since tinygrad would
 # cache their program, and baretile runs the graph

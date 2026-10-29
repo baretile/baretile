@@ -51,7 +51,8 @@ class Tensor:
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
     if any(x.rt is not self.rt for x in xs): raise ValueError("tensor operands must use the same runtime")
-    self.rt.check()
+  def _alias(self, into):  # take into's storage as this tensor's
+    self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, _root(into), into.bstride, into.stride, into.offset
 
   def __del__(self):  # free the DRAM. the runtime holds it until the launches queued so far are done
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
@@ -191,16 +192,16 @@ class Tensor:
     if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
     self.realize()
     _writes(self)
-    if x.addr == self.addr: x = Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
-    if ids.addr == self.addr: ids = Tensor(self.rt, ids.rows, ids.cols, dtype=ids.dtype).assign(ids)
-    return self.realize().run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
+    if x.addr == self.addr: x = _copy(x)
+    if ids.addr == self.addr: ids = _copy(ids)
+    return self.run(("put", self.dtype), lambda: put_kernel(self.dtype), *self._where(), *x._where(), ids.addr,
                               ids.offset, x.rows, tc, tr, self.rows, units=self.batch * x.rows * tc, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, runs=None):
     if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
     if self.runs and not runs: raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
-    v.op, v.addr, v.owner = None, self.realize().addr, self if self.owner is None else self.owner
+    v.op, v.addr, v.owner = None, self.realize().addr, _root(self)
     v.offset, v.bstride, v.stride, v.runs = self.offset + offset, bstride, self.stride, runs
     return v
 
@@ -364,20 +365,18 @@ class Tensor:
     _fit(self)
     inputs = []
     e, dtype = _tree(self, inputs)
-    if into is not None and any(t.addr == into.addr and (_layout(t) != _layout(into) or "matmul" in _name(e).split()) for t in inputs):
+    matmul = any(u.op == "matmul" for u in _lazy(self, set()))
+    if into is not None and any(t.addr == into.addr and (_layout(t) != _layout(into) or matmul) for t in inputs):
       into.assign(self.realize())  # finish every source read before any destination tile is overwritten
       self.rt.dram_free(self.addr)
-      self.addr, self.owner = into.addr, into if into.owner is None else into.owner
-      self.bstride, self.stride, self.offset = into.bstride, into.stride, into.offset
+      self._alias(into)
       return self
     shapes = tuple(u.shape for u in inputs)
     # when only the result's rows matter, round the inputs' rows up to tiles, so the same kernel serves any row count
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs), self.rt.readers)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
-    if into is not None:
-      self.addr, self.owner = into.addr, into if into.owner is None else into.owner
-      self.bstride, self.stride, self.offset = into.bstride, into.stride, into.offset
+    if into is not None: self._alias(into)
     else: self.addr = self._alloc()
     self.op, self.srcs = None, ()
     # _where(True) is safe: _expr only lets a tensor by columns in as a matmul's B
@@ -396,7 +395,7 @@ class Tensor:
     if x.op in ("T", "move") or any(t.op == "matmul" for t in _lazy(x, set())): x = x.realize()
     reads = [x] if x.op is None else [s for t in _lazy(x, set()) for s in t.srcs]
     if any(t.addr == self.addr and _layout(t) != _layout(self) for t in reads):
-      x = x.realize() if x.op is not None else Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
+      x = x.realize() if x.op is not None else _copy(x)
     if x.op is not None: x.realize(self); return self
     x = _plain(x)
     return self.run(("copy", self.dtype), lambda: copy_kernel(self.dtype), *self._where(), *x._where(),
@@ -781,12 +780,15 @@ def _fit(t):
   reductions to avoid recomputing them on each pass. Also realize elementwise values shared with work outside
   the reduction. Above MAX_OPS, prefer the largest shared value; otherwise choose a subtree that fits along the
   heaviest branch."""
-  indexed, block = False, None
-  for u in [v for v in _lazy(t, set()) if v.op == "matmul"]:
+  matmuls = lambda: [v for v in _lazy(t, set()) if v.op == "matmul" and id(v) not in kept]
+  indexed, block, kept = False, None, set()
+  while todo := matmuls():
+    u = todo[0]
     dtype = u.srcs[1].dtype
-    if len(u.srcs) == 3 and indexed or dtype in BFP and block is not None and dtype != block:
-      u.realize()  # one index stream and one block-float unpack format per fused kernel
+    if (len(u.srcs) == 3 and indexed) or (dtype in BFP and block is not None and dtype != block):
+      u.realize()  # one index stream and one block-float unpack format per fused kernel. t no longer reaches u's matmuls
     else:
+      kept.add(id(u))
       indexed |= len(u.srcs) == 3
       if dtype in BFP: block = dtype
   if any(u.op in COMBINE for u in _lazy(t, set())):

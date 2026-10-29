@@ -24,19 +24,22 @@ DRAM banks. A custom command ring must be a power of two from 64 bytes through
 Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
 all workers and cancels queued work; call `rt.wait()` first if it must finish.
 Closing first requests cancellation and lets active multicasts finish their
-acknowledgements. Multicast helpers check cancellation before issuing a new
-transfer. It then resets the cores and drains outstanding NoC requests before
-releasing host DMA and DRAM memory.
-Closing again is harmless. Process exit closes every runtime still running.
+acknowledgements; the multicast helpers check for cancellation before issuing a
+new transfer. Closing then resets the cores and drains outstanding NoC requests
+before releasing host DMA and DRAM memory. Closing again is harmless, and process
+exit closes every runtime still running.
+
 Collecting a runtime without closing it doesn't touch the card, since a
 collection can interrupt another runtime's access to the shared TLB window. Its
-cores keep running and its memory stays reserved until the next runtime on the
-chip starts, an allocation finds no free DRAM, or the process exits; any of these
-closes it. If a multicast never finishes or the NoC never drains, closing resets
-the cores anyway and keeps the runtime's host page and DRAM for the rest of the
-process, so a new runtime can still take over a hung rectangle. If resetting the
-cores fails, the memory stays reserved until a later close or takeover succeeds.
-Cleanup only stops its own rectangle.
+cores keep running and its memory stays reserved until a safe point closes it:
+the next runtime on the chip, once Python has collected the dropped one, or an
+allocation of DRAM or a hugepage that finds no room, which collects first. A
+dropped runtime is usually in a reference cycle through its cached number
+tensors, so call `close()` to release it promptly. If a multicast never finishes
+or the NoC never drains, closing resets the cores anyway and keeps the runtime's
+host page and DRAM for the rest of the process, so a new runtime can still take
+over a hung rectangle. If resetting the cores fails, the memory stays reserved
+until a later close or takeover succeeds. Cleanup only stops its own rectangle.
 
 Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
@@ -117,8 +120,9 @@ Runtimes on one `Chip` share the free ranges of its eight DRAM banks. An
 allocation uses the same address range in every bank, taking the first hole
 that's big enough and rounding to 64 bytes. `rt.holes` lists chip-wide free
 ranges; `rt.used` lists that runtime's live and deferred allocations. When you
-free a tensor, queued kernels may still be using its memory. The runtime waits for them to
-finish before reusing that space. A recording keeps its memory for later calls.
+free a tensor, queued kernels may still be using its memory. The runtime waits
+for them to finish before reusing that space. A recording keeps its memory for
+later calls.
 
 ## Recording repeated work
 

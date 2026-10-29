@@ -237,7 +237,7 @@ def test_tinygrad_closed_synchronize(monkeypatch):
   from adapters import tinygrad_baretile as adapter
   from tinygrad import Device
   class Closed:
-    resources = SimpleNamespace(active=False)
+    closed = True
     def wait(self, timeout): raise AssertionError("closed runtime must not be synchronized during interpreter shutdown")
   monkeypatch.setattr(adapter, "RT", Closed())
   Device["BARETILE"].synchronize()
