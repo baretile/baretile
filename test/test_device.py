@@ -5,12 +5,14 @@ from baretile.hello import hello
 from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Runtime, compile_kernel
 
 def test_layers():
-  # Modules in baretile/ import only the standard library and the layers below their own. A layer's tests, and the
-  # helpers in conftest, import nothing above that layer. Outside the tests, no file uses the private names of another
-  # file, whether it imports them or uses them as attributes that only the other file defines.
+  # Modules in baretile/ import only the standard library and the layers below their own. Layer 4, in baretile/models
+  # and baretile/adapters, also uses NumPy, and the adapter tinygrad; tiktoken and PyTorch only where a command needs
+  # them. The models don't use the adapters. A layer's tests, and the helpers in conftest, import nothing above that
+  # layer. No file uses the private names of another file, whether it imports them or uses them as attributes that
+  # only the other file defines.
   root = pathlib.Path(__file__).parent.parent
   order = ["bh", "pci", "chip", "runtime", "hello", "tensix", "kernels", "tensor", "bench", "probe", "viz"]  # layers and their commands
-  trees = {p: ast.parse(p.read_text()) for d in ("baretile", "models", "adapters") for p in sorted((root / d).glob("*.py"))}
+  trees = {p: ast.parse(p.read_text()) for d in ("baretile", "baretile/models", "baretile/adapters") for p in sorted((root / d).glob("*.py"))}
   assert sorted(order) == sorted(p.stem for p in trees if p.parent.name == "baretile"), "every module in baretile/ needs a layer"
   def imports(name, tree, below, also=()):  # each import is from the standard library, from also, or a baretile module in below
     for n in ast.walk(tree):
@@ -20,6 +22,8 @@ def test_layers():
         assert sub.split(".")[0] in below if top == "baretile" else top in sys.stdlib_module_names or top in also, f"{name} imports {m}"
   for p, tree in trees.items():
     if p.parent.name == "baretile": imports(p.name, tree, order[:order.index(p.stem)])
+    if p.parent.name == "models": imports(p.name, tree, order + ["models"], ("numpy", "tiktoken", "torch"))
+    if p.parent.name == "adapters": imports(p.name, tree, order + ["models"], ("numpy", "tinygrad"))
   for name, top in (("conftest", "hello"), ("test_device", "hello"), ("test_kernels", "viz")):
     imports(name, ast.parse((root / "test" / f"{name}.py").read_text()), order[:order.index(top) + 1], ("numpy", "pytest", "conftest"))
   ours, private = {p.stem for p in trees} | {"baretile"}, lambda name: name.startswith("_") and not name.endswith("__")

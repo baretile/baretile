@@ -52,7 +52,7 @@ Use the Python environment that has the test dependencies.
    comes and goes, check the waits that ttsim doesn't model. ttsim-chaos models
    some of them (see [testing](testing.md#ttsim-chaos)).
 7. Run `python3 -m baretile.bench`, and pass `probe=probe.json` to
-   `models/cost.py`.
+   `baretile/models/cost.py`.
 
 ## Giving the card back
 

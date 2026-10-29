@@ -1,20 +1,20 @@
 # OpenAI-compatible HTTP server for the models in llama.py. Requests decode together in separate
 # cache slots. Fixed shapes let steps replay, including when slots are idle. Reuse prompt prefixes
 # from free slots or saved sessions; keep sessions in device DRAM, then host memory as space fills.
-#   TTSIM=/path/to/libttsim.so python3 models/serve.py model [port] [slots] [places] [bf16|bfp8|bfp4|tt|experts] [bf16|bfp8|bfp4|""] [connections]
-# model is a local folder or Hugging Face ID. Then come the precision mode, the KV cache format ("" for the mode's) and
-# the most connections served at once, of which one client address may hold a quarter (serve.server has the default).
+#   TTSIM=/path/to/libttsim.so python3 -m baretile.models.serve model [port] [slots] [places] [mode] [kv] [connections]
+# model is a local folder or Hugging Face ID. mode is the precision (bf16, bfp8, bfp4, tt or experts), kv the KV cache
+# format (bf16, bfp8, bfp4, or "" for the mode's), and connections the most connections served at once, of which one
+# client address may hold a quarter (serve.server has the default).
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
 import codecs, collections, functools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh
 from baretile.kernels import topk_room
 from baretile.tensix import tile_bytes
 from baretile.tensor import Tensor, jit
-from models import gpt2, llama, qwen
+from baretile.models import gpt2, llama, qwen
 
 class Head:
   """The largest logits in a row, with token IDs in descending logit order. lse is log(sum(exp((x-max(x))*t)))
@@ -1141,6 +1141,7 @@ def generation_defaults(config, generation):
   return eos if isinstance(eos, list) else [] if eos is None else [eos], defaults
 
 def main():
+  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.models.serve model [port] [slots] [places] [mode] [kv] [connections]")
   from baretile import pci
   from baretile.chip import Chip
   from baretile.runtime import Runtime

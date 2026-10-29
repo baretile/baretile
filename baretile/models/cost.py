@@ -2,17 +2,16 @@
 # Count weight and cache traffic, matmuls and launches for the chosen precision. Launch counts come
 # from ttsim; default card rates use specifications and assumptions. To use hardware measurements,
 # run python3 -m baretile.probe 8 probe.json, then pass probe=probe.json here.
-#   python3 models/cost.py path/to/model [bf16|bfp8|bfp4|tt|experts] [key=value ...]
+#   python3 -m baretile.models.cost path/to/model [bf16|bfp8|bfp4|tt|experts] [key=value ...]
 # Available settings are in CARD and USE.
 import json, math, os, sys
 from types import SimpleNamespace
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh
 from baretile.kernels import attention_plan, grid_parts
 from baretile.tensix import CHUNKS, tile_bytes
 from baretile.tensor import FIDELITY
-from models import llama
+from baretile.models import llama
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
 # Launches in a decode step, counted on ttsim at Qwen3.6's shapes with eight slots:
@@ -255,5 +254,6 @@ def report(folder, mode="bf16", **keys):
   return "\n".join(out)
 
 if __name__ == "__main__":
+  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.models.cost model [mode] [key=value ...]")
   args = [a for a in sys.argv[2:] if "=" not in a]
   print(report(sys.argv[1], args[0] if args else "bf16", **dict(a.split("=", 1) for a in sys.argv[2:] if "=" in a)))

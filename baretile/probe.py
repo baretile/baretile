@@ -4,7 +4,7 @@
 # The probes use small kernels built with tensix.py and timed by the tile's wall clock.
 # ttsim can check that they run, but its timings don't predict card performance.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.probe [MiB] [out.json]
-# MiB is the upload and readback size (default 8). models/cost.py can read out.json.
+# MiB is the upload and readback size (default 8). baretile.models.cost can read out.json.
 import functools, json, sys, time
 from baretile import bh, pci
 from baretile.chip import Chip

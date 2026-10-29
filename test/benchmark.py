@@ -39,7 +39,7 @@ from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh, pci
-from models import cost, gpt2, llama
+from baretile.models import cost, gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 DEADLINE = 3600  # seconds for a serving workload or a TT-NN demo run
@@ -307,7 +307,7 @@ def baretile(folder, prompt, after, top5, book, s):
       out[f"B3 prefill, {n} tokens"] = {"seconds to first token": seconds, "chunk": chunk,
                                         "roofline": roofline(prefill_work(c, n), seconds)}
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run": f"{type(e).__name__}: {e}"}
-  from models import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
+  from baretile.models import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
   places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
   engine = serve.Engine(rt, t | tables(places), c, llama.Tokenizer(folder), s.users, places)
   threading.Thread(target=engine.run, daemon=True).start()

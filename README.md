@@ -49,9 +49,10 @@ Blackhole on the PCI bus. That needs root and takes the card away from its kerne
 driver. See [bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
 before running on a card.
 
-`pip install baretile` installs the `baretile` package from PyPI. That's enough
-for the commands above and the tensor example below. The ramps, models and
-tests are in the repository.
+`pip install baretile` installs the `baretile` package from PyPI. It needs only
+the standard library, and that's enough for the commands above and the tensor
+example below. The models and the server also need NumPy, so install
+`'baretile[models]'` for those. The ramps and the tests are in the repository.
 
 ## Tensors
 
@@ -119,7 +120,7 @@ that need checkpoint files are opt-in.
 To generate text from a local SmolLM-135M checkpoint:
 
 ```sh
-python3 models/llama.py /path/to/SmolLM-135M "The meaning of life is" 6
+python3 -m baretile.models.llama /path/to/SmolLM-135M "The meaning of life is" 6
 ```
 
 You'll need the model's config, tokenizer and safetensors weights in that folder.
@@ -135,7 +136,7 @@ lists.
 To serve a model through an OpenAI-compatible HTTP API:
 
 ```sh
-python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000
+python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000
 ```
 
 This downloads the model if you don't already have it. You can also pass a local
@@ -145,7 +146,7 @@ you send the next turn of a conversation.
 has an example request.
 
 tinygrad scripts run on baretile through
-[adapters/tinygrad_baretile.py](https://github.com/baretile/baretile/blob/main/adapters/tinygrad_baretile.py),
+[baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
 and PyTorch runs through tinygrad's torch frontend.
 
 ## Contributing

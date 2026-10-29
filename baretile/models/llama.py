@@ -2,17 +2,16 @@
 # greedy choices from pretrained weights. Decode uses a fixed KV cache and replays from its third
 # call onward. Several sequences can decode together in separate cache slots.
 # Qwen-specific experts, Gated DeltaNet and multi-token prediction are in qwen.py.
-#   TTSIM=/path/to/libttsim.so python3 models/llama.py path/to/SmolLM-135M "prompt" [tokens] [bf16|bfp8|bfp4|tt|experts]
-#   ... python3 models/llama.py path/to/model path/to/<model>.refpt [steps] [mode] [numpy]
+#   TTSIM=/path/to/libttsim.so python3 -m baretile.models.llama path/to/SmolLM-135M "prompt" [tokens] [bf16|bfp8|bfp4|tt|experts]
+#   ... python3 -m baretile.models.llama path/to/model path/to/<model>.refpt [steps] [mode] [numpy]
 # The folder needs config.json, tokenizer.json and safetensors weights, with an index for sharded weights.
 # precision() defines the weight formats and fidelity for each mode. NumPy uses the converted weight
 # values too. Append numpy to a reference accuracy command to run it without a chip.
 import functools, heapq, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile.tensor import Tensor, jit
-from models import gpt2, qwen
+from baretile.models import gpt2, qwen
 
 def fns(x):
   """Adapt NumPy and baretile operations to the same model code. mm accepts fidelity phases for the chip; NumPy
@@ -639,6 +638,8 @@ class Tokenizer:
   def decode(self, ids): return b"".join(self.bytes[i] for i in ids).decode("utf-8", "replace")
 
 def main():
+  if len(sys.argv) < 2:
+    sys.exit('usage: python3 -m baretile.models.llama model ["prompt"] [tokens] [mode], or model reference.refpt [steps] [mode] [numpy]')
   from baretile import pci
   from baretile.chip import Chip
   from baretile.runtime import Runtime

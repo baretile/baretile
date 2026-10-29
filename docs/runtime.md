@@ -177,10 +177,10 @@ NoC. That includes other tiles' L1 and local copies. You can't use the byte
 count as a DRAM measurement unless you know where the kernel reads from.
 
 `baretile.viz` shows the same records as a page you open in a browser. Run any
-script under it:
+script under it, or with `-m` a module, as `python3 -m` would:
 
 ```sh
-python3 -m baretile.viz models/llama.py /path/to/SmolLM-135M "The meaning of life is" 6
+python3 -m baretile.viz -m baretile.models.llama /path/to/SmolLM-135M "The meaning of life is" 6
 ```
 
 The script runs as it would under `python3`. If it creates a runtime, the wrapper

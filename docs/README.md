@@ -24,8 +24,8 @@ python3 ramps/3_tensix.py
 3. [Tensix](../ramps/3_tensix.py): unpack, math and pack programs written by
    hand, including a matmul and the SFPU, compared with what `Tensor` compiles.
 
-After the ramps, [models/gpt2.py](../models/gpt2.py) is a whole model in under
-200 lines. It runs the same code on baretile tensors and NumPy arrays.
+After the ramps, [baretile/models/gpt2.py](../baretile/models/gpt2.py) is a whole
+model in under 200 lines. It runs the same code on baretile tensors and NumPy arrays.
 
 ## Pages
 
@@ -41,12 +41,13 @@ After the ramps, [models/gpt2.py](../models/gpt2.py) is a whole model in under
 
 ## How the pieces fit
 
-Each module in `baretile/` imports only the standard library and the layers
-below it. `bh.py` holds hardware constants, `pci.py` opens the device, and `chip.py`
-reads and writes through the network on chip (NoC). The runtime uses these
+Each module imports only the layers below it, and layers 0 to 3 need only the
+standard library. `bh.py` holds hardware constants, `pci.py` opens the device,
+and `chip.py` reads and writes through the network on chip (NoC). The runtime uses these
 modules to load and launch programs. The compiler builds kernels from Tensix
-instructions, and `Tensor` compiles expressions into those kernels. Models and
-adapters live outside `baretile/`.
+instructions, and `Tensor` compiles expressions into those kernels. The models and
+adapters are layer 4, in `baretile/models/` and `baretile/adapters/`, and also use
+NumPy.
 
 `Tensor` builds an expression when you add, multiply or reduce. `realize()` turns
 that expression into kernels and queues them. `tolist()` also waits and copies
@@ -75,8 +76,8 @@ tile running a kernel; a tensor tile is the data it processes.
 | 3, kernels and tensors | [kernels.py](../baretile/kernels.py) | Fused elementwise, matmul and reduction kernels, attention, data movement and `topk` |
 | | [tensor.py](../baretile/tensor.py) | `Tensor`: lazy expressions, broadcasting, views, storage formats, autograd and `jit` |
 | Commands | [hello.py](../baretile/hello.py), [bench.py](../baretile/bench.py), [probe.py](../baretile/probe.py), [viz.py](../baretile/viz.py) | The fib demo, a matmul benchmark, card measurements and the launch viewer |
-| 4, on top | [models/](../models) | GPT-2, the Llama loader and its families, the server and the cost model |
-| | [adapters/](../adapters) | The BARETILE device for tinygrad |
+| 4, on top | [baretile/models/](../baretile/models) | GPT-2, the Llama loader and its families, the server and the cost model |
+| | [baretile/adapters/](../baretile/adapters) | The BARETILE device for tinygrad |
 
 A kernel that only one workload uses stays in layer 4 next to that workload.
-For example, Gated DeltaNet's decode kernel is in `models/qwen.py`.
+For example, Gated DeltaNet's decode kernel is in `baretile/models/qwen.py`.

@@ -7,7 +7,7 @@ from baretile.tensor import Tensor
 from baretile.runtime import Runtime
 from conftest import bf16, value
 import benchmark, train
-from models import cost, gpt2, llama, qwen, serve
+from baretile.models import cost, gpt2, llama, qwen, serve
 
 def test_train(chip):
   # Train a two-block GPT on a fixed counting sequence so documentation edits don't change the test data.
@@ -35,7 +35,7 @@ def need_tinygrad(name="tinygrad"):
 
 def adapter_on(chip):  # the tinygrad adapter, on a runtime of its own over the whole chip
   need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  from baretile.adapters import tinygrad_device as adapter
   if adapter.RT is None or adapter.RT.closed: adapter.RT = Runtime(chip)
   return adapter
 
@@ -298,7 +298,7 @@ def test_tinygrad_integer_precision(chip, op, expected):
 
 def test_tinygrad_closed_synchronize(monkeypatch):
   need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  from baretile.adapters import tinygrad_device as adapter
   from tinygrad import Device
   class Closed:
     closed = True
@@ -1118,7 +1118,7 @@ for dtype in ("bfp8", "bfp4"):
     assert view.to(rts[1], ch, back).tobytes() == view.tobytes()
 import numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
 from types import SimpleNamespace
-from models import gpt2, llama
+from baretile.models import gpt2, llama
 c, rng = llama.model(dim=128, heads=4, kv=2, layers=2, eps=1e-5, theta=1e4), np.random.default_rng(3)
 draw = lambda mean, std, shape: gpt2.bf16_floats(gpt2.bf16_bits(rng.normal(mean, std, shape)))
 w = {f"layers.{l}.{k}": draw(*how) for l in range(2) for k, how in (("input_layernorm", (1, 0.1, (1, 128))), ("qkv_proj", (0, 0.05, (128, 256))),
@@ -1982,7 +1982,7 @@ def test_serve(chip, tmp_path):
   together = [serve.Request(tok, p, 6, 0) for p in prompts]
   for r in together: engine.waiting.put(r)
   together = [done(r) for r in together]
-  def greedy(prompt, n):  # numpy's tokens for the same prompt, as models/llama.py decodes
+  def greedy(prompt, n):  # numpy's tokens for the same prompt, as baretile.models.llama decodes
     kv, ids = llama.kv_cache(c, 64, np.zeros), list(prompt)
     logits = llama.forward(ids, list(range(len(ids))), w, c, kv)[0]
     for i in range(n - 1): ids.append(int(logits.argmax())); logits = llama.forward(ids[-1:], [len(ids) - 1], w, c, kv)[0]
@@ -2383,7 +2383,7 @@ def test_cost_draft_head():
   assert step.flops == 2 * 4 * (s.values + s.draft_values + head) + 2 * 4 * 4 * 64 * 10
 
 def test_cost(tmp_path):
-  # models/cost.py works from a config alone. Qwen3.6-35B-A3B has 35.5B parameters (0.9B in the multi-token prediction
+  # baretile.models.cost works from a config alone. Qwen3.6-35B-A3B has 35.5B parameters (0.9B in the multi-token prediction
   # layer) and reads 2.95B a token, about 21.9 GB in the one-card formats. Its KV cache is 20 KB a token (10 attention
   # blocks with 2 KV heads of 256), and its Gated DeltaNet states are 66 MB a session (30 blocks of 32 heads of 128 x
   # 128 in fp32, plus the last 3 conv inputs). Llama-3.1-8B reads benchmark.py's 6.20 GB a token, within 2%. At 256
