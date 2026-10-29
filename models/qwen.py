@@ -445,7 +445,7 @@ def delta(S, x, conv, taps, dt, decay, live=None, first=None, accept=None, conv2
   kh, extra = divmod(width - vh * vd, 2 * kd)
   if extra or kh < 1 or vh % kh: raise ValueError("delta needs complete q/k/v projections and value heads in groups of key heads")
   aux = (first, accept, conv2)
-  if m not in (1, 2) or any(t is not None for t in aux) != (m == 2) or m == 2 and any(t is None for t in aux):
+  if m not in (1, 2) or any((t is None) == (m == 2) for t in aux):
     raise ValueError("delta needs one token, or two tokens with first, accept and conv2 together")
   ins = (S, x, conv, taps, dt, decay, *(aux if m == 2 else ()))
   if not all(t.dtype == "fp32" for t in ins): raise ValueError("delta needs fp32 states and inputs")
@@ -600,7 +600,8 @@ def group(ids, n):
   return order, tiles, places
 
 def touched_l1(rows, k, n):
-  """The output tile's L1 address for touched. Reject frames beyond the worker's data area."""
+  """The L1 address of touched's output tile, after its ids, weights and expert list. Reject inputs that would put
+  the end of the tile past OUTS."""
   if type(n) is not int or n < 1: raise ValueError("touched needs a positive integer expert count")
   out = (DATA + -(-rows // 32) * 6144 + 4 * -(-n // 32) + 4 * min(rows * k, n) + 63) // 64 * 64
   if out + 4096 > OUTS: raise ValueError(f"touched inputs and expert list do not fit L1: {rows} rows, {k} choices, {n} experts")

@@ -15,13 +15,13 @@ so one disagreement won't make the rest of the comparison useless.
 `llama.load` reads a local Hugging Face config and safetensors weights. It
 handles dense Llama-family models, several mixtures of experts, and the text
 models of Qwen3.5 and Qwen3.6. The tokenizer reads byte-level BPE data from
-`tokenizer.json`. It uses the supplied merge order and `ignore_merges` setting;
-files without a merge list use token IDs as ranks, as in tiktoken. Unsupported
-BPE dropout, subword affixes, byte fallback and unknown-token replacement are
-rejected when loading. With no unknown token, missing alphabet bytes are skipped
-before merging. Split, Digits and ByteLevel stages run in their configured order;
-ByteLevel prefix-space insertion is unsupported.
-The standalone GPT-2 command also needs `tiktoken`.
+`tokenizer.json`. It uses the file's merge order and `ignore_merges` setting;
+files without a merge list use token IDs as ranks, as in tiktoken. Split, Digits
+and ByteLevel pre-tokenizers run in their configured order. Bytes missing from
+the alphabet are skipped before merging, as Hugging Face BPE does with no unknown
+token. Loading raises `ValueError` for BPE dropout, subword affixes, byte
+fallback, an unknown token or ByteLevel's prefix space, which the tokenizer
+doesn't implement. The standalone GPT-2 command also needs `tiktoken`.
 From Python in a checkout, import these helpers with `from models import llama`
 or `from models import serve`. Models and adapters are outside the PyPI package.
 
@@ -61,14 +61,16 @@ the new state.
 Models with a multi-token prediction layer can draft a token and verify it with
 the next token. Verification keeps state after the first token and after both
 tokens. The next step reads whichever state matches the accepted tokens.
-Free server slots leave their recurrent states unchanged. DeltaNet decode requires
-key and value head dimensions divisible by 32, and validates speculative state
-shapes before launching. Truncating a hybrid to only its recurrent blocks is
-supported; these stacks use the RoPE tables for position capacity, or the
-server's explicit slot capacity.
+Free server slots leave their recurrent states unchanged. DeltaNet needs key and
+value head dimensions that are multiples of 32. A hybrid cut down to its
+recurrent blocks also runs. With no attention cache to give the positions per
+sequence, `llama.forward` takes them from its `capacity` argument, which the
+server passes, or else from the RoPE tables.
 
-Expert routing rejects chunks whose choices and expert list do not fit worker
-L1. Reduce the prefill chunk size for these layouts.
+Expert routing holds a prompt chunk's choices in one worker's L1, so it raises
+`ValueError` for a chunk too large for that, several thousand tokens. The
+server's chunks of 2,048 tokens fit. From Python, `serve.Engine(chunk=...)` and
+`llama.prefill`'s `tokens` set the chunk.
 
 ## Serving
 
@@ -80,16 +82,16 @@ connection limit:
 python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16
 ```
 
-Here, four requests can run at once, with 512 positions per slot. The slot
-capacity must fit both loaded RoPE tables; construction rejects a larger value.
-Choose a multiple of 32 for that size, and leave room for the answer as well as the
-prompt. The engine also reserves positions at the end for inactive slots.
+Here, four requests can run at once, with 512 positions per slot. Choose a
+multiple of 32 that the model's RoPE tables cover, and leave room for the answer
+as well as the prompt. The engine also reserves positions at the end for
+inactive slots.
 
 Downloads go to `~/.cache/baretile/hub`. `HF_TOKEN` supplies access to a gated
-model, and `HF_ENDPOINT` changes the download endpoint. Redirects retain that
-credential only within the same origin, including its scheme and port. Completed
-downloads are reused. The server binds to all interfaces on the selected port and has no API
-key check.
+model, and `HF_ENDPOINT` changes the download endpoint. A redirect to another
+origin (scheme, host or port) doesn't get the token. Completed downloads are
+reused. The server binds to all interfaces on the
+selected port and has no API key check.
 
 It serves `GET /v1/models`, `POST /v1/completions` and
 `POST /v1/chat/completions`. For the example above:
@@ -104,28 +106,33 @@ Set `stream` to true in the request to receive tokens as they're generated.
 You can set temperature, top_k, top_p, min_p, seed, stop strings and repetition
 penalties. Defaults come from the model's `generation_config.json` when present.
 Prompts must contain at least one token. `max_tokens` must be a positive integer;
-`top_k=0` keeps all tokens. Temperature must be nonnegative, `top_p` in `(0, 1]`,
-`min_p` in `[0, 1]`, and repetition penalties positive. Nonzero temperatures
-must have an inverse representable as a normal fp32 value. Penalties must fit
-fp32, and repetition penalties must also be normal. Invalid requests get HTTP
-400 before they take a slot.
+`top_k=0` keeps all tokens. Temperature must be nonnegative, `top_p` in `(0, 1]`
+and `min_p` in `[0, 1]`. The chip takes the inverse of a nonzero temperature as
+fp32, so it must be a normal fp32 value. Presence and frequency penalties must
+fit fp32, and a repetition penalty must be a positive normal fp32 value, so
+penalized logits stay finite. Invalid requests get HTTP 400 before they take a
+slot.
 
-Each connection has 10 seconds to send its headers and body. Bodies require one
-nonnegative `Content-Length`, may contain at most 8 MiB, and cannot use chunked
-transfer encoding. Expired bodies get HTTP 408; oversized bodies get HTTP 413.
-Each connection has a handler thread. By default at most 4 × (slots + 8)
-connections have handlers, 48 for four slots, and one client address may hold a
-quarter of them, which is more than the slots. So one client can use every slot,
-but its idle sockets can't take every handler. Past the total limit a connection
-gets HTTP 503; past its address's share, HTTP 429. Behind a proxy all clients
-share its address, so raise the limit there. The seventh argument sets the total,
-for example `python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16 "" 64`,
-where `""` keeps the precision's KV format. `serve.server` exposes these limits as
-`input_wait`, `body_limit`, `connections` and `per_client`.
+A connection has 10 seconds to send its headers and body, or it gets HTTP 408.
+The body needs one `Content-Length` and no chunked transfer encoding (HTTP 400),
+and at most 8 MiB (HTTP 413). Each connection has a handler thread. By default
+at most 4 × (slots + 8) connections have handlers, 48 for four slots, and one
+client address may hold a quarter of them, which is more than the slots. So one
+client can use every slot, but its idle sockets can't take every handler. Past
+the total a connection gets HTTP 503, and past its address's share HTTP 429,
+each with a JSON error that names the limit. The seventh argument sets the
+total, for example
+`python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16 "" 64`, where
+`""` keeps the precision's KV format. Behind a reverse proxy every client has the
+proxy's address, so they share a quarter of the handlers. To give that address
+all of them, start the server from Python as `serve.main` does, and pass
+`per_client` equal to `connections` to `serve.server`. It also takes
+`input_wait` and `body_limit`.
 
-EOS tokens and sampling defaults are resolved per field from the generation
-config, then the selected text-model config, then the outer model config. An
-explicit null EOS disables automatic end tokens.
+EOS tokens and sampling defaults come from `generation_config.json`, then from
+`text_config` in `config.json` (a multimodal model's text model), then from the
+rest of `config.json`, field by field. An explicit null EOS means no automatic
+end token.
 
 The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request
@@ -143,15 +150,16 @@ processed a prefix of it. It can also restore a saved session with its tokens,
 KV cache and recurrent state. DeltaNet must resume from the exact tokens that
 produced its state.
 
-Sessions are saved in spare DRAM on the chip. The server evicts old sessions
-before allocating a new snapshot. When device space is insufficient, it reads
-the snapshot directly into host memory. The host cache has a size limit too; a
-snapshot that cannot fit is dropped without failing the request. Restoring a
-snapshot from host memory uploads all of it before changing the slot. If DRAM
-can't hold it, the server frees what it uploaded, drops the snapshot and
-prefills the prompt as if there were no snapshot. Prompt snapshots
-include the prediction layer's final cache update when speculation is enabled.
-The response's usage field counts the prompt tokens that were reused.
+Sessions are saved in spare DRAM on the chip. To make room for a new one, the
+server moves the least recently used sessions to host memory. A session that
+doesn't fit in DRAM is saved straight to the host. The host cache has a size
+limit too, past which the oldest sessions are dropped; a session too large for
+it isn't saved, and its request still succeeds. Restoring a session from host
+memory uploads all of it before it changes the slot. If DRAM can't hold it, the
+server frees what it uploaded, drops the session and prefills the prompt from
+the start. With speculation, a session saved after its prompt includes the
+prediction layer's cache rows for that prompt. The response's usage field counts
+the prompt tokens that were reused.
 
 ## Sampling and API limits
 
@@ -162,22 +170,24 @@ sampling requests do too, so they can read much more data back to the host.
 
 Chat templates are written in Python, so a model with a new template may need
 code in `serve.py`. Qwen tool calls are returned in `tool_calls`, and reasoning
-goes in `reasoning_content`. Each tool needs a function with a nonempty name. Its
-`parameters`, if not null, must be an object, with `properties` mapping names to
-schemas; other tool shapes get HTTP 400, as do bodies nested too deeply for
-Python's JSON parser. Streams buffer partial reasoning markers so delimiter
-characters do not leak into either field. `tool_choice` and JSON response formats constrain
-which tokens can be sampled. `test_chat_tools` and `test_serve` have example
-requests to start from when adding a model or client.
+goes in `reasoning_content`. Each tool needs a function with a nonempty name.
+Its `parameters`, if not null, must be an object, with `properties` mapping
+names to schemas. Other tool shapes get HTTP 400, as do bodies nested too deeply
+for Python's JSON parser. A stream holds back text that may begin a reasoning or
+tool-call marker until the marker is complete or ruled out. `tool_choice` and
+JSON response formats constrain which tokens can be sampled. `test_chat_tools`
+and `test_serve` have example requests to start from when adding a model or
+client.
 JSON schemas support types, properties, required fields, additional properties,
 arrays, enums, constants, alternatives and nonrecursive local references.
 Sibling constraints intersect, including fields beside `$ref`, following the
 [JSON Schema 2020-12 reference rules](https://json-schema.org/draft/2020-12/json-schema-core#section-8.2.3.1).
 Enums and constants match decoded JSON values; strings accept literal Unicode
-and JSON escapes. A token may contain only part of a UTF-8 character. Generation
-keeps those bytes pending and reports an error if no token can complete the
-constraint. It does not label an incomplete constrained answer as a successful
-stop.
+and JSON escapes. A token may end partway through a UTF-8 character, and the
+constraint checks that the character can still complete. If no token can
+continue a constrained answer, or it stops before it's complete (at a stop
+string, say), the request ends with an error: HTTP 500, or `finish_reason`
+`error` in a stream.
 
 `serve.formatted` documents the supported subset. String patterns, formats and
 numeric bounds are not enforced. Generation allows at most one whitespace

@@ -23,14 +23,20 @@ class Head:
   def __init__(self, values, ids, lse, row): self.values, self.ids, self.lse, self.row = np.asarray(values, np.float64), ids, float(lse), row
   @staticmethod
   def of(logits, t=1.0, k=64):  # finds the k-th largest with a partition, then sorts the logits at least that large. Ties keep the lower id first
-    logits = np.asarray(logits, np.float64)
-    if logits.ndim != 1 or not logits.size or np.isnan(logits).any() or np.isposinf(logits).any() or not np.isfinite(logits).any():
-      raise ValueError("sampling needs a nonempty logit row with a finite maximum and no NaN")
+    logits = finite(np.asarray(logits, np.float64))
     bar = np.partition(logits, len(logits) - k)[len(logits) - k] if k < len(logits) else logits.min()
     ids = np.flatnonzero(logits >= bar)
     ids = ids[np.argsort(-logits[ids], kind="stable")][:k]
     m = float(logits[ids[0]])
     return Head(logits[ids], ids, math.log(np.exp((logits - m) * t).sum()), lambda: logits)
+
+def finite(logits):  # logits that sampling can use: a nonempty row whose maximum is finite, so no logit is NaN or +inf
+  if logits.ndim != 1 or not logits.size or not np.isfinite(logits.max()):
+    raise ValueError("sampling needs a nonempty logit row with a finite maximum and no NaN")
+  return logits
+
+def unsure(text, marks):  # how many characters at the end of text may begin one of marks
+  return max((k for m in marks for k in range(1, len(m)) if text.endswith(m[:k])), default=0)
 
 def scale(r): return 1 / r.temperature if r and r.temperature > 0 else 1.0  # the 1/temperature of a request. Any value works for greedy
 
@@ -75,13 +81,13 @@ class Request:
       except OverflowError: valid = False
       if not valid: raise ValueError(f"{name} must be a finite number")
     if temperature < 0: raise ValueError("temperature must be nonnegative")
-    fp32 = np.finfo(np.float32)
-    if temperature and not float(fp32.tiny) <= 1 / temperature <= float(fp32.max):
-      raise ValueError("inverse temperature must fit a normal fp32 value, or temperature must be zero")
-    if any(abs(v) > float(fp32.max) for v in (presence, frequency, repetition)) or 0 < repetition < float(fp32.tiny):
-      raise ValueError("penalties must fit fp32, with a normal positive repetition penalty")
+    tiny, most = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
+    if temperature and not tiny <= 1 / temperature <= most:  # the chip takes 1/temperature as fp32
+      raise ValueError("temperature must be zero or have an inverse that is a normal fp32 value")
+    # The logits are fp32. Within these bounds the penalized logits stay finite in the host's float64
+    if abs(presence) > most or abs(frequency) > most: raise ValueError("presence_penalty and frequency_penalty must fit fp32")
+    if not tiny <= repetition <= most: raise ValueError("repetition_penalty must be positive and a normal fp32 value")
     if not 0 < top_p <= 1 or not 0 <= min_p <= 1: raise ValueError("top_p must be in (0, 1] and min_p in [0, 1]")
-    if repetition <= 0: raise ValueError("repetition_penalty must be positive")
     if stop is not None and not isinstance(stop, (str, list, tuple)): raise ValueError("stop must be a string or a list of strings")
     stop = [stop] if isinstance(stop, str) else list(stop or ())
     if any(not isinstance(s, str) or not s for s in stop): raise ValueError("stop must contain nonempty strings")
@@ -114,7 +120,7 @@ class Request:
       seen = (made > 0) | (np.bincount(self.ids, minlength=len(logits))[:len(logits)] > 0)
       logits = np.where(seen, np.where(logits > 0, logits / self.repetition, logits * self.repetition), logits)
     if self.shape is None: return self.draw(logits)
-    logits = np.array(logits, np.float64)
+    logits = logits.copy()  # rejected tokens become -inf below, and the row may be the Head's own
     for _ in range(32):
       if not np.isfinite(logits).any(): break
       if self.fits(token := self.draw(logits)): return token
@@ -138,8 +144,7 @@ class Request:
     doesn't decide it: a top_k larger than the head, or a top_p or min_p cut that reaches past it. Both are known before
     drawing. With no top_k, top_p or min_p, a draw that lands past the mass of the head reads the row back and draws
     from the tokens past the head, so all tokens keep their probabilities."""
-    if not len(head.ids) or not np.isfinite(head.values[0]) or np.isnan(head.values).any():
-      raise ValueError("sampling needs finite top logits")
+    finite(head.values)
     if self.temperature == 0: return int(head.ids[0])
     if not math.isfinite(head.lse) or head.lse < 0: return self.draw(head.row())
     t, k = 1 / self.temperature, len(head.ids)
@@ -168,9 +173,7 @@ class Request:
     Apply top_k first (0 keeps all tokens), then keep the smallest prefix whose probability reaches
     top_p, then remove tokens below min_p times the highest probability. Try the 1,024 largest logits
     first to avoid sorting the whole vocabulary when they contain enough probability."""
-    logits = np.asarray(logits, np.float64)
-    if not logits.size or np.isnan(logits).any() or np.isposinf(logits).any() or not np.isfinite(logits).any():
-      raise ValueError("sampling needs a finite maximum logit and no NaN")
+    logits = finite(np.asarray(logits, np.float64))
     if self.temperature == 0: return int(logits.argmax())
     p, keep = np.exp((logits - logits.max()) / self.temperature), None  # None means no cut
     if self.top_k or self.top_p < 1:
@@ -211,8 +214,7 @@ class Request:
       self.say(text)
       self.finish = "stop" if end or cut >= 0 else "length"
       return True
-    hold = max((k for s in self.stop for k in range(1, len(s)) if self.text.endswith(s[:k])), default=0)  # what may begin a stop string
-    self.say(self.text[:len(self.text) - hold])
+    self.say(self.text[:len(self.text) - unsure(self.text, self.stop)])  # hold back what may begin a stop string
     return False
 
   def say(self, text):
@@ -288,14 +290,14 @@ class Engine:
       self.replays[f, n] = jit(run)
     return self.replays[f, n]
 
-  def rows(self, f, n, ts):
-    """Read Heads from the last call of f at cache length n, using inverse temperatures ts. Read the full
-    logits at most once if sampling needs them."""
+  def rows(self, f, n):
+    """The rows from the last call of f at cache length n: Heads where the chip found them, else NumPy rows of
+    logits. Read the full logits at most once if sampling needs them."""
     logits, made = self.made[f, n]
     whole = functools.cache(lambda: gpt2.values(logits))
     if made is None: return list(whole())
     values, ids, lse = (gpt2.values(x) for x in made)
-    return [Head(values[i], ids[i], lse[i, 0], lambda i=i: whole()[i]) for i in range(len(ts))]
+    return [Head(values[i], ids[i], lse[i, 0], lambda i=i: whole()[i]) for i in range(len(values))]
 
   def column(self, ts): return Tensor.of(self.rt, [[x] for x in ts], "fp32")  # the 1/temperature of each row, as a column
 
@@ -331,40 +333,37 @@ class Engine:
              for l, s in enumerate(self.slot[u])]
     each = lambda v: [x for part in v for x in (part if isinstance(part, tuple) else (part,))]
     mapped = lambda f, v: [tuple(f(x) for x in part) if isinstance(part, tuple) else f(part) for part in v]
-    def size(x, host=False):
-      if isinstance(x, bytes): return len(x)
-      dtype = x.t.dtype if isinstance(x, qwen.Row) else x.dtype
-      if host: return x.batch * x.rows * x.cols * (4 if dtype in ("fp32", "int32") else 2)
+    dtype = lambda x: x.t.dtype if isinstance(x, qwen.Row) else x.dtype
+    def device(x):  # the bytes of a copy in DRAM: whole tiles, spread over every bank
       tiles = x.batch * -(-x.rows // 32) * -(-x.cols // 32)
-      return -(-tiles // len(bh.DRAM)) * len(bh.DRAM) * tile_bytes(dtype)
+      return -(-tiles // len(bh.DRAM)) * len(bh.DRAM) * tile_bytes(dtype(x))
+    host = lambda x: x.batch * x.rows * x.cols * (4 if dtype(x) in ("fp32", "int32") else 2)  # tobytes gives KV rows as bf16
     def keys(kind): return [k for k, v in self.sessions.items() if isinstance(each(v)[0], kind)]
     def tohost(x):
       if not isinstance(x, qwen.Row): return x.tobytes()
       # Download each stored matrix and select the row on the host. Row.get() would need another device allocation.
       width = 4 * x.cols  # convolution history is fp32
       return b"".join(x.t[b].tobytes()[x.u * width:(x.u + 1) * width] for b in range(x.batch))
-    def host(v):
-      need = sum(size(x, True) for x in each(v))
+    def spill(v):  # v as bytes on the host, after dropping the oldest host sessions to make room. None if it can't fit
+      need = sum(map(host, each(v)))
       if need > self.keep: return None
       held = keys(bytes)
       while sum(sum(map(len, each(self.sessions[k]))) for k in held) + need > self.keep:
         del self.sessions[held.pop(0)]
       return mapped(tohost, v)
-    need, held = sum(size(x) for x in each(parts)), keys(Tensor)
+    need, held = sum(map(device, each(parts))), keys(Tensor)
     try:
       if need <= self.park:
-        while sum(sum(size(x) for x in each(self.sessions[k])) for k in held) + need > self.park:
+        while sum(sum(map(device, each(self.sessions[k]))) for k in held) + need > self.park:
           k = held.pop(0)
-          old = self.sessions[k]
-          if kept := host(old): self.sessions[k] = kept
+          if kept := spill(self.sessions[k]): self.sessions[k] = kept  # which frees the device copy
           else: del self.sessions[k]
-          del old
         def copy(x):
           if isinstance(x, qwen.Row): return x.get().realize()
           return Tensor(self.rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype).assign(x)
         try: saved = mapped(copy, parts)
-        except MemoryError: saved = host(parts)  # fragmentation or other workloads can leave less than the cache budget
-      else: saved = host(parts)
+        except MemoryError: saved = spill(parts)  # fragmentation or other workloads can leave less than the cache budget
+      else: saved = spill(parts)
       if saved is not None: self.sessions[key] = saved
     except MemoryError: pass  # caching is optional; no partially copied session is published
 
@@ -402,7 +401,8 @@ class Engine:
     out, h = out if self.spec else (out, None)
     self.held[u] += ids
     self.prefilled += len(ids)
-    final, self.coherent[u] = len(self.held[u]) == len(r.ids), not self.spec
+    final = len(self.held[u]) == len(r.ids)
+    self.coherent[u] = not self.spec  # until the prediction layer has seen this chunk too
     done = final and self.take(u, gpt2.values(out)[0], 1 + self.spec, end=False)
     after = (r.ids + r.made)[at + 1:at + len(ids) + 1]
     if self.spec and r.finish != "error" and len(after) == len(ids):
@@ -410,7 +410,7 @@ class Engine:
       self.coherent[u] = True
       if r.made: self.drafts[u], self.taken[u] = self.guess(u, int(drafts[-1].argmax())), 1.0
     if final:
-      if done: self.finish(u)
+      if done: self.release(u)
       else: self.save(u)
 
   def advance(self):  # decode one token for every occupied slot
@@ -421,29 +421,31 @@ class Engine:
     places = [len(h) if r else self.places - 1 for h, r in zip(self.held, live)]
     n, ts = self.length(max(p for p, r in zip(places, live) if r)), [scale(r) for r in live]
     self.replay(self.decode, n)(self.on(ids), self.on(places), self.column(ts))
-    for u, (r, head) in enumerate(zip(live, self.rows(self.decode, n, ts))):
+    for u, (r, head) in enumerate(zip(live, self.rows(self.decode, n))):
       if r: self.held[u].append(r.made[-1]); self.take(u, head)
 
   # The request in slot u takes its next token. A finished request leaves its slot, and its session is kept before
   # the request ends, so whoever waits on it finds the chip idle. Request.take works on the host, except where a Head
   # reads its row back from the chip. Any other failure there, from sampling to the client's output constraint, ends
-  # only this request. A failed read stops the engine.
+  # only this request. A failed read stops the engine. The type of an exception can't tell them apart: a schema's
+  # RecursionError is a RuntimeError too, so the read records its own failure.
   def take(self, u, head, room=1, end=True):
-    r, chip = self.busy[u], []
+    r, unread = self.busy[u], False
     if isinstance(head, Head):
       row = head.row
       def read():
+        nonlocal unread
         try: return row()
-        except BaseException: chip.append(True); raise
+        except BaseException: unread = True; raise
       head.row = read
     try: done = r.take(head, len(self.held[u]) + room < self.places)
     except Exception as e:
-      if chip: raise
+      if unread: raise
       r.finish, r.error, done = "error", f"{type(e).__name__}: {e}", True
-    if done and end: self.finish(u)
+    if done and end: self.release(u)
     return done
 
-  def finish(self, u):
+  def release(self, u):  # ends the request in slot u, keeping its session unless it failed
     r = self.busy[u]
     if r.finish != "error": self.save(u)
     self.busy[u] = None
@@ -481,7 +483,7 @@ class Engine:
     places = [p for u, r in enumerate(live) for p in ([at[u], at[u] + 1] if r else [self.places - 1] * 2)]
     m, ts = self.length(max(at[u] + 1 for u, r in enumerate(live) if r)), [x for r in live for x in (scale(r),) * 2]  # the draft positions too
     self.replay(self.check, m)(self.on(ids), self.on(places), self.on(self.taken, "fp32"), self.column(ts))
-    rows = self.rows(self.check, m, ts)
+    rows = self.rows(self.check, m)
     pairs = [[0, 0, self.places - 1, self.places - 1] for _ in range(n)]  # the next tokens of each slot and their positions, for the drafts
     for u, r in enumerate(live):
       if not r: continue
@@ -586,21 +588,24 @@ def qwen_chat(messages, thinking=True, tools=None):
     elif m["role"] != "system" or i: raise ValueError(f"a {m['role']} message isn't allowed there")
   return out + "<|im_start|>assistant\n" + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")
 
+def function(tool): return tool.get("function", tool)  # a tool's function. Some clients send the function as the tool
+
 def described(tools):
   """Check a request's tool definitions and return them. Each is an object whose function, or the tool itself, has a
   nonempty string name. Parameters, if not null, are an object schema whose properties, if not null, map names to
-  schemas: objects or booleans. calls and chosen read these shapes in the engine thread, so a bad one fails here."""
+  schemas: objects or booleans. chosen's validator and calls read these shapes, the first in the engine thread, so a
+  bad one fails here."""
   if tools is None: return None
   if not isinstance(tools, list): raise ValueError("tools must be a list of tool objects")
   for t in tools:
-    f = t.get("function", t) if isinstance(t, dict) else None
+    f = function(t) if isinstance(t, dict) else None
     if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not f["name"]:
       raise ValueError("each tool needs a function with a nonempty string name")
     params = f.get("parameters")
     props = params.get("properties") if isinstance(params, dict) else None
-    if params is not None and not isinstance(params, dict) or props is not None and (not isinstance(props, dict) or
-        any(not isinstance(p, (dict, bool)) for p in props.values())):
-      raise ValueError(f"tool {f['name']}: parameters must be an object schema whose properties are schemas")
+    if params is not None and not isinstance(params, dict): raise ValueError(f"tool {f['name']}: parameters must be an object schema")
+    if props is not None and (not isinstance(props, dict) or any(not isinstance(p, (dict, bool)) for p in props.values())):
+      raise ValueError(f"tool {f['name']}: properties must map names to schemas")
   return tools
 
 def calls(text, tools=()):
@@ -608,7 +613,7 @@ def calls(text, tools=()):
   schema-declared strings as text; parse other values as JSON when possible. tools have the shapes described checks."""
   head, mark, rest = text.partition("<tool_call>")
   props = lambda f: (f.get("parameters") or {}).get("properties") or {}
-  schema = {t.get("function", t).get("name"): props(t.get("function", t)) for t in tools or ()}
+  schema = {function(t)["name"]: props(function(t)) for t in tools or ()}
   def value(name, key, v):
     kind = schema.get(name, {}).get(key, {})
     if not isinstance(kind, dict) or kind.get("type", "string") == "string": return v  # a boolean schema declares no type
@@ -622,10 +627,10 @@ def calls(text, tools=()):
 def chosen(choice, tools):
   """Build a prefix validator for tool_choice, or None for auto. none disallows calls; required demands calls
   at the start; a named function allows only that function. For reasoning models, validate the answer after
-  the reasoning."""
+  the reasoning. tools have the shapes described checks."""
   if choice in (None, "auto"): return None
   if choice == "none": return lambda text, pending=b"": 0 if "<tool_call>" in text else 1 if pending else 2
-  names = [t.get("function", t)["name"] for t in described(tools) or ()]
+  names = [function(t)["name"] for t in tools or ()]
   if choice != "required": names = [n for n in names if n == choice["function"]["name"]]
   if not names: raise ValueError(f"tool_choice: there's no such tool in tools: {choice}")
   can = lambda part, whole: whole.startswith(part) or part.startswith(whole)  # part could still become whole, or starts with it
@@ -789,19 +794,15 @@ def formatted(form):
       nonlocal i
       if sc is False: raise Bad
       if sc is True: sc = {}
-      if "$ref" in sc:
-        combine((lambda: value(target(sc["$ref"]), depth), lambda: value({k: v for k, v in sc.items() if k != "$ref"}, depth)))
-        return
-      if "anyOf" in sc or "oneOf" in sc:
-        key = "anyOf" if "anyOf" in sc else "oneOf"
-        combine((lambda: value({k: v for k, v in sc.items() if k != key}, depth),
-                 lambda: combine([lambda alt=alt: value(alt, depth) for alt in sc[key]], "one" if key == "oneOf" else "any")))
-        return
-      if "enum" in sc or "const" in sc:
-        key = "enum" if "enum" in sc else "const"
-        choices = sc[key] if key == "enum" else [sc[key]]
-        combine((lambda: value({k: v for k, v in sc.items() if k != key}, depth),
-                 lambda: combine([lambda v=v: literal(v, depth) for v in choices], "any")))
+      key = next((k for k in ("$ref", "anyOf", "oneOf", "enum", "const") if k in sc), None)
+      if key:  # the value must fit key's alternatives and the schema's other fields. With no other fields, skip parsing them
+        rest = {k: v for k, v in sc.items() if k != key}
+        if key == "$ref": alternatives = lambda: value(target(sc[key]), depth)
+        elif key in ("enum", "const"):
+          choices = sc["enum"] if key == "enum" else [sc["const"]]
+          alternatives = lambda: combine([lambda v=v: literal(v, depth) for v in choices], "any")
+        else: alternatives = lambda: combine([lambda alt=alt: value(alt, depth) for alt in sc[key]], "one" if key == "oneOf" else "any")
+        combine([*([lambda: value(rest, depth)] if rest else []), alternatives])
         return
       c, kinds = peek(), sc.get("type") or ["object", "array", "string", "number", "boolean", "null"]
       kinds = [kinds] if isinstance(kinds, str) else kinds
@@ -854,10 +855,10 @@ def formatted(form):
 
 def answer(text, final=True):
   """Split generated text into reasoning and answer. The answer is empty until its start marker arrives.
-  Qwen3 separates them at </think>. gpt-oss uses analysis and final channels separated by <|end|>."""
-  def held(s, markers):
-    n = 0 if final else max((k for marker in markers for k in range(1, len(marker)) if s.endswith(marker[:k])), default=0)
-    return s[:len(s) - n]
+  Qwen3 separates them at </think>. gpt-oss uses analysis and final channels separated by <|end|>. While more text
+  can come (final False), hold back the end of the reasoning where it may begin a marker, so a stream never shows
+  part of one. Once generation ends, a partial marker is ordinary text."""
+  held = lambda s, marks: s if final else s[:len(s) - unsure(s, marks)]
   if not final and any(marker.startswith(text) for marker in ("<think>", "<|channel|>")): return "", ""
   if text.startswith("<|channel|>"):
     if "<|message|>" not in text: return "", ""  # the name of the channel is still coming
@@ -881,9 +882,11 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   generation_config.json for temperature, top_k, top_p, min_p and repetition_penalty, then from the
   handler's built-in defaults.
 
-  Each connection has a handler thread. At most connections of them run, 4 (slots + 8) by default, and at most
-  per_client from one address, a quarter of connections by default. So one client fills every slot, but its idle
-  sockets can't take every handler. Past the first limit a connection gets 503, past the second 429."""
+  A connection has input_wait seconds to send its headers and a body of at most body_limit bytes, else it gets 408 or
+  413. Each connection has a handler thread. At most connections of them run, 4 × (slots + 8) by default, and at
+  most per_client from one address, a quarter of connections by default. So one client fills every slot, but its idle
+  sockets can't take every handler. Past the first limit a connection gets 503, past the second 429, each with a
+  JSON error that names the limit."""
   for key, v in (("wait", wait), ("input_wait", input_wait)):
     if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v <= 0:
       raise ValueError(f"{key} must be a finite positive number")
@@ -892,6 +895,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   for key, v in (("body_limit", body_limit), ("connections", connections), ("per_client", per_client)):
     if type(v) is not int or v < 1: raise ValueError(f"{key} must be a positive integer")
   defaults, thinks, harmony = defaults or {}, "<think>" in template, family(template) == "harmony"
+  late = {"error": {"message": f"the request's headers and body took more than {input_wait}s"}}
   class Handler(BaseHTTPRequestHandler):
     def handle(self):
       # A socket timeout alone restarts for every read; the timer also bounds a client that trickles bytes.
@@ -911,13 +915,14 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       self.connection.settimeout(wait)
     def body(self):
       try:
+        if self.expired.is_set(): raise TimeoutError  # the deadline cut the headers short
         lengths = self.headers.get_all("Content-Length", [])
         if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
           raise ValueError("provide one nonnegative Content-Length and no Transfer-Encoding")
         size = int(lengths[0])
         if size > body_limit: raise OverflowError(f"request body exceeds {body_limit} bytes")
         data = self.rfile.read(size)
-        if self.expired.is_set(): raise TimeoutError("request input deadline expired")
+        if self.expired.is_set(): raise TimeoutError
         if len(data) != size: raise ValueError("request body ended before Content-Length")
         return data
       finally: self.input_done()
@@ -929,7 +934,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       self.wfile.write(data)
     def do_GET(self):
       self.input_done()
-      if self.expired.is_set(): return self.reply(408, {"error": {"message": "request input deadline expired"}})
+      if self.expired.is_set(): return self.reply(408, late)
       if self.path != "/v1/models": return self.reply(404, {"error": {"message": f"not found: {self.path}"}})
       self.reply(200, {"object": "list", "data": [{"id": name, "object": "model", "owned_by": "baretile"}]})
     def do_POST(self):
@@ -960,7 +965,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
                     top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=given("top_k", 0),
                     min_p=given("min_p", 0.0), presence=given("presence_penalty", 0.0), frequency=given("frequency_penalty", 0.0),
                     repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
-      except TimeoutError: return self.reply(408, {"error": {"message": "request input deadline expired"}})
+      except TimeoutError: return self.reply(408, late)  # the deadline, or a socket read that waited input_wait
       except OverflowError as e: return self.reply(413, {"error": {"message": str(e)}})
       except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:  # RecursionError: a body nested too deeply to parse
         return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
@@ -975,7 +980,7 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         out = dict(zip(("reasoning_content", "content"), answer(text, final))) if apart else {"content": text}
         if tools:  # also hold back what may be the start of a tool call
           shown = out["content"].partition("<tool_call>")[0]
-          out["content"] = shown[:len(shown) - max((k for k in range(1, 11) if shown.endswith("<tool_call>"[:k])), default=0)]
+          out["content"] = shown[:len(shown) - unsure(shown, ("<tool_call>",))]
         return out
       def delta(text, final):  # the next piece of a chat: what's new in each part
         seen["text"] += text
@@ -1024,29 +1029,34 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       self.reply(200, head | {"choices": [choice | {"finish_reason": "tool_calls" if made else r.finish}], "usage": usage()})
   class Server(ThreadingHTTPServer):
     def process_request(self, request, address):
-      with self.lock:  # room counts handlers, and clients those of each address
-        if not self.room.acquire(blocking=False): refused = b"503 Service Unavailable"
-        elif self.clients[address[0]] >= per_client: self.room.release(); refused = b"429 Too Many Requests"
+      with self.lock:  # clients counts the handlers of each address
+        if sum(self.clients.values()) >= connections: refused = 503, f"the server's connection limit ({connections}) is reached"
+        elif self.clients[address[0]] >= per_client: refused = 429, f"this address's connection limit ({per_client}) is reached"
         else: self.clients[address[0]] += 1; refused = None
-      if refused:
+      if refused:  # from the thread that accepts connections, so the reply mustn't wait long
+        code, message = refused
+        data = json.dumps({"error": {"message": message, "code": code}}).encode()
         try:
           request.settimeout(min(input_wait, 1))
-          request.sendall(b"HTTP/1.0 " + refused + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+          request.sendall(f"HTTP/1.0 {code} {Handler.responses[code][0]}\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n"
+                          f"Connection: close\r\n\r\n".encode() + data)
         except OSError: pass
         finally: self.shutdown_request(request)
         return
       try: super().process_request(request, address)
       except BaseException: self.leave(address[0]); raise
-    def process_request_thread(self, request, address):
-      try: super().process_request_thread(request, address)
-      finally: self.leave(address[0])
+    def process_request_thread(self, request, address):  # ThreadingMixIn's, freeing the handler before the client sees the end
+      try: self.finish_request(request, address)
+      except Exception: self.handle_error(request, address)
+      finally:
+        self.leave(address[0])
+        self.shutdown_request(request)
     def leave(self, client):
       with self.lock:
-        self.room.release()
         self.clients[client] -= 1
         if not self.clients[client]: del self.clients[client]
   http = Server(("", port), Handler)
-  http.room, http.lock, http.clients = threading.BoundedSemaphore(connections), threading.Lock(), collections.Counter()
+  http.lock, http.clients = threading.Lock(), collections.Counter()
   http.connections, http.per_client = connections, per_client
   return http
 
@@ -1101,10 +1111,10 @@ def fetch(model, cache=os.path.expanduser("~/.cache/baretile/hub")):
   with open(os.path.join(folder, ".done"), "w"): pass
   return folder
 
-def generation_defaults(model, generation):
-  """Resolve EOS and sampling defaults per field: generation, selected text model, then outer model config.
-  An explicit null EOS disables automatic end tokens."""
-  fields = model | (model.get("text_config") or {}) | generation
+def generation_defaults(config, generation):
+  """Resolve EOS and sampling defaults per field: generation_config.json, then config.json's text_config (a
+  multimodal model's text model), then config.json itself. An explicit null EOS disables automatic end tokens."""
+  fields = config | (config.get("text_config") or {}) | generation
   eos = fields.get("eos_token_id")
   defaults = {k: v for k, v in fields.items() if k in ("temperature", "top_k", "top_p", "min_p", "repetition_penalty")}
   return eos if isinstance(eos, list) else [] if eos is None else [eos], defaults
@@ -1129,7 +1139,7 @@ def main():
   template = config("tokenizer_config.json").get("chat_template") or (open(jinja, encoding="utf-8").read() if os.path.exists(jinja) else "")
   http = server(engine, name, template, eos, port, defaults=defaults, connections=connections)
   print(f"{name} is on the chip after {time.time() - start:.0f}s ({mode}, a {llama.cache_format(c)} KV cache), {slots} slots of {places} positions, "
-        f"prefilling {engine.chunk} tokens at a time, on port {port} with {http.connections} connections, {http.per_client} an address", flush=True)
+        f"prefilling {engine.chunk} tokens at a time, on port {port} with {http.connections} connections, {http.per_client} per address", flush=True)
   http.serve_forever()
 
 if __name__ == "__main__": main()

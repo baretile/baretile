@@ -533,6 +533,7 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
 
 WHITE = "\t-\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"  # Unicode's White_Space: what tiktoken's \s matches
 SPLIT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""  # SmolLM's: GPT-2's, but with digits split apart
+GPT2_SPLIT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""  # what ByteLevel's use_regex splits by
 
 @functools.cache
 def categories(names):  # Unicode categories like L or Lu as ranges for a character class. Python's re has no \p{...}
@@ -602,7 +603,7 @@ class Tokenizer:
         patterns.append(p["pattern"]["Regex"])
       elif kind == "Digits": patterns.append(r"\p{N}" + ("" if p.get("individual_digits", False) else "+"))
       elif kind == "ByteLevel" and not p.get("add_prefix_space", True):
-        if p.get("use_regex", True): patterns.append(SPLIT.replace(r"|\p{N}|", r"| ?\p{N}+|"))  # GPT-2's digit groups
+        if p.get("use_regex", True): patterns.append(GPT2_SPLIT)
       else: raise ValueError(f"Tokenizer does not support pre-tokenizer {p}")
     self.splits, self.pieces = [python_regex("(" + p + ")") for p in patterns], {}
     if any(p.groups != 1 for p in self.splits): raise ValueError("Tokenizer split patterns must not contain capturing groups")

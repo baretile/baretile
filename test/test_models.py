@@ -541,7 +541,6 @@ def test_bpe_merge_order(tmp_path):
     (tmp_path / "tokenizer.json").write_text(json.dumps({"model": dict(type="BPE", vocab=vocab) | settings}))
     with pytest.raises(ValueError, match="Tokenizer"): llama.Tokenizer(str(tmp_path))
 
-
 def test_bpe_stages_and_missing_bytes(tmp_path):
   # SmolLM splits digits before ByteLevel. Whitespace before a digit therefore reaches BPE as one piece. BPE with
   # unk_token=None drops absent alphabet bytes before merging, so a missing byte can join two known letters.
@@ -560,7 +559,6 @@ def test_bpe_stages_and_missing_bytes(tmp_path):
   with pytest.raises(ValueError, match="unknown-token"): tokenizer(byte, dict(unk_token="<unk>"))
   with pytest.raises(ValueError, match="pre-tokenizer"): tokenizer(byte | dict(add_prefix_space=True))
 
-
 def test_generation_defaults():
   # A nonempty generation config without EOS inherits the selected text model's token, even in a multimodal config.
   model = dict(eos_token_id=1, temperature=0.8, text_config=dict(eos_token_id=2, top_k=30))
@@ -570,7 +568,6 @@ def test_generation_defaults():
   assert serve.generation_defaults({"eos_token_id": 1, "text_config": {"top_p": 0.9}}, {"temperature": 0.5}) == \
     ([1], dict(top_p=0.9, temperature=0.5))
   assert serve.generation_defaults({}, {}) == ([], {})
-
 
 def test_tokenizer(tmp_path):
   # llama.Tokenizer must encode like tiktoken over the same tokenizer.json, and decode back, with the pre-tokenizers of
@@ -864,7 +861,6 @@ def test_model_geometry(chip):
   assert qwen.touched_l1(fitting, 1, 1) + 4096 <= qwen.OUTS
   with pytest.raises(ValueError, match="fit L1"): qwen.touched_l1(fitting + 32, 1, 1)
 
-
 def test_all_linear_model(chip):
   # A truncated hybrid can contain only recurrent blocks. Direct calls use RoPE capacity; the server supplies its
   # smaller slot capacity so its idle position leaves recurrent state untouched.
@@ -891,7 +887,6 @@ def test_all_linear_model(chip):
     assert np.abs(got - want).max() < 0.03 * np.abs(want).max()
   idle = llama.slot(c, engine.kv, 1, 2)
   assert all(not np.any(np.frombuffer(s.tobytes(), np.float32)) for block in idle for s in block)
-
 
 def test_delta_step(chip):
   # qwen.delta runs Gated DeltaNet decode in one kernel, with a work unit per key head. It must match numpy_delta to 1e-5 with the
@@ -1119,8 +1114,8 @@ def test_llama_8b_shapes(chip):
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
 
 def test_benchmark_table():
-  # The speed column is baretile's over TT-NN's, inverted for times, so above 1 means baretile is faster. A matmul at
-  # the card's peak rate has a roofline of 1.
+  # The speed column is baretile's over TT-NN's, inverted for times, so above 1 means baretile is faster. Work at the
+  # card's one-phase peak rate has a roofline of 1, so a two-phase matmul gets there at half the flops.
   ours = {"versions": {"lines of code": {"baretile": 1}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 3.0},
           "B2 decode, batch 1": {"tokens/s": 60.0}, "B3 prefill, 32768 tokens": {"does not run": "MemoryError"}}
   theirs = {"versions": {"lines of code": {"tt-metal": 2}}, "clock": "the host's", "B1 matmul 4096^3 bf16, 2 phases": {"ms": 1.5},
@@ -1128,10 +1123,11 @@ def test_benchmark_table():
   rows = benchmark.table(ours, theirs).splitlines()
   assert rows[2].endswith("| 0.50 (not above 1) |") and rows[3].endswith("| 1.20 (above 1) |") and rows[4].endswith("|  |"), rows
   assert all(r.count("|") == 5 for r in rows) and "MemoryError" in rows[4], rows
-  assert benchmark.roofline(cost.CARD["tflops"] / 2, 1.0, 2) == 1
+  flops = cost.CARD["tflops"] / 2  # a second of a two-phase matmul at the peak
+  assert benchmark.roofline(flops * 2, 1.0) == 1
   c = llama.model(layers=2, dim=256, heads=4, kv=2, ffn=512, vocab=1000)
-  attention = 2 * 4 * 4 * llama.head(c) * 10 * 11 // 2  # two blocks, scores and values, 4 heads, causal over 10 tokens
-  assert benchmark.prefill_flops(c, 10) == 2 * 10 * (cost.shape(c, "tt").values - 1000 * 256) + 2 * 1000 * 256 + attention
+  s, attention = cost.shape(c, "tt"), 2 * 4 * 4 * llama.head(c) * 10 * 11 // 2  # two blocks, scores and values, 4 heads, causal over 10 tokens
+  assert benchmark.prefill_work(c, 10) == 2 * 10 * (s.work - s.head_work) + 2 * s.head_work + s.prefill_phases * attention
 
 def test_benchmark_load(chip, tmp_path):
   # B4's load against serve.py for a small model: two agents, two streamed turns each. The second turn extends the
@@ -1200,7 +1196,7 @@ def test_benchmark_deadline(headers):
           self.send_response(200)
           self.end_headers()
           self.wfile.write(b": ")
-        for _ in range(100):
+        for _ in range(500):  # 5 seconds, well past the deadline
           self.wfile.write(b"x")
           self.wfile.flush()
           time.sleep(0.01)
@@ -1211,8 +1207,8 @@ def test_benchmark_deadline(headers):
   start = time.monotonic()
   try:
     got = benchmark.load(f"http://127.0.0.1:{server.server_port}", 1,
-                         SimpleNamespace(system=1, task=1, tool=1, out=3, n=2), "a b c d", timeout=0.2)
-    assert time.monotonic() - start < 1.5 and got["turns"] == 1 and got["tokens/s"] > 0, got
+                         SimpleNamespace(system=1, task=1, tool=1, out=3, n=2), "a b c d", timeout=1)
+    assert time.monotonic() - start < 3 and got["turns"] == 1 and got["tokens/s"] > 0, got
     assert len(got["failures"]) == 1 and "deadline" in got["failures"][0], got
   finally:
     server.shutdown()
@@ -1220,12 +1216,13 @@ def test_benchmark_deadline(headers):
     worker.join(1)
 
 def test_benchmark_subprocess_deadline(tmp_path):
-  # The child ignores termination. Its partial output survives the deadline and the forced process-group exit.
+  # The child ignores termination. Its partial output survives the deadline and the forced process-group exit. The
+  # deadline leaves a slow machine time to start Python and print; logged then waits as long again before SIGKILL.
   log = tmp_path / "benchmark.log"
   start = time.monotonic()
   code, expired = benchmark.logged([sys.executable, "-u", "-c",
-    "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('partial result',flush=True); time.sleep(30)"], log, timeout=0.2)
-  assert expired and code < 0 and time.monotonic() - start < 1.5
+    "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('partial result',flush=True); time.sleep(30)"], log, timeout=1)
+  assert expired and code < 0 and time.monotonic() - start < 4
   assert "partial result" in log.read_text() and "deadline exceeded" in log.read_text()
 
 def test_chunked_prefill(chip):
@@ -1426,8 +1423,9 @@ def test_request_inputs(tmp_path):
 
 def test_sampling_boundaries(chip):
   # Small finite temperatures must not overflow either the inverse temperature or the device normalization.
-  for kw in ({"temperature": 1e-320}, {"temperature": 1e300}, {"repetition": 1e-320}, {"frequency": 1e300}):
-    with pytest.raises(ValueError): serve.Request(None, [], **kw)
+  for kw, name in (({"temperature": 1e-320}, "temperature"), ({"temperature": 1e300}, "temperature"),
+                   ({"repetition": 1e-320}, "repetition_penalty"), ({"frequency": 1e300}, "frequency_penalty")):
+    with pytest.raises(ValueError, match=name): serve.Request(None, [], **kw)
   rt = Runtime(chip)
   logits = np.full((1, 512), 1e20, np.float32)
   temperature = 1e-30
@@ -1440,36 +1438,28 @@ def test_sampling_boundaries(chip):
   r = serve.Request(None, [], temperature=temperature, min_p=0.1)
   assert r.draw(np.array([-np.finfo(np.float32).max, np.finfo(np.float32).max])) == 1
 
-def test_request_sampling_failure(tmp_path):
-  # A bad sampling row releases only its request. Other slots and later offers still work.
-  import queue
-  tok, engine = bytes_tokenizer(tmp_path), object.__new__(serve.Engine)
-  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(2)
-  engine.waiting, engine.busy, engine.held, engine.places = queue.Queue(), [None, None], [[1], [2]], 64
-  engine.save = lambda u: None
-  first, second = [serve.Request(tok, [i], max_tokens=1, temperature=0) for i in (1, 2)]
-  for u, r in enumerate((first, second)):
-    assert engine.offer(r)
-    engine.busy[u] = engine.waiting.get_nowait()
-  assert engine.take(0, np.array([np.nan, 1.]))
-  assert first.finish == "error" and first.error and first.room is None and first.out.get_nowait() is None
-  assert engine.take(1, np.array([0., 1.])) and second.made == [1] and second.finish == "length"
-  later = serve.Request(tok, [3], max_tokens=1, temperature=0)
-  assert engine.offer(later) and not engine.failed
-  engine.busy[0] = engine.waiting.get_nowait()
-  assert engine.take(0, np.array([1., 0.])) and later.made == [0]
-
-def host_engine():  # one slot of an Engine, with what offer and take use. Its requests save no session
+def host_engine(slots=1):  # the slots of an Engine, with what offer and take use. Its requests save no session
   import queue
   engine = object.__new__(serve.Engine)
-  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(1)
-  engine.waiting, engine.busy, engine.held, engine.places, engine.save = queue.Queue(), [None], [[1]], 4096, lambda u: None
-  def seat(r):  # offers r and puts it in the slot, as admit would
+  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(slots)
+  engine.waiting, engine.busy, engine.held, engine.places = queue.Queue(), [None] * slots, [[1] for _ in range(slots)], 4096
+  engine.save = lambda u: None
+  def seat(r, u=0):  # offers r and puts it in slot u, as admit would
     assert engine.offer(r)
-    engine.busy[0] = engine.waiting.get_nowait()
+    engine.busy[u] = engine.waiting.get_nowait()
     return r
   engine.seat = seat
   return engine
+
+def test_request_sampling_failure(tmp_path):
+  # A bad sampling row releases only its request. Other slots and later offers still work.
+  tok, engine = bytes_tokenizer(tmp_path), host_engine(2)
+  first, second = [engine.seat(serve.Request(tok, [u + 1], max_tokens=1, temperature=0), u) for u in range(2)]
+  assert engine.take(0, np.array([np.nan, 1.]))
+  assert first.finish == "error" and first.error and first.room is None and first.out.get_nowait() is None
+  assert engine.take(1, np.array([0., 1.])) and second.made == [1] and second.finish == "length"
+  later = engine.seat(serve.Request(tok, [3], max_tokens=1, temperature=0))
+  assert not engine.failed and engine.take(0, np.array([1., 0.])) and later.made == [0]
 
 def test_request_host_failures(tmp_path):
   # Request.take runs on the host, apart from a Head reading its row from the chip. A failure of the request's own work,
@@ -1511,26 +1501,40 @@ def test_json_nesting_limit(tmp_path):
   assert r.finish == "error" and "output constraint" in r.error and not engine.failed and engine.busy == [None]
   assert tok.decode(r.made) == '{"a": ' + "[" * (n - 1)
 
+def received(s):  # all that a socket gets until the server closes it
+  out = b""
+  while chunk := s.recv(4096): out += chunk
+  return out
+
+def until(done, what, wait=5):  # polls done, and fails the test with what after wait seconds
+  end = time.monotonic() + wait
+  while not done():
+    if time.monotonic() > end: pytest.fail(what)
+    time.sleep(0.001)
+
+def refused(reply, code):  # the message of a connection-time refusal with status code, whose body is a JSON error
+  head, _, body = reply.partition(b"\r\n\r\n")
+  error = json.loads(body)["error"]
+  assert head.startswith(b"HTTP/1.0 %d" % code) and b"Content-Type: application/json" in head and error["code"] == code, reply
+  return error["message"]
+
 def test_http_input_limits(tmp_path):
+  # A request must arrive within input_wait, with one Content-Length and at most body_limit bytes. Otherwise it gets
+  # 408, 400 or 413 before it reaches the engine. The deadline covers headers too, and a client that trickles bytes.
   import socket
   engine = SimpleNamespace(tok=bytes_tokenizer(tmp_path), places=64)
   http = serve.server(engine, "limits", port=0, body_limit=64, input_wait=0.3, connections=1)
   thread = threading.Thread(target=http.serve_forever, daemon=True)
   thread.start()
-  address = ("127.0.0.1", http.server_address[1])
-  def connect(): return socket.create_connection(address, timeout=2)
-  def read(s):
-    out = b""
-    while chunk := s.recv(4096): out += chunk
-    return out
+  connect = lambda: socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=2)
   prefix = b"POST /v1/completions HTTP/1.0\r\n"
   try:
     for headers in (b"Content-Length: -1", b"Content-Length: bad", b"Content-Length: 1\r\nContent-Length: 1",
                     b"Content-Length: 1\r\nTransfer-Encoding: chunked", b"Content-Length: 65"):
       with connect() as s:
         s.sendall(prefix + headers + b"\r\n\r\n")
-        assert read(s).startswith(b"HTTP/1.0 " + (b"413" if headers.endswith(b"65") else b"400")), headers
-    # Bytes continue arriving inside the socket timeout; the total input deadline must still end the body read.
+        assert received(s).startswith(b"HTTP/1.0 " + (b"413" if headers.endswith(b"65") else b"400")), headers
+    # Bytes keep arriving within the socket timeout, but the deadline still ends the body read.
     with connect() as slow:
       slow.sendall(prefix + b"Content-Length: 64\r\n\r\n{")
       start = time.monotonic()
@@ -1538,25 +1542,20 @@ def test_http_input_limits(tmp_path):
         time.sleep(0.06)
         try: slow.sendall(b" ")
         except OSError: break
-      assert read(slow).startswith(b"HTTP/1.0 408") and time.monotonic() - start < 1.5
-    with connect() as headers:
-      headers.sendall(b"GET /v1/models HTTP/1.0\r\nX-Slow: ")
-      assert read(headers).startswith(b"HTTP/1.0 408"), "the deadline also bounds incomplete headers"
-    # One unfinished request consumes the only handler; another gets a bounded rejection.
+      assert received(slow).startswith(b"HTTP/1.0 408") and time.monotonic() - start < 1.5
+    for request in (b"GET /v1/models HTTP/1.0\r\nX-Slow: ", prefix + b"Content-Type: application/json\r\nX-Slow: "):
+      with connect() as s:
+        s.sendall(request)
+        assert received(s).startswith(b"HTTP/1.0 408"), request
+    # One unfinished request takes the only handler. Another connection gets a 503 at once that names the limit.
     with connect() as held:
       held.sendall(prefix + b"Content-Length: 64\r\n\r\n{")
-      end = time.monotonic() + 1
-      while time.monotonic() < end:
-        if not http.room.acquire(blocking=False): break
-        http.room.release()
-        time.sleep(0.001)
-      else: pytest.fail("request did not acquire a handler")
-      with connect() as extra:
-        assert read(extra).startswith(b"HTTP/1.0 503")
-      assert read(held).startswith(b"HTTP/1.0 408")
+      until(lambda: http.clients["127.0.0.1"] == 1, "the request did not take a handler", 1)
+      with connect() as extra: assert "connection limit (1)" in refused(received(extra), 503)
+      assert received(held).startswith(b"HTTP/1.0 408")
     with connect() as s:
       s.sendall(b"GET /v1/models HTTP/1.0\r\n\r\n")
-      assert read(s).startswith(b"HTTP/1.0 200"), "expired requests release their handlers"
+      assert received(s).startswith(b"HTTP/1.0 200"), "expired requests release their handlers"
   finally:
     http.shutdown(); http.server_close(); thread.join(timeout=2)
     assert not thread.is_alive()
@@ -1567,33 +1566,24 @@ def test_http_connection_limits(tmp_path):
   import socket
   tok = bytes_tokenizer(tmp_path)
   wide = serve.server(SimpleNamespace(tok=tok, places=64, busy=[None] * 40), "wide", port=0)
-  assert (wide.connections, wide.per_client) == (192, 48), "more than 32 slots need more than 32 connections"
+  assert (wide.connections, wide.per_client) == (192, 48), "4 x (40 slots + 8) connections, a quarter of them per address"
   wide.server_close()
-  with pytest.raises(ValueError): serve.server(SimpleNamespace(tok=tok, places=64, busy=[None]), "bad", port=0, per_client=0)
+  with pytest.raises(ValueError, match="per_client"): serve.server(SimpleNamespace(tok=tok, places=64, busy=[None]), "bad", port=0, per_client=0)
   http = serve.server(SimpleNamespace(tok=tok, places=64, busy=[None] * 2), "limits", port=0, input_wait=5)
   thread = threading.Thread(target=http.serve_forever, daemon=True)
   thread.start()
   def connect(client):
     try: return socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=5, source_address=(client, 0))
     except OSError as e: pytest.skip(f"no loopback connection from {client}: {e}")
-  def read(s):
-    out = b""
-    while chunk := s.recv(4096): out += chunk
-    return out
-  def until(done, what):
-    end = time.monotonic() + 5
-    while not done():
-      if time.monotonic() > end: pytest.fail(what)
-      time.sleep(0.001)
   idle = []
   try:
     for k in range(http.per_client):  # each holds a handler that waits for headers
       idle.append(connect("127.0.0.2"))
       until(lambda: http.clients["127.0.0.2"] == k + 1, "the server did not take the connection")
-    with connect("127.0.0.2") as extra: assert read(extra).startswith(b"HTTP/1.0 429")
+    with connect("127.0.0.2") as extra: assert f"address's connection limit ({http.per_client})" in refused(received(extra), 429)
     with connect("127.0.0.3") as other:
       other.sendall(b"GET /v1/models HTTP/1.0\r\n\r\n")
-      assert read(other).startswith(b"HTTP/1.0 200")
+      assert received(other).startswith(b"HTTP/1.0 200")
     for s in idle: s.close()
     until(lambda: not http.clients, "closed connections must release their handlers")
   finally:
@@ -2225,8 +2215,9 @@ def test_cost_fidelity():
   s = cost.shape(large, "tt")
   assert s.work == 2 * s.values - 31 * 2 * 4096 * 14336
   # B3's mixed-phase roofline uses causal attention and phase-weighted work against the one-phase peak.
-  attention = c.layers * 4 * c.heads * llama.head(c) * 64 * 65 // 2
-  assert benchmark.prefill_flops(c, 64, phases=True) == 2 * benchmark.prefill_flops(c, 64) - 2 * 64 * gate_up + 2 * attention
+  s, attention = cost.shape(c, "tt"), c.layers * 4 * c.heads * llama.head(c) * 64 * 65 // 2
+  flops = 2 * 64 * (s.values - c.vocab * c.dim) + 2 * c.vocab * c.dim + attention
+  assert benchmark.prefill_work(c, 64) == 2 * flops - 2 * 64 * gate_up + 2 * attention
 
 def test_cost_draft_head():
   # Experts use one phase, projections two, routers and MTP inputs four, and the draft head one. The draft

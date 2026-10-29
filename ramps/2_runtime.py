@@ -10,8 +10,8 @@ from baretile.runtime import DATA, Runtime, compile_kernel
 from baretile.tensix import BANKS
 from baretile.tensor import Tensor
 
-def check(value, message="ramp result did not match"):
-  if not value: raise AssertionError(message)
+def check(ok):  # an assert that python -O keeps. The traceback shows which check failed
+  if not ok: raise AssertionError("the ramp's result is wrong")
 
 # 1. The host reads and writes any tile's memory through windows in PCIe BAR0, set up by chip.py. A Tensix tile has
 # 1.5 MiB of L1, which its RISC-V cores and Tensix share. Coordinates are (x, y) on the NoC, the network on chip.

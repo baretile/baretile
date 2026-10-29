@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import bh
 from baretile.kernels import attention_plan, grid_parts
 from baretile.tensix import CHUNKS, tile_bytes
+from baretile.tensor import FIDELITY
 from models import llama
 
 BYTES = {d: tile_bytes(d) / 1024 for d in ("bf16", "bfp8", "bfp4")}  # bytes per value, with its share of the tile's exponents
@@ -85,11 +86,11 @@ def shape(c, mode="bf16"):
   values = sum(mixers(l) + ffn_values(l) for l in range(c.layers)) + c.vocab * d
   draft_values = c.mtp * (mixer + ffn_values(t) + 2 * d * d)
   def work(l, draft=False):
-    # The projections can use different phases; routers and the MTP input projections use Tensor's default four.
+    # The projections can use different phases; routers and the MTP input projections use Tensor's default.
     out = c.heads * hd * d if draft or not llama.linear(c, l) else c.vh * c.vd * d
     width = sh + c.k * m if mixture(l) else c.ffn
-    values = {"qkv": (mixer if draft else mixers(l)) - out, "o": out, "gate_up": 2 * d * width, "down": d * width}
-    return sum(v * prec[op, l][1] for op, v in values.items()) + (d * e * 4 if mixture(l) else 0)
+    ops = {"qkv": (mixer if draft else mixers(l)) - out, "o": out, "gate_up": 2 * d * width, "down": d * width}
+    return sum(v * prec[op, l][1] for op, v in ops.items()) + (d * e * FIDELITY if mixture(l) else 0)
   head_work = c.vocab * d * prec["head", None][1]
   draft_head_work = c.vocab * d * prec.get(("draft head", None), prec["head", None])[1]
   held = len(moe) + (c.mtp if e else 0)  # the blocks with experts, counting the multi-token prediction layer
@@ -97,7 +98,7 @@ def shape(c, mode="bf16"):
                          head=own or c.vocab * d * fmt("head"), bytes=every + held * e * expert + draft + own + c.vocab * d * BYTES["bf16"],
                          values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1),
                          work=sum(work(l) for l in range(c.layers)) + head_work,
-                         draft_work=c.mtp * (work(t, draft=True) + 2 * d * d * 4) if c.mtp else 0,
+                         draft_work=c.mtp * (work(t, draft=True) + 2 * d * d * FIDELITY) if c.mtp else 0,
                          head_work=head_work, draft_head_work=draft_head_work,
                          decode_phases=prec["attention", "decode"][1], prefill_phases=prec["attention", "prefill"][1])
 

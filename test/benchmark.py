@@ -12,11 +12,12 @@
 #   B3, long prefill: time to first token for B2's model with prompts of 4,096 and 32,768 tokens, after a warm-up.
 #   B4, serving: B2's model behind serve.py, with 32 concurrent agents over HTTP. Each agent runs four turns. They
 #     start from a shared system prompt, and each turn adds the last answer and a tool result. It reports tokens/s per
-#     user and for the card (including first-token latency), time to first text, and the share of prompt tokens the server had cached. B4 has no
-#     TT-NN side, since TT-NN serves through vLLM, but `load` can drive any OpenAI-compatible server.
+#     user and for the card (including first-token latency), time to first text, and the share of prompt tokens the
+#     server had cached. B4 has no TT-NN side, since TT-NN serves through vLLM, but `load` can drive any
+#     OpenAI-compatible server.
 # `table` compares both stacks. It reports the speed ratio (baretile / TT-NN; above 1 means baretile is faster)
-# and the fraction of the card's theoretical limit. That limit is the peak matmul rate at the benchmark's
-# fidelity for B1 and B3, and the DRAM bandwidth for B2.
+# and the fraction of the card's theoretical limit. That limit is the peak matmul rate at each matmul's fidelity
+# phases for B1 and B3, and the DRAM bandwidth for B2.
 #   python3 test/benchmark.py baretile path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py ttnn path/to/Llama-3.1-8B-Instruct path/to/Llama-3.1-8B-Instruct.refpt [--quick]
 #   python3 test/benchmark.py table benchmark-baretile.json benchmark-ttnn.json   # the two side by side, as markdown
@@ -41,6 +42,7 @@ from baretile import bh, pci
 from models import cost, gpt2, llama
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
+DEADLINE = 3600  # seconds for a serving workload or a TT-NN demo run
 SIZES = {False: SimpleNamespace(n=4096, runs=(3, 5, 20), steps=200, accuracy=500, users=32, lengths=(4096, 32768), blocks=None,
                                turns=SimpleNamespace(system=1500, task=400, tool=200, out=256, n=4)),  # B4's prompt words, answer tokens and turns
          True: SimpleNamespace(n=256, runs=(1, 2, 2), steps=8, accuracy=8, users=2, lengths=(64, 128), blocks=2,
@@ -90,7 +92,7 @@ def timed(run, wait, clock, runs):
     times.append((clock() - start) / runs[2])
   return statistics.median(times)
 
-def load(url, agents, turns, text, timeout=3600):
+def load(url, agents, turns, text, timeout=DEADLINE):
   """Run streamed greedy completions, with one deadline for the whole workload.
 
   Each agent extends its shared system prompt with a task, then each answer and tool result. Rates use reported
@@ -183,7 +185,7 @@ def load(url, agents, turns, text, timeout=3600):
           "seconds to first text": statistics.median(first) if first else None,
           "seconds to first text, 90th percentile": first[int(0.9 * (len(first) - 1))] if first else None, "prompt tokens cached": cache}
 
-def logged(args, path, timeout=3600, **kwargs):
+def logged(args, path, timeout=DEADLINE, **kwargs):
   """Run a benchmark subprocess to a log, stopping its process group at the deadline and keeping partial output."""
   if not math.isfinite(timeout) or timeout <= 0: raise ValueError("benchmark timeout must be positive and finite")
   with open(path, "w") as log:
@@ -193,8 +195,7 @@ def logged(args, path, timeout=3600, **kwargs):
       try: os.killpg(process.pid, signal.SIGTERM)
       except ProcessLookupError: pass
       try: process.wait(min(5, timeout))
-      except subprocess.TimeoutExpired:
-        pass
+      except subprocess.TimeoutExpired: pass
       finally:
         # A subprocess can exit before its children. Stop the whole group even when its leader has already exited.
         try: os.killpg(process.pid, signal.SIGKILL)
@@ -220,16 +221,15 @@ def bytes_per_token(t, c, context):
   return (sum(cost.BYTES[x.dtype] * rows.get(k, x.rows * x.cols) for k, x in t.items())
           + context * c.layers * 2 * c.kv * llama.head(c) * cost.BYTES[llama.cache_format(c)])
 
-def roofline(flops, seconds, phases):  # a benchmark's share of the card's peak matmul rate at its fidelity phases
-  return flops / seconds / (cost.CARD["tflops"] / phases)
+def roofline(work, seconds):  # a benchmark's share of the card's one-phase peak, for work counted as flops times their fidelity phases
+  return work / seconds / cost.CARD["tflops"]
 
-def prefill_flops(c, n, phases=False):
-  # B3's matmul flops, or phase-weighted work when phases=True. Each token goes through the weights, but only the last goes through the output layer.
-  # Attention adds its scores and values over the rows that each token sees.
+def prefill_work(c, n):
+  # B3's matmul flops, each times its fidelity phases. Each token goes through the weights, but only the last goes through
+  # the output layer. Attention adds its scores and values over the rows that each token sees.
   s = cost.shape(c, "tt")
-  values, head = (s.work, s.head_work) if phases else (s.values, c.vocab * c.dim)
   attention = c.layers * 4 * c.heads * llama.head(c) * n * (n + 1) // 2
-  return 2 * n * (values - head) + 2 * head + attention * ((s.prefill_phases if n > 1 else s.decode_phases) if phases else 1)
+  return 2 * n * (s.work - s.head_work) + 2 * s.head_work + attention * (s.prefill_phases if n > 1 else s.decode_phases)
 
 def model(folder, s, places):  # the model's config at TT's performance precision, and its weights, read lazily
   c, w = llama.load(folder, places)
@@ -289,7 +289,7 @@ def baretile(folder, prompt, after, top5, book, s):
     a, b = (Tensor.frombytes(rt, s.n, s.n, (rng.standard_normal((s.n, s.n), np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes())
             for _ in range(2))
     seconds = timed(lambda: a.matmul(b, fidelity=phases).realize(), rt.wait, clock, s.runs)
-    return {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12, "roofline": roofline(2 * s.n**3, seconds, phases)}
+    return {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12, "roofline": roofline(2 * s.n**3 * phases, seconds)}
   for phases in (2, 4): out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = matmul(phases)
   c, w = model(folder, s, len(prompt) + max(s.steps, s.accuracy))
   t = llama.upload(rt, w, c.precision)
@@ -305,7 +305,7 @@ def baretile(folder, prompt, after, top5, book, s):
     try:
       seconds, chunk = prefill(t, c, ids[:n])
       out[f"B3 prefill, {n} tokens"] = {"seconds to first token": seconds, "chunk": chunk,
-                                        "roofline": roofline(prefill_flops(c, n, phases=True), seconds, 1)}
+                                        "roofline": roofline(prefill_work(c, n), seconds)}
     except Exception as e: out[f"B3 prefill, {n} tokens"] = {"does not run": f"{type(e).__name__}: {e}"}
   from models import serve  # B4: a slot for each agent, with room for two tokens a word plus the answers
   places = -(-(2 * (s.turns.system + s.turns.task + s.turns.n * s.turns.tool) + s.turns.n * s.turns.out) // 32) * 32
@@ -357,10 +357,10 @@ def ttnn(folder, prompt, after, top5, book, s):
       if s.blocks: flags += ("--num_layers", str(s.blocks))
       path = f"benchmark-ttnn-{label}.log"
       code, expired = logged([sys.executable, "-m", "pytest", DEMO, "-k", f"performance and {run}", "-s", "-p", "no:cacheprovider", *flags],
-                             path, timeout=3600, cwd=tt, env=os.environ | {"HF_MODEL": folder})
+                             path, cwd=tt, env=os.environ | {"HF_MODEL": folder})
     log = open(path).read()
     got = {k: float(m[-1]) * LOGGED[k][1] for k in want + ("prompt tokens",) if (m := re.findall(LOGGED[k][0], log))}
-    if expired: got["did not pass"] = ["benchmark deadline exceeded after 3600 seconds; partial output is in " + path]
+    if expired: got["did not pass"] = [f"benchmark deadline exceeded after {DEADLINE} seconds; partial output is in {path}"]
     elif code or set(want) - set(got):
       got["did not pass"] = [l for l in log.splitlines() if l.startswith(("E ", "FAILED", "SKIPPED")) or "ERROR:" in l][-3:] or log.splitlines()[-1:]
     return got
@@ -368,7 +368,7 @@ def ttnn(folder, prompt, after, top5, book, s):
   for phases in (2, 4):
     seconds = matmul(s.n, phases)
     out[f"B1 matmul {s.n}^3 bf16, {phases} phases"] = {"ms": seconds * 1e3, "TFLOPS": 2 * s.n**3 / seconds / 1e12,
-                                                       "roofline": roofline(2 * s.n**3, seconds, phases)}
+                                                       "roofline": roofline(2 * s.n**3 * phases, seconds)}
   tok = AutoTokenizer.from_pretrained(folder)
   text = tok.decode(short)  # TT's token accuracy makes its prompt from the reference tokens this way (prepare_ref_tokens)
   decoding = ("--stop_at_eos", "0", "--max_generated_tokens", str(s.steps))
@@ -385,7 +385,7 @@ def ttnn(folder, prompt, after, top5, book, s):
   for n in s.lengths:  # the script adds a beginning-of-text token to n - 1 tokens of the book. --max_seq_len leaves room for 2n
     b3 = out[f"B3 prefill, {n} tokens"] = demo(f"b3-{n}", "long-context-64k", ("seconds to first token",), "--mode", "prefill",
                                                "--max_seq_len", str(2 * n), "--max_generated_tokens", "1", text=tok.decode(ids[:n - 1]))
-    if "seconds to first token" in b3: b3["roofline"] = roofline(prefill_flops(c, n, phases=True), b3["seconds to first token"], 1)
+    if "seconds to first token" in b3: b3["roofline"] = roofline(prefill_work(c, n), b3["seconds to first token"])
   return out
 
 def table(baretile, ttnn):
