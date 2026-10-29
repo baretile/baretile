@@ -1,7 +1,7 @@
 # Shared chip fixture and tensor helpers. test_device.py covers the device and runtime; test_kernels.py covers
 # code generation and tensors; test_models.py covers models, serving and adapters. Set TTSIM to libttsim.so to
 # use the simulator. Otherwise tests open the first Blackhole on the PCI bus as root (see docs/bring-up.md).
-import functools, pytest
+import functools, gc, pytest
 import numpy as np
 from baretile import pci
 from baretile.chip import Chip
@@ -25,6 +25,13 @@ def hold(rt):
   rt.chip.write32(x, y, DATA, 0)
   rt.launch(_held(), (1,), units=1, name="hold")
   return lambda: rt.chip.write32(x, y, DATA, 1)
+
+@pytest.fixture
+def no_gc():  # Python collects only where the test calls gc.collect()
+  collecting = gc.isenabled()
+  gc.disable()
+  yield
+  if collecting: gc.enable()
 
 @pytest.fixture(scope="session")
 def chip(): return Chip(pci.open_device())  # session-wide, since libttsim can only be initialized once a process

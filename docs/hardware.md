@@ -71,10 +71,11 @@ back to the raw grid for routing calculations.
 | x `1..7, 10..16`, y `2..11` | Tensix; the available columns come from telemetry |
 | `(17 + b//4, 12 + 3*(b%4) + p)` | DRAM bank b, port p, for b `0..7` and p `0..2` |
 | `(19, 24)` | PCIe connected to the host |
-| x `20..31`, y `25` | Ethernet |
+| x `1..7, 10..16`, y `1` | Ethernet, which `bh.ETH` lists by channel. x `20..31`, y `25` also selects the unharvested ones |
 | `(8, 0)` | ARC |
 
-A p150 with twelve available columns has 120 Tensix tiles. The code also
+Rows 0 and 1 aren't translated in x, so ARC and the Ethernet tiles keep their
+raw positions. A p150 with twelve available columns has 120 Tensix tiles. The code also
 handles fourteen columns. Use `chip.tensix` when you need the cores, since the
 list can change with the firmware and harvesting configuration.
 

@@ -2,7 +2,7 @@
 import ast, collections, ctypes, gc, mmap, os, pathlib, random, struct, sys, threading, time, weakref, pytest
 from baretile import bh, pci
 from baretile.hello import hello
-from baretile.runtime import DATA, KERNELS, MCAST_STATE, Runtime, compile_kernel
+from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Runtime, compile_kernel
 
 def test_layers():
   # Modules in baretile/ import only the standard library and the layers below their own. A layer's tests, and the
@@ -33,6 +33,11 @@ def test_layers():
   for p in trees:
     theirs = {name for q in trees if q != p for name in defined[q] if private(name)} - defined[p]
     assert not used[p] & theirs, f"{p.name} uses another file's private {sorted(used[p] & theirs)}"
+
+def test_open_device(chip):
+  # A device has one opener at a time, since two Chips on one chip would hand out the same TLBs and DRAM.
+  with pytest.raises(RuntimeError, match="already open"): pci.open_device()
+  with pytest.raises(ValueError, match="chips"): pci.open_device(64)
 
 def test_config_space(chip):
   assert chip.pci.cfg_read(0x00) == bh.VENDOR | bh.DEVICE << 16
@@ -194,8 +199,8 @@ def test_capability_chain():
   with pytest.raises(RuntimeError, match="capability chain"): card.capability(0x10)
 
 def test_card_sysfs(tmp_path, monkeypatch):
-  # This runs pci.Card and reset against a fake sysfs, so no card is needed. Card unbinds the driver, enables the
-  # device, turns on memory decode and bus mastering, and sets Max Read Request Size to 4 KiB. It maps BAR0, clears the
+  # This runs pci.Card and reset against a fake sysfs, so no card is needed. Card locks config space, unbinds the
+  # driver, enables the device, turns on memory decode and bus mastering, and sets Max Read Request Size to 4 KiB. It maps BAR0, clears the
   # strided multicast of TLBs 0-31 there, and refuses an IOMMU that translates. find_cards finds the card by its ids.
   # reset fires the interface timer, waits for the card to clear the marker, and has the kernel enumerate it again.
   bdf = "0000:01:00.0"
@@ -204,18 +209,28 @@ def test_card_sysfs(tmp_path, monkeypatch):
   for name, text in (("vendor", f"{bh.VENDOR:#x}\n"), ("device", f"{bh.DEVICE:#x}\n"), ("enable", "0"), ("driver/unbind", ""),
                      ("iommu_group/type", "identity\n"), ("remove", "")): (dev / name).write_text(text)
   config = bytearray(4096)  # PCIe capability at 0x40. Device control at 0x48 asks for reads of 512 bytes
+  config[6:8] = (0xF900).to_bytes(2, "little")  # sticky PCI error bits: writing a 1 clears that bit
   config[0x34], config[0x40], config[0x48:0x4A] = 0x40, 0x10, (0x2810).to_bytes(2, "little")
   (dev / "config").write_bytes(config)
+  pwrite = os.pwrite
+  def config_write(fd, data, off):
+    if off == 4 and len(data) == 4:
+      status = int.from_bytes(os.pread(fd, 2, 6), "little") & ~int.from_bytes(data[2:], "little")
+      data = data[:2] + status.to_bytes(2, "little")
+    return pwrite(fd, data, off)
+  monkeypatch.setattr(pci.os, "pwrite", config_write)
   # BAR0, with TLBs left set by an earlier user
   with open(dev / "resource0", "wb") as f: f.truncate(1 << 29), f.seek(bh.TLB_STRIDED), f.write(b"\xff" * 128)
   monkeypatch.setattr(pci, "SYS", str(tmp_path))
   monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
   assert pci.find_cards() == [bdf]
   card, data = pci.Card(bdf), random.randbytes(64)
+  with pytest.raises(RuntimeError, match="already open"): pci.Card(bdf)  # config space stays locked while card is open
   card.write(0x1000, data)
   with open(dev / "resource0", "rb") as f: written = f.read(0x1040)[0x1000:]
   assert (dev / "driver/unbind").read_text() == bdf and (dev / "enable").read_text() == "1" and written == data
   assert card.cfg_read(0x04) & 6 == 6 and card.cfg_read(0x48) & 0xFFFF == 0x5810 and card.read(bh.TLB_STRIDED, 128) == bytes(128)
+  assert card.cfg_read(0x04) >> 16 == 0xF900, "enabling memory decode and bus mastering preserves PCI error status"
   (dev / "iommu_group/type").write_text("DMA\n")
   with pytest.raises(RuntimeError, match="IOMMU"): pci.Card(bdf)
   def back():  # the card clears the marker when its reset is done
@@ -294,13 +309,6 @@ def test_takeover(chip):
   for rt in (first, beside):
     rt.launch(me), rt.wait()
     assert [chip.read32(x, y, rt.args()) for x, y in rt.cores] == [x | y << 6 for x, y in rt.cores]
-
-@pytest.fixture
-def no_gc():  # Python collects only where the test calls gc.collect()
-  collecting = gc.isenabled()
-  gc.disable()
-  yield
-  if collecting: gc.enable()
 
 def test_runtime_shared_dram(chip):
   a = Runtime(chip, end=chip.tensix[1])
@@ -715,12 +723,15 @@ def test_runtime_inputs(chip):
   rt = Runtime(chip, end=chip.tensix[1], ring=64)
   for units in (0, -1, 2**32, 1.5):
     with pytest.raises(ValueError, match="unit"): rt.launch(bytes(16), units=units)
+  for args in ((-1,), (2**32,), (1.5,)):
+    with pytest.raises(ValueError, match="arguments"): rt.launch(bytes(16), args)
   with pytest.raises(ValueError, match="command"): rt.launch(bytes(16), (0,) * 20)
   assert not rt.loaded and not rt.launches
+  with pytest.raises(ValueError, match="never queued"): rt.wait(launch=1)
 
 def test_hung_kernel_times_out(chip):
   # A timeout reports unfinished workers, active cores, synchronization counters and outstanding NoC requests.
-  # Check both a stuck BRISC and a stuck TRISC1 that leaves BRISC waiting for completion.
+  # Check a stuck BRISC, a stuck TRISC1 that leaves BRISC waiting for completion, and a report the dispatcher missed.
   rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel("void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"launch 1, still running on \[\(1, 2\)\]\n  \(1, 2\): launch 1 not finished by "
@@ -728,5 +739,8 @@ def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel(None, None, "void kmain(volatile unsigned *a) { for (;;); }"))
   with pytest.raises(TimeoutError, match=r"\(1, 2\): launch 1 not finished by BRISC, TRISC1\n"): rt.wait(timeout=0.2)
-  rt.close()  # cancellation must not wait for a hung ordinary kernel to return
+  rt = Runtime(chip, end=chip.tensix[1])
+  rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ ((volatile unsigned *){MAILBOX:#x})[5] = noc_me(); }}"))  # reports to itself
+  with pytest.raises(TimeoutError, match=r"launch 1, whose workers all finished, so it missed a report$"): rt.wait(timeout=0.2)
+  rt.close()  # a hung ordinary kernel holds cancellation up for at most the launch's two seconds
   assert rt.resources.closed
