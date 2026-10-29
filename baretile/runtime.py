@@ -1,6 +1,6 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import bisect, collections, functools, hashlib, operator, os, pathlib, shutil, struct, subprocess, tempfile, time, weakref
+import atexit, bisect, collections, functools, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -367,9 +367,25 @@ def _merge_holes(holes):
     (a, n), (b, m) = holes[i - 1], holes[i]
     if a + n == b: holes[i - 1:i + 1] = [(a, n + m)]
 
-# A failed halt must not let Python release memory that the card can still reach. Keep its resources until a
-# later close or takeover can stop the rectangle. A finalizer's callback otherwise disappears even if it raises.
-_stranded = set()
+# _open holds the resources of every runtime that hasn't stopped, and _stranded those of runtimes whose cores stopped
+# before their transfers could be shown finished. Holding them keeps host DMA pages mapped and DRAM reserved while the
+# card may still use them. Collecting a Runtime doesn't stop it: closing goes through the shared TLB window, and a
+# collection can run in the middle of another access to that window. The next Runtime on the chip, an allocation
+# that finds no room, or process exit stops it instead.
+_open, _stranded = set(), set()
+
+def _reap(chip):  # stop the runtimes on chip that were collected without close(). True if any memory came back
+  freed = False
+  for resources in [r for r in _open if r.chip is chip and r.owner() is None]:
+    try: freed |= resources.close()
+    except Exception: pass  # still open, and a later reap, takeover or exit tries again
+  return freed
+
+@atexit.register
+def _exit():  # stop every runtime still running when Python exits, since the card would outlive the host pages
+  for resources in list(_open):
+    try: resources.close()
+    except Exception as e: print(f"baretile: could not stop the runtime from {resources.start} to {resources.end}: {e}", file=sys.stderr)
 
 class _Resources:
   """Own a rectangle, its host DMA views and its DRAM without retaining the Runtime that uses them."""
@@ -377,39 +393,44 @@ class _Resources:
     self.chip, self.start, self.end, self.cores = rt.chip, rt.start, rt.end, {*rt.cores, rt.dispatcher}
     self.owner, self.views, self.used = weakref.ref(rt), views, rt.used
     self.active, self.closed, self.started = True, False, False
+    _open.add(self)
   def close(self):
-    if self.closed: return
-    # Takeover holds only resources. Keep the Runtime alive until cleanup finishes so cyclic collection
-    # during a drain cannot invoke its finalizer and reenter this close. Failed cleanup remains retryable.
-    owner = self.owner()
-    self.active = False
-    try:
-      if self.started:
+    """Stop the rectangle and release its memory, returning whether the memory came back. If a multicast never
+    finishes or the NoC never drains, stop the cores anyway and keep the memory for the rest of the process, so
+    that another runtime can still take the tiles. If halting fails, the memory stays reserved and close can be retried."""
+    if self.closed: return False
+    self.active, settled = False, True
+    if self.started:
+      try:
         self.chip.write32(*self.end, MCAST_STATE, 1, self.start)
         self.chip.wait(lambda: all(self.chip.read32(x, y, MCAST_STATE) == 1 and self.chip.read32(x, y, MCAST_STATE + 4) == 0
                                   for x, y in self.cores),
                        "finish the runtime's active multicasts")
-      self.chip.halt(*self.end, self.start)
+      except TimeoutError: settled = False  # the multicast's counters are wrong until it finishes, so draining can't tell
+    self.chip.halt(*self.end, self.start)
+    try:
       # Read reset back before polling the NoC: requests issued before the cores stopped can still be in flight.
       for x, y in self.cores: self.chip.read32(x, y, bh.SOFT_RESET)
       # Every initiator must finish accepting its command before the transaction counters can be trusted.
-      self.chip.wait(lambda: all(not self.chip.read32(x, y, bh.NIU + i * bh.NIU_REGS["INITIATOR"] + bh.NIU_REGS["CMD"]) & 1
-                                for x, y in self.cores for i in range(4)), "stop issuing the runtime's NoC requests")
-      self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS[kind] + 4 * i) == 0
-                                for x, y in self.cores for kind in ("OUTSTANDING", "OUTGOING") for i in range(16)),
-                     "drain the stopped runtime's NoC requests")
-    except BaseException:
+      if settled:
+        self.chip.wait(lambda: all(not self.chip.read32(x, y, bh.NIU + i * bh.NIU_REGS["INITIATOR"] + bh.NIU_REGS["CMD"]) & 1
+                                  for x, y in self.cores for i in range(4)), "stop issuing the runtime's NoC requests")
+        self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS[kind] + 4 * i) == 0
+                                  for x, y in self.cores for kind in ("OUTSTANDING", "OUTGOING") for i in range(16)),
+                       "drain the stopped runtime's NoC requests")
+    except TimeoutError: settled = False
+    del self.chip.taken[self.start, self.end]
+    _open.discard(self)
+    self.closed = True
+    if not settled:
       _stranded.add(self)
-      raise
+      return False
     self.chip.dram_holes.extend(self.used.items())
     _merge_holes(self.chip.dram_holes)
     self.used.clear()
     for view in self.views: view.release()
     self.views = ()
-    del self.chip.taken[self.start, self.end]
-    self.closed = True
-    _stranded.discard(self)
-    if owner is not None: owner.finalizer.detach()
+    return True
 
 class Runtime:
   """Run kernels on the Tensix rectangle from start to end, using the available tiles by default. The last tile
@@ -459,6 +480,7 @@ class Runtime:
     assert max(len(worker), len(dispatcher)) <= MAILBOX, "firmware overlaps the mailbox"
     # Close the whole old rectangle, including workers we don't take. The old object stays invalid even if a
     # later runtime uses exactly the same rectangle. Disjoint rectangles keep running and share the DRAM holes.
+    _reap(chip)
     for theirs in list(chip.taken.values()):
       if theirs.cores & set(cores): theirs.close()
     chip.halt(*end, start)
@@ -466,7 +488,6 @@ class Runtime:
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))
     chip.taken[start, end] = self.resources
-    self.finalizer = weakref.finalize(self, self.resources.close)
     self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
     self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
     # while tensor.jit records a call: its launches, and the DRAM it took, which dram_free won't give back
@@ -502,7 +523,6 @@ class Runtime:
     """Stop all workers, cancel queued work and release memory. Call wait() first to finish queued work.
     Closing twice is harmless; tensors and recordings from this runtime can no longer run."""
     self.resources.close()
-    self.finalizer.detach()
 
   def __enter__(self): self.check(); return self
   def __exit__(self, *_): self.close()
@@ -632,9 +652,10 @@ class Runtime:
         self.pin(addr)
         return addr
     for resources in self.chip.taken.values():  # another runtime's completed launches can free shared space too
-      if (rt := resources.owner()) is not None and rt.freed:
+      if resources.active and (rt := resources.owner()) is not None and rt.freed:
         rt.wait()
         return self.dram_alloc(size)
+    if _reap(self.chip): return self.dram_alloc(size)  # and so can stopping runtimes that were collected
     raise MemoryError(f"no {size} bytes free in DRAM")
 
   def dram_free(self, addr):

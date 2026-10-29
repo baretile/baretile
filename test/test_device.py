@@ -318,8 +318,8 @@ def test_runtime_shared_dram(chip):
   assert a.holes == [(0, bh.DRAM_BANK_SIZE)]
 
 def test_takeover_during_collection(chip, monkeypatch):
-  # Takeover owns only the old resources. Collecting the Runtime cycle during its drain must not run its
-  # finalizer in the middle of the same close, release allocations twice, or remove the rectangle twice.
+  # Takeover owns only the old resources. Collecting the Runtime cycle during its drain must not close it again in
+  # the middle of the same close, release allocations twice, or remove the rectangle twice.
   collecting = gc.isenabled()
   gc.disable()
   try:
@@ -369,17 +369,18 @@ def test_displaced_runtime_rejects_work(chip):
   assert chip.read32(*b.cores[0], b.args()) == 111
   b.close()
 
-def test_runtime_finalizer_keeps_dma_until_halt(chip, monkeypatch):
+def test_collected_runtime_keeps_dma_until_stopped(chip, monkeypatch):
   if not isinstance(chip.pci, pci.Sim): pytest.skip("mock DMA addresses cannot run on a physical card")
   # A Card-like allocator owns no references to its mmap. No simulator tick is needed: the queued command is
-  # deliberately unfinished when the runtime and its reference cycle are collected.
+  # deliberately unfinished when the runtime and its reference cycle are collected. Collection leaves the card alone,
+  # and the next runtime on the chip stops the collected one before its page goes.
   pages, halted, halt = [], [], chip.halt
   def alloc(size):
     page = mmap.mmap(-1, size)
     pages.append(weakref.ref(page))
     return memoryview(page), 1 << 48
   def stop(*args):
-    if pages: halted.append(pages[-1]() is not None)
+    if pages: halted.append(pages[0]() is not None)
     halt(*args)
   monkeypatch.setattr(chip.pci, "alloc", alloc)
   monkeypatch.setattr(chip.pci, "tick", lambda: pytest.fail("this command must stay queued"))
@@ -390,10 +391,67 @@ def test_runtime_finalizer_keeps_dma_until_halt(chip, monkeypatch):
   assert rt.launches == 1 and rt.finished() == 0
   assert chip.read32(*rt.dispatcher, bh.SOFT_RESET) == bh.NCRISC
   ref, cores = weakref.ref(rt), [*rt.cores, rt.dispatcher]
+  halted.clear()
   del rt
   gc.collect()
-  assert ref() is None and pages[0]() is None and halted == [True]
-  assert all(chip.read32(*xy, bh.SOFT_RESET) == bh.ALL_CORES for xy in cores)
+  assert ref() is None and pages[0]() is not None and halted == [], "collection must not touch the card"
+  assert chip.read32(*cores[-1], bh.SOFT_RESET) == bh.NCRISC
+  with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]):
+    assert pages[0]() is None and halted[0] is True
+    assert all(chip.read32(*xy, bh.SOFT_RESET) == bh.ALL_CORES for xy in cores)
+
+def test_collection_during_another_runtimes_access(chip, monkeypatch):
+  # Python can collect a dropped runtime's reference cycle in the middle of another runtime's chip access. Stopping
+  # it there would move the shared TLB window under that access and send its bytes to the collected runtime's tiles.
+  collecting = gc.isenabled()
+  gc.disable()
+  try:
+    dropped = Runtime(chip, end=chip.tensix[1])
+    dropped.cycle, resources = dropped, dropped.resources
+    with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]) as rt:
+      del dropped
+      x, y = rt.cores[0]
+      chip.write(x, y, DATA, bytes(16))
+      write, collected = chip.pci.write, []
+      def collect_first(off, data):  # where CPython may run a pending collection: entering the next Python call
+        if not collected and off < bh.TLB_WINDOW:
+          collected.append(1)
+          gc.collect()
+        return write(off, data)
+      with monkeypatch.context() as patch:
+        patch.setattr(chip.pci, "write", collect_first)
+        chip.write(x, y, DATA, bytes([0x55]) * 16)
+      assert collected and chip.read(x, y, DATA, 16) == bytes([0x55]) * 16
+      assert not resources.closed, "the collected runtime waits for a safe point"
+  finally:
+    if collecting: gc.enable()
+  with Runtime(chip, start=chip.tensix[2], end=chip.tensix[3]):
+    assert resources.closed and resources not in chip.taken.values()
+
+def test_takeover_after_hung_multicast(chip):
+  # A kernel that never sees its multicast's acknowledgements never leaves the multicast region. Closing it can't
+  # show that its transfers finished, so it resets the cores anyway and keeps its memory. A new runtime can still take
+  # the tiles, as after any other hung kernel.
+  rt = Runtime(chip, end=chip.tensix[1])
+  addr, page = rt.dram_alloc(64), weakref.ref(rt.status.obj)
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) { mcast_begin(); mcast_done(NIU(WR_ACKS) + 1); }"), units=1)
+  with pytest.raises(TimeoutError): rt.wait(timeout=0.5)
+  cores = [*rt.cores, rt.dispatcher]
+  for attempt in range(2):
+    with Runtime(chip, end=chip.tensix[1]) as fresh:
+      assert all(chip.read32(*xy, MCAST_STATE + 4) == 0 for xy in cores)
+      fresh.launch(compile_kernel("void kmain(volatile unsigned *a) { a[0] = 7; }"))
+      fresh.wait()
+      assert chip.read32(*fresh.cores[0], fresh.args()) == 7
+      assert fresh.dram_alloc(64) != addr, "the hung runtime's DRAM may still be written"
+  assert page() is not None and rt.used == {addr: 64}, "nor may its host page be released"
+  with pytest.raises(RuntimeError, match="closed"): rt.launch(bytes(16))
+  # The kernel never issued its multicast, so the tests that follow can have the memory back
+  import baretile.runtime as runtime
+  runtime._stranded.discard(rt.resources)
+  chip.dram_holes.extend(rt.used.items())
+  runtime._merge_holes(chip.dram_holes)
+  rt.used.clear()
 
 @pytest.mark.parametrize("kind,tag", [("OUTSTANDING", 1), ("OUTSTANDING", 15), ("OUTGOING", 3), ("CMD", 2)])
 def test_runtime_close_drains_all_transactions(chip, monkeypatch, kind, tag):

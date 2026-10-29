@@ -54,7 +54,7 @@ class Sim:
     addresses, 4 GiB apart. The last memoryview releases the mapping, as it does on a card."""
     buf, bus = mmap.mmap(-1, size), Sim.next_bus
     Sim.next_bus += 1 << 32
-    def release(_): Sim.dma[:] = [entry for entry in Sim.dma if entry[0] != bus]
+    def release(_): Sim.dma = [entry for entry in Sim.dma if entry[0] != bus]  # a new list, since dma_copy may be going through the old one
     Sim.dma.append((bus, size, ctypes.addressof(ctypes.c_char.from_buffer(buf)), weakref.ref(buf, release)))
     return memoryview(buf), bus
   fault = None  # an error in a DMA callback, which ctypes can't raise through C. tick raises it
