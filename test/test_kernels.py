@@ -944,9 +944,15 @@ def test_replay_keeps_pushes_small():
   tile = lambda op: len(c.unpack(0, 1)) + len(c.math_begin(op == "mul") + c.elementwise(op, slots) + c.MATH_END) + len(c.pack(0, 0, c.SEM_L1))
   assert tile("add") <= 27 and tile("mul") <= 28, "a tile's repeating runs replayed, a word each"
   assert len(c.step_unpack(0) + c.matmul(slots)) <= 12, "a matmul step's phases replayed"
-  assert len(c.sfpu(["recip"], c.allocate({"recip"}))) <= 3, "32 passes of 12 words: one REPLAY word, in a loop"
+  assert len(c.sfpu(["recip"], c.allocate({"recip"}))) <= 3, "32 passes of 10 words: one REPLAY word, in a loop"
   for names in ({"mm", "mul"}, {"exp", "recip", "relu", "mm", "mul"}):  # what is recorded fits the 32-entry buffer
-    assert sum(len(c.MATH_RUNS[n]) for n in c.allocate(names)) <= 32
+    assert sum(n for _, n in c.allocate(names).values()) <= 32
+  # Only the transcendentals, with their long range reductions, don't fit on their own. A run left out records what fits.
+  assert {n for n, (_, body) in c.SFPU.items() if len(body) > 32} == {"exp", "exp2", "fexp", "fexp2", "log", "log2", "sin", "cos"}
+  assert c.run(c.allocate({"sin"}), "sin") == [c.replay(0, 32)] + c.MATH_RUNS["sin"][32:]
+  # The programs that a kernel runs together for rsqrt, a row's rsqrt, where and int32 minimum are all recorded whole
+  for names in ({"sqrt", "recip"}, {"sum2", "sqrt"}, {"fcmplt", "keep", "drop", "join"}, {"icmplt", "keep", "drop", "join"}, {"isub", "imax"}):
+    assert {name: n for name, (_, n) in c.allocate(names).items()} == {name: len(c.MATH_RUNS[name]) for name in names}, names
 
 def test_sfpu(chip):
   # relu is exact, and exp and 1/x are within a bf16 step: they run in fp32 on the SFPU and the packer rounds once. The
@@ -974,8 +980,8 @@ def test_sfpu(chip):
   a, b, c = (Tensor.of(rt, [[bf(random.uniform(-1, 1)) for _ in range(64)] for _ in range(64)]) for _ in range(3))
   launches, fused = rt.launches, ((a @ b) + c).relu().tolist()
   assert kernels(rt, launches) == 1 and fused == unfused(((a @ b) + c).relu()).tolist()
-  # Next, the three SFPU programs run in one kernel. exp's 38 words don't fit the 32-entry replay buffer, so it runs
-  # word by word, while recip and relu are replayed.
+  # Next, the three SFPU programs run in one kernel. recip and relu are replayed. exp's 38 words don't fit the 32-entry
+  # replay buffer with them, so the 18 that do are replayed and the rest pushed.
   u = [[bf(random.uniform(-3, 3)) for _ in range(64)] for _ in range(64)]
   w = [[bf(random.choice((-1, 1)) * random.uniform(0.5, 2)) for _ in range(64)] for _ in range(64)]
   tu, tw = Tensor.of(rt, u), Tensor.of(rt, w)

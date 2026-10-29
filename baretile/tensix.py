@@ -250,10 +250,10 @@ CONSTS = bh.LREG_CONSTS  # constant LRegs
 ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
 CC_ON, CC_ALL, CC_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags: on, all set, off
 NAN, INF = 0x7FC00000, 0x7F800000
-def nans(x, t, inf, mask=False):  # marks the lanes where LReg x is NaN, in LReg t or in the lane flags
-  # A lane is NaN where |x| is above the bits of inf (which LReg inf holds) in SFPGT's order. With mask, LReg t gets
-  # all ones there. Without it, the lane flags are set, so an SFPMOV between CC_ON and CC_OFF can give those lanes NaN.
-  return [*sfp_bits(inf, INF), ins("SFPABS", vd=t, vc=x, mod1=1), ins("SFPGT", vd=t, vc=inf, mod1=8 if mask else 1)]
+def nans(x, t, inf):  # sets the lane flags where LReg x is NaN, using LRegs t and inf
+  # A lane is NaN where |x| is above the bits of inf (which LReg inf gets) in SFPGT's order. An SFPMOV between CC_ON
+  # and CC_OFF can then give those lanes NaN.
+  return [*sfp_bits(inf, INF), ins("SFPABS", vd=t, vc=x, mod1=1), ins("SFPGT", vd=t, vc=inf, mod1=1)]
 def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # with flags on, keeps lanes where int LReg e >= n
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n. both overwrite LReg t
 # LReg d = cs[0] + cs[1] x + ..., by Horner. Each coefficient goes into LReg temp when it's needed, except 0 and +-1,
@@ -293,13 +293,31 @@ def exp(base2, nan=False):
            *([sfp_load(0), CC_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), CC_OFF] if nan else []), sfp_store(4)])
 
 def recip(nan=False):
-  """1/x: the 7-bit estimate from SFPARECIP, then two Newton steps y += y * (1 - x * y). The steps only run where x is
-  normal. The estimate is inf for 0 and denormals and 0 for inf, so a step would make 0 * inf = NaN. Those lanes keep
-  the estimate. With nan, for fp32, a NaN gets NaN back instead of its estimate of 0."""
-  return ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), ins("SFPEXEXP", vd=3, vc=0),  # LReg 3: unbiased exponent
-               CC_ON, below(3, 128, 4), at_least(3, -126, 4),  # the lanes with exponent in [-126, 128)
-               mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
+  """1/x: the 7-bit estimate y from SFPARECIP, then two Newton steps y += y e, with e = 1 - x y. The estimate is inf
+  for 0 and denormals and 0 for inf, where e is 0 * inf = NaN. The steps only run where the first e is below 1 in
+  magnitude, which its exponent tells, so those lanes keep the estimate. So does an x past 2^126, whose estimate is
+  the 0 that the steps would leave. With nan, for fp32, a NaN gets NaN back instead of its estimate of 0."""
+  return ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), mad(2, 0, 1, ONE, neg=1), CC_ON, ins("SFPEXEXP", vd=3, vc=2, mod1=2),
+               mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
                *([CC_ALL, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), CC_OFF, sfp_store(1)])
+
+def sqrt():
+  """sqrt(x) by Goldschmidt's iteration. y = 0x5F3759DF minus half the bits of x is 1/sqrt(x) within 3.5%, and g = x y
+  and h = y / 2 approach sqrt(x) and 1/(2 sqrt(x)). A step multiplies both by 1 + r, with r = 1/2 - g h, and the second
+  step only g. The last is Newton's g += h (x - g^2), as g (1 - g h) + x h, which also corrects the rounding that the
+  first two leave between g and h. Every value stays near sqrt(x), 1/sqrt(x) or 1/2, so none underflows or overflows
+  for normal x, and the result is within a step or two of fp32's.
+
+  x y and x h subtract 0 rather than add it, so that a zero keeps its sign and comes back as it is, like a denormal,
+  which is flushed to one. The result is x where x is above the largest float in SFPGT's order (inf and NaN), and NaN
+  where it's below minus the largest denormal."""
+  return (sfp_bits(4, 0x5F3759DF) + sfp_const(5, 0.5) + sfp_bits(6, 0x7F7FFFFF) + sfp_bits(7, 0x807FFFFF),
+          [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF), ins("SFPIADD", vd=1, vc=4, mod1=6),  # LReg 1: y
+           mad(2, 0, 1, ZERO, neg=2), mul(1, 1, 5),  # LReg 2: g, 1: h
+           mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2), mad(1, 1, 3, 1), mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2),  # LReg 3: r
+           mad(3, 2, 1, ONE, neg=1), mad(1, 0, 1, ZERO, neg=2), mad(2, 2, 3, 1),  # g (1 - g h) + x h
+           CC_ON, ins("SFPGT", vd=0, vc=6, mod1=1), ins("SFPMOV", vd=2, vc=0),
+           CC_ALL, ins("SFPGT", vd=7, vc=0, mod1=1), *sfp_bits(2, NAN), CC_OFF, sfp_store(2)])
 
 def log(scale):
   """log2(x) * scale. Write x = 2^e m with m in [sqrt(1/2), sqrt(2)). m starts in [1, 2), and where it's above sqrt 2
@@ -348,20 +366,7 @@ SFPU = {
   # raw store works for int32 too.
   "relu": ([], [sfp_load(), ins("SFPMOV", vd=1, vc=ZERO), ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0, mod0=RAW)]),
   "exp": exp(False), "exp2": exp(True), "log": log(math.log(2)), "log2": log(1), "sin": sin(0.0), "cos": sin(0.5),
-  "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True),
-  # Write x = m * 2^(2q), with m in [1, 4). Three inverse-sqrt Newton steps on m avoid intermediate underflow
-  # and overflow throughout the normal fp32 range. Multiply m / sqrt(m) by 2^q. Preserve signed zero and inf;
-  # negative normal values give NaN. Subnormal inputs flush to zero, like the other SFPU arithmetic.
-  "sqrt": (sfp_const(2, struct.unpack("<f", struct.pack("<I", 0x5F3759DF))[0]) + sfp_const(3, 1.5) + sfp_const(4, 0.5),
-           [sfp_load(), ins("SFPEXEXP", vd=7, vc=0), ins("SFPMOV", vd=6, vc=7), ins("SFPLOADI", vd=1, mod0=2, imm16=1),
-            ins("SFPAND", vd=6, vc=1), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=127), ins("SFPSETEXP", vd=6, vc=0),
-            ins("SFPMOV", vd=0, vc=6), ins("SFPSHFT", vd=7, mod1=3, imm12=-1 & 0xFFF),
-            ins("SFPIADD", vd=7, vc=7, mod1=5, imm12=127), ins("SFPSHFT", vd=7, mod1=1, imm12=23),
-            ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF), ins("SFPIADD", vd=1, vc=2, mod1=6), mul(5, 0, 4)] +
-           [w for _ in range(3) for w in (mul(6, 1, 1), mad(6, 5, 6, 3, neg=1), mul(1, 1, 6))] +
-           [mul(1, 1, 0), mul(1, 1, 7), sfp_load(), ins("SFPEXEXP", vd=6, vc=0, mod1=1),
-            CC_ON, at_least(6, 255, 5), ins("SFPMOV", vd=1, vc=0), CC_ALL, ins("SFPSETCC", vc=0), *sfp_bits(1, NAN),
-            CC_ALL, below(6, 1, 5), ins("SFPMOV", vd=1, vc=0), CC_OFF, sfp_store(1)]),
+  "fexp": exp(False, True), "fexp2": exp(True, True), "recip": recip(), "frecip": recip(True), "sqrt": sqrt(),
 }
 # Binary ops on the SFPU. x and y reach Dst by being added to zero, x at the op's Dst half and y 128 rows further on.
 # They load into LRegs 0 and 1, and the result is stored over x. Comparisons give 1.0 or 0: the all ones or 0 from
@@ -370,31 +375,37 @@ SFPU = {
 # bits, so an inf in the value that isn't picked doesn't make a NaN, as c * x would. c's test is a float's, so an int32
 # c comes as 0 or 1 (Tensor.where).
 def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
-# Map two's complement to SFPGT's total order, including INT32_MIN. Complement only the magnitude bits of
-# negatives: -1 becomes negative zero, ordered below positive zero. Applying the same map restores the input.
+# fp32 comparisons start from x + 0 and y + 0, which turn -0 into 0 and a NaN into 0x7FC00000, the top of SFPGT's
+# order. -(-(y + 0) - 0) then gives y + 0 back, but its NaN negated, at the bottom: an SFPMAD's NaN is always
+# 0x7FC00000, and subtracting 0 keeps a zero's sign. Where either is NaN, x > y holds and y > x doesn't, so one SFPGT
+# makes each comparison.
+UNORDERED = [mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), mad(1, 1, MINUS_ONE, ZERO, neg=2), ins("SFPMOV", vd=1, vc=1, mod1=1)]
+# Map two's complement to SFPGT's sign-magnitude order, including INT32_MIN: XOR a negative with its sign spread over
+# the magnitude bits, by an arithmetic shift right by 31 and then a logical one by 1. -1 becomes negative zero, below
+# positive zero. Applying the same map restores the input.
 def integer_order(*regs):
-  return [*sfp_bits(2, 0x7FFFFFFF), CC_ON, *[w for r in regs for w in
-          (CC_ALL, ins("SFPSETCC", vc=r), ins("SFPXOR", vd=r, vc=2))], CC_OFF]
-BINARY = {"max", "cmplt", "cmpne", "keep", "drop", "join"}
+  return [w for r in regs for w in (ins("SFPSHFT", vd=2, vc=r, mod1=7, imm12=-31 & 0xFFF), ins("SFPSHFT", vd=2, mod1=1, imm12=-1 & 0xFFF),
+                                    ins("SFPXOR", vd=r, vc=2))]
+BINARY = {"max", "cmplt", "cmple", "cmpne", "keep", "drop", "join"}
 # In an fp32 kernel the SFPU also does add, sub and mul, rounding once as fp32 does. There, exp, the reciprocal and
 # the comparisons handle NaN the IEEE way. The bf16 versions skip that work, since a bf16 NaN is already inf before the
 # SFPU sees it.
 FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt",
-            "cmpne": "fcmpne"}
-INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmpne": "icmpne",  # int32's own programs
+            "cmple": "fcmple", "cmpne": "fcmpne"}
+INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmple": "icmple", "cmpne": "icmpne",  # int32's own programs
              "keep": "keep", "drop": "drop", "join": "join"}
 CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # the SFPU program for a cast
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
   "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmple": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0),
+                       ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
   "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
                        ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "fcmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 2, 4, True), *nans(1, 3, 4, True), ins("SFPOR", vd=2, vc=3),
-                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPNOT", vd=2, vc=2), ins("SFPAND", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE),
-                       sfp_store(1))),
-  "fcmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), *nans(0, 3, 4, True), ins("SFPMOV", vd=2, vc=0),
-                       ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPOR", vd=1, vc=3),
-                       ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "fcmplt": ([], binary(*UNORDERED, ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "fcmple": ([], binary(*UNORDERED, ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
+  "fcmpne": ([], binary(*UNORDERED, ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8),
+                        ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "keep": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0, mod1=1), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
@@ -402,14 +413,17 @@ SFPU |= {
   "join": ([], binary(ins("SFPOR", vd=0, vc=1), sfp_store(0, mod0=RAW))),
   "fadd": ([], binary(mad(0, 0, ONE, 1), sfp_store(0))), "fsub": ([], binary(mad(0, 1, ONE, 0, neg=1), sfp_store(0))),
   "fmul": ([], binary(mul(0, 0, 1), sfp_store(0))),
-  # int32 stays two's complement in L1, Dst and LRegs. Ordering uses the reversible map above. A comparison gives 1, not 1.0.
+  # int32 stays two's complement in L1, Dst and LRegs. Ordering uses the reversible map above. A comparison gives 1, not
+  # 1.0: 0 minus SFPGT's all ones, or for <=, x > y's all ones plus 1.
   "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, mod0=RAW))),
   "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, mod0=RAW))),
   "imax": ([], binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0), sfp_store(0, mod0=RAW))),
-  "icmplt": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=1, vc=0, mod1=8),
-                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  "icmplt": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPIADD", vd=1, vc=ZERO, mod1=6),
+                        sfp_store(1, mod0=RAW))),
+  "icmple": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPIADD", vd=0, vc=0, mod1=5, imm12=1),
+                        sfp_store(0, mod0=RAW))),
   "icmpne": ([], binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
-                        ins("SFPLOADI", vd=2, mod0=2, imm16=1), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+                        ins("SFPIADD", vd=1, vc=ZERO, mod1=6), sfp_store(1, mod0=RAW))),
   # Casts. itof turns an integer into sign-magnitude, then into a float, rounding to nearest (exact below 2^24). ftoi
   # rounds a float toward 0 by shifting its mantissa, hidden bit included, by its exponent - 23. It gives 0 where the
   # exponent is negative, and negates the result for a negative float.
@@ -508,19 +522,26 @@ MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i ==
 MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
 def allocate(names):
-  """Assign runs to the math thread's replay buffer. Prioritize SFPU bodies because they repeat 32 times per
-  tile, allocating the longest first. Matmul phases repeat up to four times a step and mul's four times a tile,
-  and they get the remaining space. Push runs that don't fit one word at a time."""
+  """Assign runs to the math thread's replay buffer, as {name: (index, words recorded)}. Prioritize SFPU bodies
+  because they repeat 32 times per tile, a reduction's folds first, since they run on every tile it sweeps and the
+  ops on its result once. Then allocate the longest first. Matmul phases repeat up to four times a step and mul's
+  four times a tile, and they get the remaining space. The first run that doesn't fit records the words that still
+  do, so its TRISC pushes only the rest, after a REPLAY. Other runs that don't fit are pushed one word at a time."""
   slots, at = {}, 0
   # the name breaks ties, so different processes build the same kernel
-  for name in sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), -len(MATH_RUNS[n]), n)):
-    if at + len(MATH_RUNS[name]) <= 32: slots[name], at = at, at + len(MATH_RUNS[name])
+  order = sorted(names, key=lambda n: (n in ("mm", "mmT", "mul"), n not in COMBINE, -len(MATH_RUNS[n]), n))
+  for name in order:
+    if at + len(MATH_RUNS[name]) <= 32: slots[name], at = (at, len(MATH_RUNS[name])), at + len(MATH_RUNS[name])
+  rest = next((name for name in order if name not in slots), None)
+  if rest and at < 32: slots[rest] = (at, 32 - at)
   return slots
-def run(slots, name, count=None):  # the first count words of a run: one REPLAY if it was recorded, or else the words
+def run(slots, name, count=None):  # the first count words of a run: a REPLAY of those recorded, then the others
   words = MATH_RUNS[name][:count]
-  return [replay(slots[name], len(words))] if name in slots else words
+  if name not in slots: return words
+  at, n = slots[name]
+  return [replay(at, min(n, len(words)))] + words[n:]
 def runs(slots, name, times): return [Loop(times, run(slots, name))]  # a C loop is fine, since the math TRISC runs ahead of its pushes
-def math_runs(slots): return [w for name, at in slots.items() for w in record(at, MATH_RUNS[name])]  # recorded at setup
+def math_runs(slots): return [w for name, (at, n) in slots.items() for w in record(at, MATH_RUNS[name][:n])]  # recorded at setup
 
 def release(word):  # the same ELW*/MVMUL with clear_dvalid set, so both Src banks go back to the unpackers
   first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]
