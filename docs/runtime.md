@@ -27,10 +27,16 @@ Closing first requests cancellation and lets active multicasts finish their
 acknowledgements. Multicast helpers check cancellation before issuing a new
 transfer. It then resets the cores and drains outstanding NoC requests before
 releasing host DMA and DRAM memory.
-Closing again is harmless. Collection and process exit perform the same cleanup,
-including runtimes in reference cycles. If stopping fails, memory stays reserved
-until a later close or takeover succeeds. Cleanup only stops its own rectangle
-and retains allocations when transfer completion cannot be established.
+Closing again is harmless. Process exit closes every runtime still running.
+Collecting a runtime without closing it doesn't touch the card, since a
+collection can interrupt another runtime's access to the shared TLB window. Its
+cores keep running and its memory stays reserved until the next runtime on the
+chip starts, an allocation finds no free DRAM, or the process exits; any of these
+closes it. If a multicast never finishes or the NoC never drains, closing resets
+the cores anyway and keeps the runtime's host page and DRAM for the rest of the
+process, so a new runtime can still take over a hung rectangle. If resetting the
+cores fails, the memory stays reserved until a later close or takeover succeeds.
+Cleanup only stops its own rectangle.
 
 Custom kernels must use acknowledged reads, writes and atomics, and wait for
 completion before returning. Unacknowledged writes have no completion counter;
