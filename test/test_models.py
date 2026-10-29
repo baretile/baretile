@@ -1311,7 +1311,7 @@ def test_serve_timeout(tmp_path):
   import queue, urllib.error, urllib.request
   class Hung:
     tok, places, waiting, room = bytes_tokenizer(tmp_path), 64, queue.Queue(), threading.BoundedSemaphore(1)
-    lock, failed = threading.Lock(), False
+    lock, failed, busy = threading.Lock(), False, [None]
     offer = serve.Engine.offer
   hung = Hung()
   http = serve.server(hung, "hung", port=0, wait=0.2)
@@ -1419,6 +1419,58 @@ def test_request_sampling_failure(tmp_path):
   engine.busy[0] = engine.waiting.get_nowait()
   assert engine.take(0, np.array([1., 0.])) and later.made == [0]
 
+def host_engine():  # one slot of an Engine, with what offer and take use. Its requests save no session
+  import queue
+  engine = object.__new__(serve.Engine)
+  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(1)
+  engine.waiting, engine.busy, engine.held, engine.places, engine.save = queue.Queue(), [None], [[1]], 4096, lambda u: None
+  def seat(r):  # offers r and puts it in the slot, as admit would
+    assert engine.offer(r)
+    engine.busy[0] = engine.waiting.get_nowait()
+    return r
+  engine.seat = seat
+  return engine
+
+def test_request_host_failures(tmp_path):
+  # Request.take runs on the host, apart from a Head reading its row from the chip. A failure of the request's own work,
+  # here its output constraint, ends that request alone, whatever its type. A failed read, as when the chip hangs or its
+  # runtime closes, still stops the engine, though RecursionError is a RuntimeError too.
+  tok, engine = bytes_tokenizer(tmp_path), host_engine()
+  def recurse(text, pending=b""): return recurse(text, pending)
+  def broken(text, pending=b""): return text.get("x")
+  for shape, error in ((recurse, "RecursionError"), (broken, "AttributeError")):
+    r = engine.seat(serve.Request(tok, [1], temperature=0, shape=shape))
+    assert engine.take(0, np.array([0., 1.])) and engine.busy == [None] and not engine.failed
+    assert r.finish == "error" and r.error.startswith(error) and r.room is None and r.out.get_nowait() is None
+  for failure in (TimeoutError, RuntimeError):
+    def hung(): raise failure("the chip failed")
+    r = engine.seat(serve.Request(tok, [1], temperature=0, presence=1.0))  # a penalty reads the whole row
+    with pytest.raises(failure): engine.take(0, serve.Head([1.0], [1], 0.0, hung))
+    r.end(); engine.busy[0] = None
+
+def test_json_nesting_limit(tmp_path):
+  # Arrays and objects nest at most serve.NESTING deep in constrained JSON. A model that keeps opening brackets ends its
+  # request with an error instead of recursing past Python's limit in the engine thread. Deeper schemas and constants
+  # are rejected as the request is parsed.
+  n, tok = serve.NESTING, bytes_tokenizer(tmp_path)
+  fits = serve.formatted({"type": "json_object"})
+  assert fits('{"a": ' + "[" * (n - 1)) == 1 and fits('{"a": ' + "[" * n) == 0 and fits('{"a": ' + "[" * (n - 1) + "]" * (n - 1) + "}") == 2
+  schema = lambda sc: serve.formatted({"type": "json_schema", "json_schema": {"schema": sc}})
+  deep, nested = {}, 1
+  for _ in range(n - 1): deep = {"type": "array", "items": deep}
+  for _ in range(n): nested = [nested]
+  assert schema(deep)("[" * n) == 1 and schema(deep)("[" * (n + 1)) == 0 and schema({"const": nested})(json.dumps(nested)) == 2
+  for sc in ({"items": deep}, {"const": [nested]}, {"type": "array", "items": {"enum": [nested]}}):
+    with pytest.raises(ValueError, match="nest"): schema(sc)
+  engine = host_engine()
+  r = engine.seat(serve.Request(tok, [1], max_tokens=4000, temperature=0, eos=[0], shape=fits))
+  for c in '{"a": ' + "[" * 3000:
+    logits = np.full(256, -np.inf)
+    logits[ord(c)] = 1
+    if engine.take(0, logits): break
+  assert r.finish == "error" and "output constraint" in r.error and not engine.failed and engine.busy == [None]
+  assert tok.decode(r.made) == '{"a": ' + "[" * (n - 1)
+
 def test_http_input_limits(tmp_path):
   import socket
   engine = SimpleNamespace(tok=bytes_tokenizer(tmp_path), places=64)
@@ -1469,6 +1521,46 @@ def test_http_input_limits(tmp_path):
     http.shutdown(); http.server_close(); thread.join(timeout=2)
     assert not thread.is_alive()
 
+def test_http_connection_limits(tmp_path):
+  # The connection limits follow the engine's slots, so one client can fill them all, but one address can't hold more
+  # than a quarter of the handlers. Its idle sockets get 429 past that, and other clients are still served.
+  import socket
+  tok = bytes_tokenizer(tmp_path)
+  wide = serve.server(SimpleNamespace(tok=tok, places=64, busy=[None] * 40), "wide", port=0)
+  assert (wide.connections, wide.per_client) == (192, 48), "more than 32 slots need more than 32 connections"
+  wide.server_close()
+  with pytest.raises(ValueError): serve.server(SimpleNamespace(tok=tok, places=64, busy=[None]), "bad", port=0, per_client=0)
+  http = serve.server(SimpleNamespace(tok=tok, places=64, busy=[None] * 2), "limits", port=0, input_wait=5)
+  thread = threading.Thread(target=http.serve_forever, daemon=True)
+  thread.start()
+  def connect(client):
+    try: return socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=5, source_address=(client, 0))
+    except OSError as e: pytest.skip(f"no loopback connection from {client}: {e}")
+  def read(s):
+    out = b""
+    while chunk := s.recv(4096): out += chunk
+    return out
+  def until(done, what):
+    end = time.monotonic() + 5
+    while not done():
+      if time.monotonic() > end: pytest.fail(what)
+      time.sleep(0.001)
+  idle = []
+  try:
+    for k in range(http.per_client):  # each holds a handler that waits for headers
+      idle.append(connect("127.0.0.2"))
+      until(lambda: http.clients["127.0.0.2"] == k + 1, "the server did not take the connection")
+    with connect("127.0.0.2") as extra: assert read(extra).startswith(b"HTTP/1.0 429")
+    with connect("127.0.0.3") as other:
+      other.sendall(b"GET /v1/models HTTP/1.0\r\n\r\n")
+      assert read(other).startswith(b"HTTP/1.0 200")
+    for s in idle: s.close()
+    until(lambda: not http.clients, "closed connections must release their handlers")
+  finally:
+    for s in idle: s.close()
+    http.shutdown(); http.server_close(); thread.join(timeout=2)
+    assert not thread.is_alive()
+
 def test_download_redirect_credentials(tmp_path, monkeypatch):
   import http.server, urllib.request
   received = []
@@ -1515,7 +1607,7 @@ def test_tokenizer_without_specials(tmp_path):
 def test_serve_bad_requests(tmp_path):
   import urllib.error, urllib.request
   class Stand:
-    tok, places, failed = bytes_tokenizer(tmp_path), 64, False
+    tok, places, failed, busy = bytes_tokenizer(tmp_path), 64, False, [None]
     def offer(self, r):
       if self.failed: raise RuntimeError("engine failed")
       r.finish = "stop"
@@ -1538,6 +1630,40 @@ def test_serve_bad_requests(tmp_path):
     stand.failed = True
     with pytest.raises(urllib.error.HTTPError) as e: ask({"prompt": "Hi"})
     assert e.value.code == 503
+  finally: http.shutdown(); http.server_close()
+
+def test_tool_definitions(tmp_path):
+  # Tool definitions that calls and chosen can't read get HTTP 400 as the request is parsed, before any reaches the
+  # engine thread. So does a body nested too deeply for the JSON parser. Boolean property schemas and null parameters work.
+  import urllib.error, urllib.request
+  class Stand:  # answers every request with a call to f
+    tok, places, busy, offered = bytes_tokenizer(tmp_path), 4096, [None], 0
+    def offer(self, r):
+      self.offered += 1
+      r.out.put("<tool_call>\n<function=f>\n<parameter=x>\n[1]\n</parameter>\n</function>\n</tool_call>")
+      r.finish = "stop"
+      r.end()
+      return True
+  stand = Stand()
+  http = serve.server(stand, "qwen", "<|im_start|> <tool_call>\n<function=", port=0)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  def ask(body):
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/chat/completions", data), timeout=10)
+  tool = lambda **kw: [{"type": "function", "function": {"name": "f"} | kw}]
+  messages = [{"role": "user", "content": "Hi"}]
+  try:
+    for tools in ({}, "f", [None], [{"function": "f"}], [{"function": {"name": ""}}], tool(parameters="oops"), tool(parameters=[]),
+                  tool(parameters={"properties": "x"}), tool(parameters={"properties": {"x": "string"}})):
+      for choice in ("auto", "required"):
+        with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages, "tools": tools, "tool_choice": choice})
+        assert e.value.code == 400 and json.load(e.value)["error"]["message"], (tools, choice)
+    with pytest.raises(urllib.error.HTTPError) as e: ask(b'{"messages": ' + b"[" * 100000 + b"]" * 100000 + b"}")
+    assert e.value.code == 400 and stand.offered == 0
+    for tools, x in ((tool(parameters={"type": "object", "properties": {"x": True}}), "[1]"), (tool(parameters=None), "[1]"),
+                     (tool(parameters={"properties": {"x": {"type": "array"}}}), [1])):
+      made = json.load(ask({"messages": messages, "tools": tools, "tool_choice": "required"}))["choices"][0]["message"]["tool_calls"]
+      assert [json.loads(c["function"]["arguments"]) for c in made] == [{"x": x}], tools
   finally: http.shutdown(); http.server_close()
 
 def test_engine_failure():
@@ -1891,6 +2017,53 @@ def test_session_snapshot_without_device_space(chip):
   engine.save(0)
   assert engine.sessions[(1, 2)] == want and isinstance(engine.sessions[(3, 4)][1], Tensor), "evict before copying"
 
+def test_session_restore_without_device_space(chip):
+  # A session kept on the host that no longer fits in DRAM is dropped when a prompt would restore it. Uploads that fit
+  # are freed, the slot keeps its state, and the prompt prefills from the start. Copies to the chip that fit before
+  # a save fails are freed too. With room again, the session restores.
+  import collections
+  rt, engine = Runtime(chip), object.__new__(serve.Engine)
+  conv = lambda v: Tensor.of(rt, np.full((3, 2, 32), v, np.float32).tolist(), "fp32")
+  slot = lambda v: [(qwen.Row(conv(v), 1), Tensor.full(rt, 32, 32, v, "fp32")), Tensor.full(rt, 64, 32, v)]
+  contents = lambda s: [value(s[0][0].t), value(s[0][1]), value(s[1])]
+  engine.rt, engine.c, engine.linear = rt, llama.model(layer_types=["linear_attention", "full_attention"]), True
+  engine.slot, engine.held, engine.taken, engine.coherent, engine.busy, engine.used = [slot(7)], [[1, 2]], [1.0], [True], [None], [0]
+  engine.sessions, engine.park, engine.keep = collections.OrderedDict(), 0, 1 << 20
+  engine.save(0)  # to host memory, since park is 0
+  kept = engine.sessions[(1, 2)]
+  engine.slot[0], engine.held[0] = slot(5), []
+  before = contents(engine.slot[0])
+  rt.wait()
+  tail = max(rt.holes)
+  assert tail[1] > 8192 + 64
+  for spare in (0, 8192):  # every hole keeps 64 bytes, and the free tail of DRAM spare more: room for two 4 KiB allocations
+    reserved = [rt.dram_alloc(room - 64 - (spare if (addr, room) == tail else 0)) for addr, room in sorted(rt.holes) if room > 64]
+    try:
+      rt.wait()
+      free = sorted(rt.holes)
+      if spare:
+        engine.park, engine.held[0] = 1 << 20, [4]
+        engine.save(0)  # copies the convolution row and the state, then fails on the KV rows
+        rt.wait()
+        assert isinstance(engine.sessions.pop((4,))[1], bytes) and sorted(rt.holes) == free, "free partial copies"
+        engine.park, engine.held[0] = 0, []
+      engine.busy[0], engine.sessions[(1, 2)] = None, kept
+      r = serve.Request(None, [1, 2, 3])
+      engine.admit(r)  # with room, uploads the index row and the convolution row, then fails on the state
+      rt.wait()
+      assert sorted(rt.holes) == free, "free partial uploads"
+    finally:
+      for addr in reserved: rt.dram_free(addr)
+      rt.wait()
+    assert engine.busy[0] is r and r.cached == 0 and engine.held[0] == [] and not engine.sessions
+    assert all(np.array_equal(a, b) for a, b in zip(contents(engine.slot[0]), before)), "the slot keeps its state"
+  engine.busy[0], engine.sessions[(1, 2)] = None, kept
+  r = serve.Request(None, [1, 2, 3])
+  engine.admit(r)
+  history, state, kv = contents(engine.slot[0])
+  assert r.cached == 2 and engine.held[0] == [1, 2] and (history[:, 1] == 7).all() and (history[:, 0] == 5).all()
+  assert (state == 7).all() and (kv[:, :32] == 7).all() and (kv[:, 32:] == 5).all()
+
 def test_prompt_snapshot_includes_prediction(chip, tmp_path):
   rt, rng = Runtime(chip), np.random.default_rng(31)
   c, weights = qwen35(rng)
@@ -1947,7 +2120,7 @@ def test_chat_tools(tmp_path):
   prompt = serve.chat(qwen, again + messages[3:], tools=tools)
   assert "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n2\n</parameter>" in prompt
   class Stand:  # an engine that answers requests with `said`, 7 characters at a time
-    tok, places, waiting = bytes_tokenizer(tmp_path), 4096, queue.Queue()
+    tok, places, waiting, busy = bytes_tokenizer(tmp_path), 4096, queue.Queue(), [None]
     def offer(self, r): self.waiting.put(r); return True  # there's room for any request
     def run(self):
       while r := self.waiting.get():
