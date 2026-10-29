@@ -47,7 +47,14 @@ testing. The MXFP4 test also needs safetensors, `test_tokenizer` needs
 tiktoken, and the adapter tests need tinygrad at the commit that CI pins (see
 [models](models.md#tinygrad-and-pytorch)). With a checkout in `TINYGRAD`, they
 fail instead of skipping when tinygrad doesn't import. Check pytest's skipped
-tests if you expected one of these comparisons to run.
+tests if you expected one of these comparisons to run, or set `SKIPS=fail`,
+which turns a skip into a failure.
+
+CI's test job doesn't install these, so its `references` job does, at pinned
+versions, and runs the comparisons with `SKIPS=fail`: `test_train`,
+`test_llama_frequencies`, `test_tokenizer`, `test_hf_families`, `test_qwen3_moe`,
+`test_qwen3_5_moe`, `test_mxfp4` and `test_torch_frontend`. It downloads no
+checkpoints.
 
 To include pretrained checkpoint checks:
 
