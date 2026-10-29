@@ -102,10 +102,14 @@ curl http://localhost:8000/v1/completions \
   -d '{"model":"SmolLM-135M","prompt":"The meaning of life is","max_tokens":6,"temperature":0}'
 ```
 
-Set `stream` to true in the request to receive tokens as they're generated.
-You can set temperature, top_k, top_p, min_p, seed, stop strings and repetition
+Set `stream` to true in the request to receive tokens as they're generated, and
+`stream_options.include_usage` to also get the token counts in a last chunk
+whose `choices` is empty. You can set temperature, top_k, top_p, min_p, seed,
+stop strings and repetition
 penalties. Defaults come from the model's `generation_config.json` when present.
 Prompts must contain at least one token. `max_tokens` must be a positive integer;
+a chat request can name it `max_completion_tokens`, which takes precedence over
+`max_tokens`. A message's content is a string or a list of text parts.
 `top_k=0` keeps all tokens. Temperature must be nonnegative, `top_p` in `(0, 1]`
 and `min_p` in `[0, 1]`. The chip takes the inverse of a nonzero temperature as
 fp32, so it must be a normal fp32 value. Presence and frequency penalties must
@@ -137,7 +141,9 @@ end token.
 The engine gives each request a slot in a shared KV cache and decodes occupied
 slots together. Prompts are processed in chunks between decode steps. A request
 gets HTTP 429 when no slot is free. A non-streaming request that receives no text
-for 600 seconds gets HTTP 504. A stream that times out releases its slot.
+for 600 seconds gets HTTP 504. A request that times out, or whose client hangs
+up, is cancelled. The handler checks for hangups at least once a second; the
+engine releases the slot when it next handles that request.
 A failure in a request's own work on the host, such as sampling or checking its
 output constraint, ends that request with an error and frees its slot; other
 requests continue. A failure on the chip, including reading logits back, stops
@@ -174,7 +180,9 @@ goes in `reasoning_content`. Each tool needs a function with a nonempty name.
 Its `parameters`, if not null, must be an object, with `properties` mapping
 names to schemas. Other tool shapes get HTTP 400, as do bodies nested too deeply
 for Python's JSON parser. A stream holds back text that may begin a reasoning or
-tool-call marker until the marker is complete or ruled out. `tool_choice` and
+tool-call marker until the marker is complete or ruled out. Once generation ends,
+the whole answer stays in the content if no tool call parses. Otherwise, content
+contains the text before the first tool-call marker. `tool_choice` and
 JSON response formats constrain which tokens can be sampled. `test_chat_tools`
 and `test_serve` have example requests to start from when adding a model or
 client.
@@ -218,6 +226,8 @@ that commit on `PYTHONPATH`, or in `TINYGRAD` for the tests.
 
 Unsupported operations fall back to tinygrad's CPU device. These include
 64-bit integers, bit operations, random-number generation and symbolic shapes.
+Int32 multiplication and reductions also use the CPU to preserve exact integer
+results; baretile's tensor API computes those operations through fp32.
 The adapter preserves the logical dtype through fallback; uint16 values and
 bfloat16 storage use different conversions, and boolean results stay 0 or 1.
 
@@ -235,8 +245,10 @@ normally. Calls that materialize data on the host, bind symbolic
 variables, pass repeated or partial input buffers, store into input buffers, or
 return an input or a view of one execute normally, including aliases inside
 returned containers. Discarded recordings release their allocations after
-queued work completes. Keep captured CPU tensors constant, or pass changing
-values as BARETILE inputs.
+queued work completes. Reading another device's buffers executes the call
+normally, so CPU-generated values are read again on each call. Python and NumPy
+literals can be recorded. A captured buffer read from host bytes and then
+written needs another recording once its current value is on the chip.
 
 PyTorch uses tinygrad's `extra/torch_backend`, which needs a tinygrad checkout,
 PyTorch, a C++ compiler and ninja. `test_torch_frontend` exercises that path.

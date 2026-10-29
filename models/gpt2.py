@@ -12,22 +12,22 @@ from baretile.tensor import Tensor, jit
 
 HEADS = 12
 
-def bf16_bits(a, packer=False):  # to bf16 bits, rounded to nearest even like uploads, or half up like the packer
+def bf16_bits(a):  # to bf16 bits, rounded to nearest even like uploads
   b = np.asarray(a, np.float32).view(np.uint32)
-  return ((b + (0x8000 if packer else 0x7FFF + (b >> 16 & 1))) >> 16).astype(np.uint16)
+  return ((b + 0x7FFF + (b >> 16 & 1)) >> 16).astype(np.uint16)
 def bf16_floats(bits): return (np.asarray(bits).astype(np.uint32) << 16).view(np.float32)  # bf16 bits to float32 values
 
 def bfp(a, dtype="bfp8"):
   """Round values to a block-float format as the chip does, and return the converted values.
   First round to bf16. Each run of 16 values along a row then shares its largest exponent. bfp8 keeps
-  seven magnitude bits with half-up rounding; bfp4 keeps three with rounding to nearest."""
+  seven magnitude bits and bfp4 three, both rounded half up."""
   bits = bf16_bits(a).astype(np.uint32)
   s, e, m = bits >> 15, bits >> 7 & 255, (bits & 127) | np.where(bits >> 7 & 255, 128, 0)
   runs = lambda x: x.reshape(*x.shape[:-1], -1, 16)
   top = runs(e).max(-1, keepdims=True)
   shift = np.minimum(top - runs(e), 8)  # a shift of 8 or more leaves 0
   q = np.minimum((runs(m) + (1 << shift)) >> (shift + 1), 127)
-  if dtype == "bfp4": q = np.where(shift < 4, np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7), 0) << 4  # rounded to the nearest 3 bits
+  if dtype == "bfp4": q = np.minimum((runs(m) + (16 << shift)) >> (shift + 5), 7) << 4
   return (np.where(runs(s), -1.0, 1.0) * q * 2.0 ** (top.astype(np.int64) - 133)).reshape(np.shape(a))
 
 def safetensors(path):  # the header, with each tensor's dtype, shape and byte range, and the data, memory-mapped

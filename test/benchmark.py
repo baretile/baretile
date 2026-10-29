@@ -412,7 +412,7 @@ def main():
     book = bz2.open(path, "rt", encoding="utf-8").read()
     return print(json.dumps(load(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 32, SIZES[False].turns, book), indent=1))
   stack, folder, refpt, s = sys.argv[1], sys.argv[2], sys.argv[3], SIZES["--quick" in sys.argv]
-  assert stack in ("baretile", "ttnn"), "the stack must be baretile or ttnn"
+  if stack not in ("baretile", "ttnn"): raise ValueError(f"the stack must be baretile, ttnn, table or load, not {stack}")
   prompt, after, top5 = llama.reference(refpt)
   path = os.environ.get("BOOK") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(refpt))), "tale-of-two-cities.txt.bz2")
   out = {"baretile": baretile, "ttnn": ttnn}[stack](folder, prompt, after, top5, bz2.open(path, "rt", encoding="utf-8").read(), s)

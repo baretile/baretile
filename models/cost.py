@@ -62,7 +62,6 @@ def shape(c, mode="bf16"):
   expert: bytes per expert; moe: number of model blocks with experts.
   draft: bytes in the prediction layer, excluding its experts.
   draft_values: matrix values used by the prediction layer per token.
-  embed: bytes held for the embedding; a step reads only its token rows.
   head: bytes in the output layer used for drafting.
   bytes: total bytes held, including draft weights.
   values: matrix values used per token, including selected experts.
@@ -94,7 +93,7 @@ def shape(c, mode="bf16"):
   head_work = c.vocab * d * prec["head", None][1]
   draft_head_work = c.vocab * d * prec.get(("draft head", None), prec["head", None])[1]
   held = len(moe) + (c.mtp if e else 0)  # the blocks with experts, counting the multi-token prediction layer
-  return SimpleNamespace(every=every, expert=expert, moe=len(moe), draft=draft, draft_values=draft_values, embed=c.vocab * d * BYTES["bf16"],
+  return SimpleNamespace(every=every, expert=expert, moe=len(moe), draft=draft, draft_values=draft_values,
                          head=own or c.vocab * d * fmt("head"), bytes=every + held * e * expert + draft + own + c.vocab * d * BYTES["bf16"],
                          values=values, held=values + draft_values + held * (e - c.k) * 3 * d * m + c.vocab * d * (0 if c.tied else 1),
                          work=sum(work(l) for l in range(c.layers)) + head_work,
@@ -208,9 +207,9 @@ def report(folder, mode="bf16", **keys):
   keyword arguments override CARD and USE settings."""
   card, use = dict(CARD), dict(USE)
   if unknown := keys.keys() - (card.keys() | use.keys() | {"probe"}): raise ValueError(f"unknown cost settings: {', '.join(sorted(unknown))}")
+  if "probe" in keys: card = probed(card, keys["probe"])  # measured rates replace the spec; explicit settings override both
   for k, v in keys.items():
     if k != "probe": (card if k in card else use)[k] = v if k == "kv" else float(v)
-  if "probe" in keys: card = probed(card, keys["probe"])
   for k, v in (card | use).items():
     if k != "kv" and v is not None and (not math.isfinite(v) or v < 0): raise ValueError(f"{k} must be a finite nonnegative number")
   for k in ("bandwidth", "reach", "tflops", "phases", "years", "pcie"):

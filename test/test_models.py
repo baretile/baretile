@@ -33,28 +33,35 @@ def need_tinygrad(name="tinygrad"):
   if os.environ["TINYGRAD"] not in sys.path: sys.path.insert(0, os.environ["TINYGRAD"])
   return importlib.import_module(name)
 
+def adapter_on(chip):
+  need_tinygrad()
+  from adapters import tinygrad_baretile as adapter
+  if adapter.RT is None or adapter.RT.closed: adapter.RT = Runtime(chip)
+  return adapter
+
 def test_tinygrad_jit_unrecorded(chip):
   # If the second TinyJit call can't be recorded, a later eligible call must still record. Here the second
   # call has a CPU input; subsequent calls put every input on BARETILE and should replay.
-  need_tinygrad()
-  from adapters import tinygrad_baretile
+  rt = adapter_on(chip).RT
   from tinygrad import Tensor, TinyJit
-  rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)
-  add, x = TinyJit(lambda x, y: (x + y.to("BARETILE")).realize()), Tensor([1.0, 2.0], device="BARETILE")
+  calls, x = [], Tensor([1.0, 2.0], device="BARETILE")
+  @TinyJit
+  def add(x, y):
+    calls.append(1)
+    return (x + y.to("BARETILE")).realize()
   for device in ("BARETILE", "CPU", "BARETILE", "BARETILE", "BARETILE"):
     assert add(x, Tensor([3.0, 4.0], device=device)).tolist() == [4.0, 6.0], device
   launches = rt.launches
   assert add(x, Tensor([5.0, 6.0], device="BARETILE")).tolist() == [6.0, 8.0] and rt.launches > launches
+  assert len(calls) == 3 and add.replay, "eligible calls record again after a CPU-input call"
   from tinygrad import Device
   pending = (tensor.Tensor.full(rt, 1, 1, 2) + 3).realize()
   Device["BARETILE"].synchronize()
   assert rt.read_status(1) == rt.launches % 2**32 and pending.tolist() == [[5]], "synchronize completes queued chip work"
 
 def test_tinygrad_jit_inputs(chip):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
-  adapter.RT = adapter.RT or Runtime(chip)
   calls, pins = [], dict(adapter.RT.pinned)
   @TinyJit
   def combine(x, y):
@@ -73,11 +80,9 @@ def test_tinygrad_jit_inputs(chip):
 
 @pytest.mark.parametrize("kind", ["direct", "slice", "reshape", "nested"])
 def test_tinygrad_jit_returned_inputs(chip, kind):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   from tinygrad.nn.state import get_parameters
-  adapter.RT = adapter.RT or Runtime(chip)
   calls, pins = [], dict(adapter.RT.pinned)
   @TinyJit
   def aliases(x):
@@ -102,10 +107,8 @@ def test_tinygrad_jit_returned_inputs(chip, kind):
 
 @pytest.mark.parametrize("store", [False, True])
 def test_tinygrad_jit_failed_capture(chip, store):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
-  adapter.RT = adapter.RT or Runtime(chip)
   calls, pins = [], dict(adapter.RT.pinned)
   @TinyJit
   def fails_once(x):
@@ -127,11 +130,9 @@ def test_tinygrad_jit_failed_capture(chip, store):
 
 
 def test_tinygrad_jit_changed_state(chip):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter_on(chip)
   from tinygrad import Tensor, TinyJit
   from tinygrad.helpers import Context
-  adapter.RT = adapter.RT or Runtime(chip)
   weight, calls = Tensor([2.0], device="BARETILE").realize(), []
   @TinyJit
   def product(x):
@@ -162,10 +163,8 @@ def test_tinygrad_jit_changed_state(chip):
 def test_tinygrad_jit_rebinds(chip):
   # A replay reads captured buffers where they are at that call. Two TinyJits that each update what the other reads,
   # and a learning rate assigned outside the TinyJit before each step, replay from the third call, as on tinygrad's CPU.
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  rt = adapter_on(chip).RT
   from tinygrad import Tensor, TinyJit
-  rt = adapter.RT = adapter.RT or Runtime(chip)
   def run(device):
     a, b, w, lr = (Tensor([1.0], device=device).contiguous().realize() for _ in range(4))
     calls = {"f": 0, "g": 0, "h": 0}
@@ -201,10 +200,8 @@ def test_tinygrad_jit_rebinds(chip):
 
 
 def test_tinygrad_host_materialize(chip):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
-  adapter.RT = adapter.RT or Runtime(chip)
   calls, pins = [], dict(adapter.RT.pinned)
   @TinyJit
   def padded(x):
@@ -218,10 +215,8 @@ def test_tinygrad_host_materialize(chip):
 
 
 def test_tinygrad_fallback_dtypes(chip):
-  need_tinygrad()
-  from adapters import tinygrad_baretile as adapter
+  adapter_on(chip)
   from tinygrad import Tensor, dtypes
-  adapter.RT = adapter.RT or Runtime(chip)
   x = Tensor([1, 256, 65535], dtype=dtypes.uint16, device="BARETILE")
   assert (x + x).tolist() == [2, 512, 65534] and x.max().item() == 65535
   y = Tensor([1.0, 2.5, -3.0], dtype=dtypes.bfloat16, device="BARETILE")
@@ -231,6 +226,70 @@ def test_tinygrad_fallback_dtypes(chip):
   assert ((b + b) == b).tolist() == [True, True, True]
   assert ((b + b) & b).cast(dtypes.int32).tolist() == [1, 0, 1]
 
+
+@pytest.mark.parametrize("size", [4, 64])
+def test_tinygrad_jit_reset_host_state(chip, size):
+  adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  state = Tensor.zeros(size, device="BARETILE").contiguous().realize()
+  x, calls = Tensor.ones(size, device="BARETILE").contiguous().realize(), []
+  @TinyJit
+  def step(x):
+    calls.append(1)
+    state.assign(state + x).realize()
+    return state
+  assert step(x).tolist() == [1.0] * size
+  buf = state.uop.base.buffer
+  buf.allocator._copyin(buf._buf, memoryview(bytes(size * 4)))  # reset through a host upload, also for small buffers
+  for n in (1, 2, 3, 4): assert step(x).tolist() == [float(n)] * size
+  assert len(calls) == 3 and step.replay, "record again after replacing the uploaded host state"
+
+def test_tinygrad_jit_reads_cpu_state(chip):
+  adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  captured, calls = Tensor([0.0, 0.0], device="CPU").realize(), []
+  @TinyJit
+  def add(x):
+    calls.append(1)
+    return (x + captured.to("BARETILE")).realize()
+  for n in range(4):
+    captured.assign(Tensor([float(n), float(n + 1)], device="CPU")).realize()
+    assert add(Tensor([2.0, 3.0], device="BARETILE")).tolist() == [n + 2, n + 4]
+  assert len(calls) == 4 and add.replay is False
+
+def test_tinygrad_jit_capture_setup_failure(chip):
+  adapter = adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  step = TinyJit(lambda x: (x + 1).realize())
+  x = Tensor([2.0, 3.0], device="BARETILE").realize()
+  assert step(x).tolist() == [3.0, 4.0]
+  adapter.RT = Runtime(chip)  # x still belongs to the displaced runtime
+  with pytest.raises(RuntimeError, match="closed|replaced"): step(x)
+  assert adapter.recording is None
+  fresh = TinyJit(lambda x: (x + 1).realize())
+  for n in range(4): assert fresh(Tensor([float(n)], device="BARETILE")).tolist() == [n + 1]
+
+def test_tinygrad_padded_constant_replays(chip):
+  adapter_on(chip)
+  from tinygrad import Tensor, TinyJit
+  calls = []
+  @TinyJit
+  def padded(x):
+    calls.append(1)
+    return (x.pad(((1, 1), (0, 0)), value=-1.0) * 2).realize()
+  for n in range(4):
+    assert padded(Tensor([[float(n), float(n + 1)]], device="BARETILE")).tolist() == [[-2, -2], [n * 2, (n + 1) * 2], [-2, -2]]
+  assert len(calls) == 2 and padded.replay
+
+@pytest.mark.parametrize("op,expected", [("mul", [[16777217, 1], [5, -3]]), ("sum", [16777218, 2]), ("max", [16777217, 5])])
+def test_tinygrad_integer_precision(chip, op, expected):
+  adapter_on(chip)
+  from tinygrad import Tensor, dtypes
+  values = [[16777217, 1], [5, -3]]
+  x = Tensor(values, dtype=dtypes.int32, device="BARETILE").realize()
+  one = Tensor.ones(2, 2, dtype=dtypes.int32, device="BARETILE").contiguous().realize()
+  got = x * one if op == "mul" else x.sum(1) if op == "sum" else x.max(1)
+  assert got.tolist() == expected
 
 def test_tinygrad_closed_synchronize(monkeypatch):
   need_tinygrad()
@@ -246,11 +305,9 @@ def test_tinygrad_closed_synchronize(monkeypatch):
 def test_tinygrad(chip):
   # tinygrad builds the graph and baretile runs it, checked against tinygrad's CPU device. Each case must launch on the
   # chip, so we know the host didn't compute it.
-  need_tinygrad()
-  from adapters import tinygrad_baretile
+  rt = adapter_on(chip).RT  # the BARETILE device uses this process's chip
   from tinygrad import Tensor, TinyJit, dtypes, function, nn
   from tinygrad.helpers import Context
-  rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)  # the BARETILE device uses this process's chip
   rng = np.random.default_rng(14)
   a, b, w = (rng.standard_normal(shape).astype(np.float32) for shape in ((2, 3, 40), (2, 3, 40), (40, 5)))
   cases = [lambda x, y, w: x * 2 + y, lambda x, y, w: x.sum(1), lambda x, y, w: x.max(-1), lambda x, y, w: x.exp().log(),
@@ -272,7 +329,7 @@ def test_tinygrad(chip):
   assert (made * Tensor([1.0, 2.0], dtype=dtypes.bfloat16, device="BARETILE")).tolist() == [3.0, 6.0]
   assert (Tensor(a, device="BARETILE") > 0).any(1).tolist() == (a > 0).any(1).tolist()  # bools read back a byte each
   assert (Tensor(np.arange(8, dtype=np.float32), device="BARETILE")[:4] * 2).tolist() == [0, 2, 4, 6]  # a view of part of a tensor
-  assert (ints.T @ ints).tolist() == (np.array(ints.tolist()).T @ np.array(ints.tolist())).tolist()  # summed in fp32, no FPU
+  assert (ints.T @ ints).tolist() == (np.array(ints.tolist()).T @ np.array(ints.tolist())).tolist()  # integer products and sums stay exact
   t = Tensor(a, device="BARETILE").realize()
   assert t[1, 1:3].numpy().tolist() == a[1, 1:3].tolist()  # reads a buffer through a tinygrad view of part of it (_offset)
   assert t[:, :0].sum(1).numpy().tolist() == [[0] * 40] * 2 and t[:, :0].numpy().shape == (2, 0, 40)  # nothing to compute
@@ -318,12 +375,10 @@ def test_tinygrad(chip):
 def test_torch_frontend(chip):
   # PyTorch runs on BARETILE through tinygrad's torch frontend (extra/torch_backend, PyTorch's "tiny" device), checked
   # against PyTorch on the CPU. The matmul and conv are good to the FPU's 2^-11.
-  need_tinygrad()
+  rt = adapter_on(chip).RT
   pytest.importorskip("extra.torch_backend", reason="needs a tinygrad checkout in TINYGRAD, since an installed tinygrad has no extra/")
   torch = pytest.importorskip("torch")
-  from adapters import tinygrad_baretile
   from tinygrad.helpers import Context
-  rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)
   with Context(DEV="BARETILE"):  # the tinygrad device behind "tiny", read at each op
     import extra.torch_backend.backend  # noqa: F401 -- registers "tiny" with PyTorch. its C++ part is built once and cached
     g = torch.Generator().manual_seed(0)
@@ -358,11 +413,10 @@ def test_tinygrad_llm(chip):
   # bf16 weights. tinygrad's KV cache is fp16, which the adapter doesn't have, so it stays on the host. The blocks are
   # precompiled tinygrad functions, and the adapter inlines them with fresh buffers on each call.
   need_tinygrad("tinygrad.llm.model")
-  from adapters import tinygrad_baretile
   from tinygrad import Tensor as TT, dtypes, nn
   from tinygrad.helpers import Context
   from tinygrad.llm.model import Transformer, TransformerConfig
-  rt = tinygrad_baretile.RT = tinygrad_baretile.RT or Runtime(chip)
+  rt = adapter_on(chip).RT
   c, w = smol(np.random.default_rng(37), 2)
   sd = {"token_embd.weight": w["embed"], "output.weight": w["embed"], "output_norm.weight": w["norm"][0]}
   for l in range(2):  # tinygrad's Linear is (out, in) like Hugging Face's, and keeps q, k, v, gate and up apart
@@ -536,6 +590,13 @@ def test_bpe_merge_order(tmp_path):
         assert tok.encode("abc") == ([5] if ignore else want)
         assert tok.encode("abcabc") == want * 2
         assert tok.decode(tok.encode("abcabc")) == "abcabc"
+  # A piece of 21,000 letters merges in O(n log n): rescanning every pair after each merge took 20 s. The cache of
+  # pieces stays bounded, since a server sees new words forever.
+  (tmp_path / "tokenizer.json").write_text(json.dumps({"model": dict(type="BPE", vocab=vocab, merges=[["a", "b"], ["b", "c"], ["ab", "c"]])}))
+  tok, start = llama.Tokenizer(str(tmp_path)), time.monotonic()
+  assert tok.encode("abc" * 7000) == [5] * 7000 and time.monotonic() - start < 5
+  tok.encode(" ".join("".join("abc"[i // 3**k % 3] for k in range(9)) for i in range(12000)))  # 12,000 words
+  assert len(tok.pieces) == 10000
   for settings in (dict(type="Unigram"), dict(dropout=0.1), dict(continuing_subword_prefix="##"),
                    dict(merges=["a c"]), dict(merges=[None]), dict(merges=None)):
     (tmp_path / "tokenizer.json").write_text(json.dumps({"model": dict(type="BPE", vocab=vocab) | settings}))
@@ -849,11 +910,11 @@ def test_model_geometry(chip):
          dict(accept=None), dict(conv2=None), dict(first=t((4, 32, 32))), dict(accept=t((1, 2, 1))), dict(conv2=t((3, 1, 256))),
          dict(x=t((1, 2, 392))), dict(dt=t((1, 1, 8))), dict(live=Tensor(rt, 2, 1))]
   for changed in bad:
-    before = rt.used, rt.launches
+    before = dict(rt.used), rt.launches
     with pytest.raises(ValueError, match="delta"): qwen.delta(**(base | changed))
     assert (rt.used, rt.launches) == before
   ids, weights = Tensor(rt, 8192, 1, dtype="int32"), Tensor(rt, 8192, 1)
-  before = rt.used, rt.launches
+  before = dict(rt.used), rt.launches
   with pytest.raises(ValueError, match="fit L1"): qwen.touched(ids, 1, weights)
   with pytest.raises(ValueError, match="fit L1"): qwen.touched_kernel(8192, 1, 1)
   assert (rt.used, rt.launches) == before
@@ -874,7 +935,7 @@ def test_all_linear_model(chip):
   got = gpt2.values(llama.forward(on(ids), on([0, 1, 2]), t, c, llama.kv_cache(c, 32, llama.zeros(rt)), every=True))
   want = llama.forward(ids, [0, 1, 2], w, c, llama.kv_cache(c, 32, np.zeros), every=True)
   assert np.abs(got - want).max() < 0.03 * np.abs(want).max()
-  before = rt.used, rt.launches
+  before = dict(rt.used), rt.launches
   for k in ("cos", "sin"):
     with pytest.raises(ValueError, match="RoPE"):
       serve.Engine(rt, t | {k: t[k][:, :32, :]}, c, None, slots=2, places=64)
@@ -1042,6 +1103,14 @@ t = Tensor.of(rts[0], x)  # 24 tiles: 6 chunks through the 2 slots, so the credi
 for ch, (_, back) in links_a.items():
   y = t.to(rts[1], ch, back)
   assert y.rt is rts[1] and y.tolist() == t.tolist() and (y * 2).to(rts[0], back, ch).tolist() == (t * 2).tolist(), ch
+import struct
+raw = struct.pack("<4f", 1.0, 2.0, -0.0, 3.0)
+view = Tensor.frombytes(rts[0], 1, 2, raw, batch=2, dtype="fp32")[1]
+assert view.to(rts[1], ch, back).tobytes() == raw[8:]
+for dtype in ("bfp8", "bfp4"):
+  source = Tensor.of(rts[0], [[[1.5] * 32] * 32] * 2).cast(dtype).realize()
+  for view in (source[1], source.repeat_interleave(2)):
+    assert view.to(rts[1], ch, back).tobytes() == view.tobytes()
 import numpy as np  # a model split across the two chips: its first block on chip 0, its second and its head on chip 1
 from types import SimpleNamespace
 from models import gpt2, llama
@@ -1112,6 +1181,12 @@ def test_llama_8b_shapes(chip):
     rt.wait(600)
     got, want = llama.logits(out), llama.forward(new, places, arrays, c, np_kv)[0]
     assert got.argmax() == want.argmax() and np.abs(got - want).max() < 0.02 * np.ptp(want), (np.abs(got - want).max(), np.ptp(want))
+
+def test_benchmark_bad_stack():
+  import subprocess
+  run = subprocess.run([sys.executable, "-O", benchmark.__file__, "bad-stack", "unused-model", "unused-reference"],
+                       capture_output=True, text=True, timeout=60)
+  assert run.returncode != 0 and "ValueError: the stack must be" in run.stderr, run.stdout + run.stderr
 
 def test_benchmark_table():
   # The speed column is baretile's over TT-NN's, inverted for times, so above 1 means baretile is faster. Work at the
@@ -1234,6 +1309,8 @@ def test_chunked_prefill(chip):
   on = lambda row: Tensor.of(rt, [row], "int32")
   kv, np_kv = llama.kv_cache(c, 96, lambda shape: Tensor.of(rt, np.zeros(shape).tolist())), llama.kv_cache(c, 96, np.zeros)
   want = llama.prefill(prompt, w, c, np_kv, 32)[0]
+  for ids, chunk in (([], 32), (prompt, 0), (prompt, -1)):
+    with pytest.raises(ValueError, match="prefill"): llama.prefill(ids, w, c, np_kv, chunk)
   assert np.allclose(want, llama.forward(prompt, range(70), w, c, llama.kv_cache(c, 96, np.zeros))[0], atol=1e-3)
   got = llama.logits(llama.prefill(prompt, t, c, kv, 32, on))
   assert np.abs(got - want).max() < 0.03 * np.abs(want).max(), np.abs(got - want).max()
@@ -1293,6 +1370,8 @@ def test_token_accuracy(chip):
   top1, five, picks = llama.accuracy(rt, t, c, prompt, after, top5, 8)
   assert (top1, five) == (7 / 8, 1) and picks[3] == top5[3][-1], (top1, five, picks)
   assert llama.accuracy(None, w, c, prompt, after, top5, 8) == (top1, five, picks), "numpy (rt None) should give the same picks and scores"
+  for steps in (0, 9):  # a step past the reference's predictions has nothing to score against
+    with pytest.raises(ValueError, match="1 to 8 steps"): llama.accuracy(None, w, c, prompt, after, top5, steps)
 
 def test_benchmark_quick_accuracy():
   # --quick decodes after a short prompt to save time, but token accuracy has to be scored from the prompt the
@@ -1358,6 +1437,31 @@ def test_serve_timeout(tmp_path):
                                                   json.dumps({"prompt": "Hi"}).encode(), {"Content-Type": "application/json"}), timeout=60)
   http.shutdown()
   assert e.value.code == 504 and hung.waiting.get_nowait().gone, "the engine should drop a request that timed out"
+
+def test_serve_hangup(tmp_path):
+  # A client that hangs up before its answer is done lets its slot go within a second, streamed or not. The stand-in
+  # engine sends a piece every 10 ms until the request is gone.
+  import socket
+  class Chatty:
+    tok, places, busy, made = bytes_tokenizer(tmp_path), 64, [None], []
+    def offer(self, r):
+      self.made.append(r)
+      def run():
+        while not r.gone: r.out.put("."), time.sleep(0.01)
+      threading.Thread(target=run, daemon=True).start()
+      return True
+  chatty = Chatty()
+  http = serve.server(chatty, "chatty", port=0)
+  threading.Thread(target=http.serve_forever, daemon=True).start()
+  try:
+    for stream in (False, True):
+      body = json.dumps({"prompt": "Hi", "max_tokens": 1000, "stream": stream}).encode()
+      with socket.create_connection(("127.0.0.1", http.server_address[1]), timeout=5) as s:
+        s.sendall(b"POST /v1/completions HTTP/1.0\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        until(lambda: len(chatty.made) == 1 + stream, "the request reached the engine")
+        time.sleep(0.1)
+      until(lambda: chatty.made[-1].gone, "the request whose client hung up should end", 2)
+  finally: http.shutdown(); http.server_close()
 
 def bytes_tokenizer(folder):  # writes a byte-level vocabulary of the 256 bytes to tokenizer.json in folder
   bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -1534,7 +1638,7 @@ def test_http_input_limits(tmp_path):
       with connect() as s:
         s.sendall(prefix + headers + b"\r\n\r\n")
         assert received(s).startswith(b"HTTP/1.0 " + (b"413" if headers.endswith(b"65") else b"400")), headers
-    # Bytes keep arriving within the socket timeout, but the deadline still ends the body read.
+    # A client that trickles bytes still gets 408 when the deadline passes.
     with connect() as slow:
       slow.sendall(prefix + b"Content-Length: 64\r\n\r\n{")
       start = time.monotonic()
@@ -1640,11 +1744,11 @@ def test_serve_bad_requests(tmp_path):
     tok, places, failed, busy = bytes_tokenizer(tmp_path), 64, False, [None]
     def offer(self, r):
       if self.failed: raise RuntimeError("engine failed")
-      r.finish = "stop"
+      self.last, r.finish = r, "stop"
       r.end()
       return True
   stand = Stand()
-  http = serve.server(stand, "stand", port=0, wait=0.1)
+  http = serve.server(stand, "stand", "<|im_start|>", port=0, wait=0.1)
   threading.Thread(target=http.serve_forever, daemon=True).start()
   def ask(body, chat=False):
     return urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{http.server_address[1]}/v1/" +
@@ -1654,8 +1758,15 @@ def test_serve_bad_requests(tmp_path):
                  (("temperature", -1), ("temperature", math.nan), ("max_tokens", 0), ("top_k", 1.5), ("stop", [4])))):
       with pytest.raises(urllib.error.HTTPError) as e: ask(body)
       assert e.value.code == 400 and json.load(e.value)["error"]["message"]
-    with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": [None]}, chat=True)
-    assert e.value.code == 400
+    hi = lambda content: {"messages": [{"role": "user", "content": content}]}
+    for body in ({"messages": [None]}, hi(3), hi([{"type": "image_url", "image_url": {"url": "x"}}]), hi("Hi") | {"max_completion_tokens": 0}):
+      with pytest.raises(urllib.error.HTTPError) as e: ask(body, chat=True)
+      assert e.value.code == 400, body
+    ask(hi("Hi") | {"max_tokens": 9, "max_completion_tokens": 3}, chat=True)
+    ids = stand.last.ids
+    assert stand.last.max_tokens == 3, "max_completion_tokens, OpenAI's chat name, comes first"
+    ask(hi([{"type": "text", "text": "H"}, {"type": "text", "text": "i"}]), chat=True)
+    assert stand.last.ids == ids, "text parts join into the message's text"
     assert json.load(ask({"prompt": "Hi"}))["choices"][0]["finish_reason"] == "stop"
     stand.failed = True
     with pytest.raises(urllib.error.HTTPError) as e: ask({"prompt": "Hi"})
@@ -1700,8 +1811,10 @@ def test_engine_failure():
   # A failure while admitting a request must release it and queued requests. Future offers fail immediately.
   import queue
   engine = object.__new__(serve.Engine)
-  engine.lock, engine.failed, engine.room = threading.Lock(), False, threading.BoundedSemaphore(2)
+  engine.lock, engine.failed, engine.room, engine.places = threading.Lock(), False, threading.BoundedSemaphore(2), 64
   engine.waiting, engine.busy = queue.Queue(), [None, None]
+  for ids in ([], list(range(63))):
+    with pytest.raises(ValueError, match="1 to 62 tokens"): engine.offer(serve.Request(None, ids))
   def fail(r): raise RuntimeError("admission failed")
   engine.admit = fail
   requests = [serve.Request(None, [1]), serve.Request(None, [2])]
@@ -1710,6 +1823,22 @@ def test_engine_failure():
   for r in requests: assert r.finish == "error" and r.out.get_nowait() is None and r.room is None
   assert engine.waiting.empty()
   with pytest.raises(RuntimeError, match="engine stopped"): engine.offer(serve.Request(None, [3]))
+
+def test_padded_vocabulary(tmp_path):
+  # A model's logits can cover more ids than its tokenizer has, as Qwen3's and gpt-oss's do. Those ids never fit a
+  # constrained answer, and drawing one unconstrained adds no text.
+  tok = bytes_tokenizer(tmp_path)
+  r = serve.Request(tok, [], 20, 0, eos=[0], shape=serve.formatted({"type": "json_object"}))
+  for c in '{"a": 1}\0':  # each step the padding outranks the next character, and at the end the EOS
+    logits = np.zeros(300, np.float32)
+    logits[256:], logits[ord(c)] = 5, 4
+    if r.take(logits, True): break
+  assert tok.decode(r.made) == '{"a": 1}' and r.finish == "stop"
+  r = serve.Request(tok, [], 1, 0, logprobs=1)
+  logits = np.zeros(300, np.float32)
+  logits[299] = 1
+  r.take(logits, True)
+  assert r.made == [299] and r.text == "" and r.finish == "length"
 
 def test_shapes(tmp_path):
   # Request.pick restricts output to the tool call or JSON schema requested. Logits that favor a greeting must still
@@ -1854,7 +1983,9 @@ def test_serve(chip, tmp_path):
     return ids[len(prompt):] + [int(logits.argmax())]
   assert together == [greedy(p, 6) for p in prompts], "requests must get numpy's greedy tokens while they decode together"
   before = engine.prefilled
-  assert [done(r) for r in [serve.Request(tok, p, 6, 0) for p in prompts[:0:-1]] if not engine.waiting.put(r)] == together[:0:-1]
+  again = [serve.Request(tok, p, 6, 0) for p in prompts[:0:-1]]
+  served(engine, *again)
+  assert [r.made for r in again] == together[:0:-1]
   assert engine.prefilled - before == 2, "only the last token of each prompt should be prefilled, the rest are in their slots"
   class Watched(serve.Request):  # records engine.prefilled at each of its tokens, from the engine's thread
     def take(self, logits, room): self.seen = getattr(self, "seen", []) + [engine.prefilled]; return super().take(logits, room)
@@ -1887,7 +2018,7 @@ def test_serve(chip, tmp_path):
   reply, held = json.load(post({"prompt": "Hi there", "max_tokens": 6})), len(tok.encode("Hi there")) - 1
   assert reply["choices"][0]["text"] == text and reply["choices"][0]["finish_reason"] == "length" and reply["usage"]["completion_tokens"] == 6
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
-  events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True}))
+  events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}))
   assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
   schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}
   shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0,
@@ -1901,7 +2032,7 @@ def test_serve(chip, tmp_path):
   holding = [post({"prompt": "Hi there", "max_tokens": 20, "temperature": 0, "stream": True}) for _ in range(2)]
   with pytest.raises(urllib.error.HTTPError) as e: post({"prompt": "Hi", "max_tokens": 2})
   assert e.value.code == 429 and json.load(e.value)["error"]["code"] == 429, "with no slot free, expected an immediate 429, not a wait"
-  for h in holding: streamed(h)
+  for h in holding: assert streamed(h)[1] is None, "usage only when the request asks for it"
   assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "the slots should be free once the streams end"
   http.shutdown()
   hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
@@ -1948,10 +2079,10 @@ def agrees(r, w, c, tol=0.03):
   worst = max(np.abs(g - v).max() / np.abs(v).max() for g, v in zip(r.logits, want))
   assert worst < tol and near(r.logits, want), worst
 
-def streamed(response):  # the choices of a server-sent stream, and the usage from its last chunk
+def streamed(response):  # the choices of a server-sent stream, and the usage in its last chunk if the request asked for it
   events = [json.loads(line[6:]) for line in response.read().decode().split("\n\n") if line.startswith("data: {")]
-  assert events[-1]["choices"] == [] and "usage" in events[-1], "a stream's last chunk should be its usage"
-  return [e["choices"][0] for e in events[:-1]], events[-1]["usage"]
+  usage = events.pop()["usage"] if events[-1]["choices"] == [] else None
+  return [e["choices"][0] for e in events], usage
 
 def served(engine, *requests):  # sends requests to an engine, each after the one before ends. The requests in a list go in together
   for batch in requests:
@@ -2176,6 +2307,13 @@ def test_chat_tools(tmp_path):
   assert e.value.code == 400 and "no such tool" in json.load(e.value)["error"]["message"]
   with pytest.raises(urllib.error.HTTPError) as e: ask({"messages": messages[:2], "response_format": {"type": "xml"}})
   assert e.value.code == 400
+  for said in ("I should read it.\n</think>\n\nReading.\n\n<tool_call>\n<function=re", "I see.\n</think>\n\nA <"):
+    # once the answer ends, a tool call cut short and text that might have begun one are shown as they are
+    shown = serve.answer(said)[1]
+    reply = json.load(ask({"messages": messages[:2], "tools": tools}))["choices"][0]
+    assert reply["message"]["content"] == shown and reply["finish_reason"] == "stop" and "tool_calls" not in reply["message"]
+    events = streamed(ask({"messages": messages[:2], "tools": tools, "stream": True}))[0]
+    assert "".join(e["delta"].get("content", "") for e in events) == shown and events[-1]["finish_reason"] == "stop"
   http.shutdown()
 
 def test_attention_cost_units():
@@ -2270,6 +2408,9 @@ def test_cost(tmp_path):
                                                    "matmul step, 1 phase, unpacks included": 16.0, "launch, 100 queued: chip each": 2700.0,
                                                    "upload over PCIe": 20.0, "read back over PCIe": 12.0}))
   measured = cost.probed(card, str(tmp_path / "probe.json"))
+  probe = str(tmp_path / "probe.json")
+  llama_cost = lambda **keys: cost.report(str(tmp_path / "llama"), probe=probe, **keys)
+  assert llama_cost() != llama_cost(launch=1e-3), "explicit settings override the probe"
   assert measured["bandwidth"] == 300e9 and abs(measured["tflops"] / 658e12 - 1) < 0.01 and measured["launch"] == 2e-6 and measured["pcie"] == 12e9
   slow, fast, long = (cost.prompt(c, s, use | {"kv": "bfp8", "context": n}, card, chunk) for n, chunk in ((4096, 256), (4096, 2048), (32768, 2048)))
   assert slow.rate * 6 < fast.rate and long.rate * 1.5 < fast.rate, (slow.rate, fast.rate, long.rate)

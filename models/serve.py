@@ -5,7 +5,7 @@
 # model is a local folder or Hugging Face ID. Then come the precision mode, the KV cache format ("" for the mode's) and
 # the most connections served at once, of which one client address may hold a quarter (serve.server has the default).
 #   curl localhost:8000/v1/completions -d '{"prompt": "The meaning of life is", "max_tokens": 8, "temperature": 0}'
-import codecs, collections, functools, json, math, os, queue, re, shutil, socket, sys, tempfile, threading, time, uuid
+import codecs, collections, functools, json, math, os, queue, re, select, shutil, socket, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
@@ -133,6 +133,7 @@ class Request:
   def fits(self, token):
     # A token may stop partway through UTF-8. Keep incomplete bytes pending, and reject malformed sequences.
     end = token is None or token in self.eos
+    if not end and token not in self.tok.bytes: return False  # a padded vocabulary has ids the tokenizer can't spell
     decoder = codecs.getincrementaldecoder("utf-8")()
     try: text = decoder.decode(b"".join(self.tok.bytes[t] for t in self.made + ([] if end else [token])), final=end)
     except UnicodeDecodeError: return False
@@ -203,7 +204,7 @@ class Request:
         top = np.argpartition(-lp, n - 1)[:n] if n else []
         self.probs.append((token, float(lp[token]), [(int(t), float(lp[t])) for t in sorted(top, key=lambda t: -lp[t])]))
     before = len(self.text)  # where to look for a stop string that reaches into what this token adds
-    self.text += self.utf8.decode(b"" if end else self.tok.bytes[token])
+    self.text += self.utf8.decode(b"" if end else self.tok.bytes.get(token, b""))
     start = max(0, before - max(map(len, self.stop), default=1) + 1)
     cut = min((i for i in (self.text.find(s, start) for s in self.stop) if i >= 0), default=-1)
     if end or cut >= 0 or len(self.made) == self.max_tokens or not room:
@@ -273,7 +274,7 @@ class Engine:
   def offer(self, r):  # queues r if a slot is free and holds the slot until r ends. Otherwise it returns False without waiting
     with self.lock:
       if self.failed: raise RuntimeError("the engine stopped on an error")
-      if not r.ids: raise ValueError("a prompt must contain at least one token")
+      if not 0 < len(r.ids) < self.places - 1: raise ValueError(f"a prompt needs 1 to {self.places - 2} tokens, not {len(r.ids)}")
       if not self.room.acquire(blocking=False): return False
       r.room = self.room
       self.waiting.put(r)
@@ -522,6 +523,13 @@ class Engine:
 FAMILIES = (("qwen", "<tool_call>\n<function="), ("harmony", "<|channel|>"), ("llama", "<|start_header_id|>"), ("chatml", "<|im_start|>"))
 def family(template): return next((name for name, mark in FAMILIES if mark in template), None)  # Qwen3.5's has ChatML's mark too, so qwen goes first
 
+def words(m):  # a message's text: a string, or OpenAI's list of text parts, joined as Qwen's template joins them
+  c = m.get("content")
+  if isinstance(c, list) and all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) for p in c):
+    c = "".join(p["text"] for p in c)
+  if c is not None and not isinstance(c, str): raise ValueError("message content must be a string or a list of text parts")
+  return c or ""
+
 def chat(template, messages, thinking=True, effort="medium", tools=None):
   """Format messages using the model's chat template: Qwen3.5/3.6, gpt-oss (Harmony), Llama 3 or ChatML."""
   kind = family(template)
@@ -532,14 +540,14 @@ def chat(template, messages, thinking=True, effort="medium", tools=None):
               f"Reasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.")
     head, turns = f"<|start|>system<|message|>{system}<|end|>", messages
     if messages and messages[0]["role"] in ("system", "developer"):
-      head, turns = head + f"<|start|>developer<|message|># Instructions\n\n{messages[0]['content']}\n\n<|end|>", messages[1:]
+      head, turns = head + f"<|start|>developer<|message|># Instructions\n\n{words(messages[0])}\n\n<|end|>", messages[1:]
     said = lambda m: "<|start|>user<|message|>" if m["role"] == "user" else "<|start|>assistant<|channel|>final<|message|>"
-    return head + "".join(f"{said(m)}{m['content']}<|end|>" for m in turns) + "<|start|>assistant"
+    return head + "".join(f"{said(m)}{words(m)}<|end|>" for m in turns) + "<|start|>assistant"
   if kind == "llama":  # Llama 3
-    turn = lambda m: f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{m['content']}<|eot_id|>"
+    turn = lambda m: f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{words(m)}<|eot_id|>"
     return "<|begin_of_text|>" + "".join(map(turn, messages)) + "<|start_header_id|>assistant<|end_header_id|>\n\n"
   if kind == "chatml":  # the SmolLM instruct models and Qwen. When Qwen3 isn't thinking, its reasoning is given empty
-    prompt = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages) + "<|im_start|>assistant\n"
+    prompt = "".join(f"<|im_start|>{m['role']}\n{words(m)}<|im_end|>\n" for m in messages) + "<|im_start|>assistant\n"
     return prompt if thinking or "<think>" not in template else prompt + "<think>\n\n</think>\n\n"
   raise ValueError("unsupported chat template; expected Qwen3.5, gpt-oss, Llama 3 or ChatML")
 
@@ -556,7 +564,7 @@ def qwen_chat(messages, thinking=True, tools=None):
   """Format text messages as in Qwen3.5/3.6 chat_template.jinja. Describe tools in the system turn, encode
   calls as XML, and put results in user turns. Keep reasoning in assistant turns after the last question so
   a tool response can extend the cached conversation."""
-  text = lambda m: (m.get("content") or "").strip()
+  text = lambda m: words(m).strip()
   answered = lambda m: text(m).startswith("<tool_response>") and text(m).endswith("</tool_response>")  # a tool result, sent as a user turn
   question = [i for i, m in enumerate(messages) if m["role"] == "user" and not answered(m)]
   if not question: raise ValueError("messages must include a user message other than a tool response")
@@ -610,7 +618,7 @@ def described(tools):
 
 def calls(text, tools=()):
   """Parse Qwen XML tool calls into (preceding text, OpenAI tool_calls). Encode arguments as JSON. Keep
-  schema-declared strings as text; parse other values as JSON when possible. tools have the shapes described checks."""
+  schema-declared strings as text; parse other values as JSON when possible. tools have the shapes described by checks."""
   head, mark, rest = text.partition("<tool_call>")
   props = lambda f: (f.get("parameters") or {}).get("properties") or {}
   schema = {function(t)["name"]: props(function(t)) for t in tools or ()}
@@ -877,10 +885,10 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   uses reasoning_effort (low, medium or high). Qwen tool calls use OpenAI's tool_calls format and follow
   text when streamed.
 
-  Usage includes prompt_tokens_details.cached_tokens and ends a stream in a separate chunk. End a request if
-  no text arrives within wait seconds. Sampling defaults come from defaults, populated from
-  generation_config.json for temperature, top_k, top_p, min_p and repetition_penalty, then from the
-  handler's built-in defaults.
+  Usage includes prompt_tokens_details.cached_tokens. A stream ends with it in a separate chunk, with empty choices,
+  when stream_options.include_usage asks for it. End a request if no text arrives within wait seconds, or when its
+  client hangs up. Sampling defaults come from defaults, populated from generation_config.json for temperature,
+  top_k, top_p, min_p and repetition_penalty, then from the handler's built-in defaults.
 
   A connection has input_wait seconds to send its headers and a body of at most body_limit bytes, else it gets 408 or
   413. Each connection has a handler thread. At most connections of them run, 4 × (slots + 8) by default, and at
@@ -898,7 +906,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
   late = {"error": {"message": f"the request's headers and body took more than {input_wait}s"}}
   class Handler(BaseHTTPRequestHandler):
     def handle(self):
-      # A socket timeout alone restarts for every read; the timer also bounds a client that trickles bytes.
+      # The deadline is the only bound on reading the request. It shuts the socket for reading, so the read ends and the
+      # request gets its 408. A socket timeout would restart at every read, and one that fired during the headers would
+      # make http.server drop the connection without a reply.
       self.expired = threading.Event()
       def expire():
         self.expired.set()
@@ -906,7 +916,6 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         except OSError: pass
       self.deadline = threading.Timer(input_wait, expire)
       self.deadline.daemon = True
-      self.connection.settimeout(input_wait)
       self.deadline.start()
       try: super().handle()
       finally: self.deadline.cancel()
@@ -961,11 +970,13 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
           return fits(answer(text)[1], pending if started else b"")
         shape = shaped if fits and apart else fits
         given = lambda k, default: q[k] if q.get(k) is not None else defaults[k] if defaults.get(k) is not None else default
-        r = Request(engine.tok, ids, max_tokens=given("max_tokens", engine.places if is_chat else 16), temperature=given("temperature", 1.0),
+        limit = "max_completion_tokens" if is_chat and q.get("max_completion_tokens") is not None else "max_tokens"  # OpenAI's chat name first
+        counted = (q.get("stream_options") or {}).get("include_usage")  # a stream ends with usage only when asked
+        r = Request(engine.tok, ids, max_tokens=given(limit, engine.places if is_chat else 16), temperature=given("temperature", 1.0),
                     top_p=given("top_p", 1.0), stop=q.get("stop"), eos=eos, seed=q.get("seed"), top_k=given("top_k", 0),
                     min_p=given("min_p", 0.0), presence=given("presence_penalty", 0.0), frequency=given("frequency_penalty", 0.0),
                     repetition=given("repetition_penalty", 1.0), logprobs=top, shape=shape)
-      except TimeoutError: return self.reply(408, late)  # the deadline, or a socket read that waited input_wait
+      except TimeoutError: return self.reply(408, late)  # the deadline cut the headers or body short
       except OverflowError as e: return self.reply(413, {"error": {"message": str(e)}})
       except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:  # RecursionError: a body nested too deeply to parse
         return self.reply(400, {"error": {"message": f"{type(e).__name__}: {e}"}})
@@ -976,11 +987,12 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
       if not offered: return self.reply(429, {"error": {"message": "every slot is busy", "code": 429}})
       head = {"id": f"baretile-{id(r)}", "object": "chat.completion" if is_chat else "text_completion", "created": int(time.time()), "model": name}
       seen = {"text": "", "reasoning_content": "", "content": ""}
+      called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the text and tool calls of the answer
       def parts(text, final=True):  # splits a thinking model's text into reasoning and answer, and cuts the answer at its tool calls
         out = dict(zip(("reasoning_content", "content"), answer(text, final))) if apart else {"content": text}
-        if tools:  # also hold back what may be the start of a tool call
+        if tools and (not final or called(text)[1]):  # while more can come, hold back what may begin a call. at the end, cut at calls that parsed
           shown = out["content"].partition("<tool_call>")[0]
-          out["content"] = shown[:len(shown) - unsure(shown, ("<tool_call>",))]
+          out["content"] = shown if final else shown[:len(shown) - unsure(shown, ("<tool_call>",))]
         return out
       def delta(text, final):  # the next piece of a chat: what's new in each part
         seen["text"] += text
@@ -988,10 +1000,9 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         out = {k: v[len(seen[k]):] for k, v in new.items() if len(v) > len(seen[k])}
         seen.update(new)
         return out
-      called = lambda text: calls(answer(text)[1] if apart else text, tools) if tools else (None, [])  # the text and tool calls of the answer
       def piece(text, done):
         return ({"index": 0, "delta": delta(text, done is not None)} if is_chat else {"index": 0, "text": text}) | {"finish_reason": done}
-      word, raw = lambda t: engine.tok.decode([t]), lambda t: list(engine.tok.bytes[t])
+      word, raw = lambda t: engine.tok.bytes.get(t, b"").decode("utf-8", "replace"), lambda t: list(engine.tok.bytes.get(t, b""))
       def chances(made):  # log probabilities in OpenAI's format: a chat's under content, a completion's as lists
         one = lambda t, p: {"token": word(t), "logprob": p, "bytes": raw(t)}
         if is_chat: return {"content": [one(t, p) | {"top_logprobs": [one(a, b) for a, b in top]} for t, p, top in made]}
@@ -1002,23 +1013,33 @@ def server(engine, name, template="", eos=(), port=8000, wait=600, defaults=None
         return {"logprobs": chances(r.probs if k is None else r.probs[r.marks[k - 1] if k else 0:r.marks[k]])}
       usage = lambda: {"prompt_tokens": len(ids), "completion_tokens": len(r.made), "total_tokens": len(ids) + len(r.made),
                        "prompt_tokens_details": {"cached_tokens": r.cached}}
+      hangup = select.poll()
+      hangup.register(self.connection, select.POLLIN)  # after its request a client sends nothing, so input means it hung up
+      def next_text():  # the next piece of r's text. ConnectionError once the client hangs up, queue.Empty after wait seconds without any
+        end = time.monotonic() + wait
+        while not hangup.poll(0):
+          try: return r.out.get(timeout=min(1, wait))
+          except queue.Empty:
+            if time.monotonic() > end: raise
+        raise ConnectionError("the client hung up")
       if q.get("stream"):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
         send = lambda body: (self.wfile.write(f"data: {json.dumps(body)}\n\n".encode()), self.wfile.flush())
         head["object"] += ".chunk" if is_chat else ""
         try:
           if is_chat: send(head | {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-          for k, text in enumerate(iter(lambda: r.out.get(timeout=wait), None)):  # each piece with the log probabilities of its tokens
+          for k, text in enumerate(iter(next_text, None)):  # each piece with the log probabilities of its tokens
             send(head | {"choices": [piece(text, None) | logprobs(k)]})
           if made := called(seen["text"])[1]:
             calling = {"tool_calls": [{"index": i} | c for i, c in enumerate(made)]}
             send(head | {"choices": [{"index": 0, "delta": calling, "finish_reason": None}]})
           send(head | {"choices": [piece("", "tool_calls" if made else r.finish)]})
-          send(head | {"choices": [], "usage": usage()})
+          if counted: send(head | {"choices": [], "usage": usage()})
           return self.wfile.write(b"data: [DONE]\n\n")
         except (OSError, queue.Empty): r.gone = True  # the client left, or no text came, so let its slot go
         return
-      try: text = "".join(iter(lambda: r.out.get(timeout=wait), None))
+      try: text = "".join(iter(next_text, None))
+      except ConnectionError: r.gone = True; return  # nobody is waiting for it now, so let its slot go
       except queue.Empty:
         r.gone = True  # nobody is waiting for it now, so let its slot go
         return self.reply(504, {"error": {"message": f"no text came in {wait}s: the chip may be hung"}})
