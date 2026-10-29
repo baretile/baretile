@@ -7,7 +7,7 @@
 # The folder needs config.json, tokenizer.json and safetensors weights, with an index for sharded weights.
 # precision() defines the weight formats and fidelity for each mode. NumPy uses the converted weight
 # values too. Append numpy to a reference accuracy command to run it without a chip.
-import functools, json, math, os, re, sys, time, unicodedata
+import functools, heapq, json, math, os, re, sys, time, unicodedata
 from types import SimpleNamespace
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -351,6 +351,7 @@ def prefill(ids, w, c, caches, tokens, on=lambda row: row):
   updates caches before the next runs. Attention scores then have one row per chunk token instead of one per
   prompt token. on converts IDs and positions to the representation used by forward, an int32 tensor on
   baretile."""
+  if not len(ids) or tokens < 1: raise ValueError("prefill needs a nonempty prompt and a chunk of at least one token")
   for i in range(0, len(ids), tokens): out = forward(on(ids[i:i + tokens]), on(list(range(i, min(i + tokens, len(ids))))), w, c, caches)
   return out
 
@@ -520,6 +521,7 @@ def accuracy(rt, t, c, prompt, after, top5, steps=500):
   With rt=None, use NumPy weights from arrays and full-precision products. This separates errors
   from weight conversion from errors in chip arithmetic. Reference tokens are known in advance, so
   NumPy processes the prompt and following tokens together, reading each block's weights once."""
+  if not 0 < steps <= len(top5): raise ValueError(f"accuracy scores 1 to {len(top5)} steps, one for each of the reference's predictions, not {steps}")
   n, size = len(prompt), -(-(len(prompt) + steps) // 32) * 32
   if rt is None:
     ids = prompt + after[:steps - 1]
@@ -610,16 +612,24 @@ class Tokenizer:
     self.nfc = (t.get("normalizer") or {}).get("type") == "NFC"  # Qwen composes the text first, so an e and its accent become one letter
 
   def bpe(self, piece):  # a piece's bytes as ids
-    if piece not in self.pieces:
-      parts = [piece] if self.ignore_merges and piece in self.vocab else [b for i in range(len(piece)) if (b := piece[i:i + 1]) in self.vocab]
-      while len(parts) > 1:
-        ranks = (self.vocab.get(a + b, math.inf) if self.merges is None else self.merges.get((a, b), math.inf)
-                 for a, b in zip(parts, parts[1:]))
-        rank, i = min((rank, i) for i, rank in enumerate(ranks))
-        if rank == math.inf: break
-        parts[i:i + 2] = [parts[i] + parts[i + 1]]
-      self.pieces[piece] = [self.vocab[p] for p in parts]
-    return self.pieces[piece]
+    if (ids := self.pieces.get(piece)) is not None: return ids
+    parts = [piece] if self.ignore_merges and piece in self.vocab else [b for i in range(len(piece)) if (b := piece[i:i + 1]) in self.vocab]
+    rank = lambda a, b: self.vocab.get(a + b, math.inf) if self.merges is None else self.merges.get((a, b), math.inf)
+    # Merge the lowest-ranked pair, leftmost first, until none is left. A heap of (rank, left part) finds it, where
+    # rescanning every pair took quadratic time for a long run of letters. A part merges into the one before it and
+    # becomes None; before and after link the parts left.
+    before, after = list(range(-1, len(parts) - 1)), list(range(1, len(parts) + 1))
+    heap = [(rank(a, b), i) for i, (a, b) in enumerate(zip(parts, parts[1:]))]
+    heapq.heapify(heap)
+    while heap and heap[0][0] < math.inf:
+      r, i = heapq.heappop(heap)
+      if parts[i] is None or (j := after[i]) == len(parts) or rank(parts[i], parts[j]) != r: continue  # a neighbor merged since
+      parts[i], parts[j], after[i] = parts[i] + parts[j], None, after[j]
+      if after[i] < len(parts): before[after[i]] = i; heapq.heappush(heap, (rank(parts[i], parts[after[i]]), i))
+      if before[i] >= 0: heapq.heappush(heap, (rank(parts[before[i]], parts[i]), before[i]))
+    ids = [self.vocab[p] for p in parts if p is not None]
+    if len(self.pieces) < 10000: self.pieces[piece] = ids  # as many as Hugging Face keeps, so a server's memory stays bounded
+    return ids
   def encode(self, text, special=False):  # with special, a special token's text becomes that token, as in a chat template
     if special and self.special:
       return [i for part in self.specials.split(text) if part for i in ([self.special[part]] if part in self.special else self.encode(part))]

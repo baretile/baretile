@@ -26,7 +26,7 @@ from baretile.runtime import Bound, Runtime
 # place, one move, or several moves that swap axes.
 NP = {"fp32": np.float32, "bf16": np.uint16, "int32": np.int32}  # bf16 as raw bits
 
-RT = None  # all workers of the chip, unless you set it first. a process can only open the simulator once
+RT = None  # all workers of the chip, unless you set it first. a device has one Chip at a time
 def runtime():
   global RT
   if RT is None:
@@ -222,8 +222,10 @@ def cpu(a, dtype):  # only logical bf16 values use uint16 storage as raw bits
 def array(t):  # bf16 as raw bits
   t = t.realize()
   return t.bitcast(dtypes.uint16).numpy() if t.dtype is dtypes.bfloat16 else t.numpy()
-def constant(t):  # the number, if a host tensor is a constant broadcast over a shape, else None
-  return t.uop.base.arg if t.uop.base.op is Ops.CONST else None
+def constant(t):  # a uniform host constant; padding can introduce zeros into a nonzero constant
+  u = t.uop
+  while u is not u.base and u.op is not Ops.PAD: u = u.src[0]
+  return u.arg if u.op is Ops.CONST else None
 
 def flat(a, n, npd):  # the bytes of n values, broadcasting a scalar
   a = np.asarray(a)
@@ -234,6 +236,7 @@ def flat(a, n, npd):  # the bytes of n values, broadcasting a scalar
 # replay can read the holder wherever it is then. hosted counts the host work the call does on the values it reads,
 # which a replay wouldn't redo.
 recording, hosted = None, 0
+HOST = object()  # a recorded read uploaded host bytes that cannot be rebound on replay
 def note_host_work():
   global hosted
   if recording is not None: hosted += 1
@@ -309,6 +312,7 @@ class Evaluator:
     """Run u on the chip, or return None if baretile can't."""
     if u.op in ELEMENTWISE and (u.dtype not in DTYPES or any(isinstance(s, Value) and s.dtype not in DTYPES for s in srcs)): return None
     if u.op in (Ops.AND, Ops.OR) and u.dtype is not dtypes.bool: return None  # bitwise, on the host
+    if u.op is Ops.MUL and u.dtype is dtypes.int32: return None  # baretile's int32 products round through fp32
     shape = tuple(u.shape)
     groups = common_groups(shape, srcs)
     as_u = lambda t: t.ne(0) if u.dtype is dtypes.bool else t.cast(DTYPES[u.dtype])  # baretile returns some int32 ops in fp32, like a product
@@ -342,7 +346,7 @@ class Evaluator:
     m = p.src[0] if p.op is Ops.PERMUTE else p
     if m.op is not Ops.MUL or not all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src): return None
     lift = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # upload a weight still on the host
-    a, b = (uncast(spread_to(lift(s, self.read(self.values.get(s))), m.shape)) for s in m.src)
+    a, b = (uncast(spread_to(lift(s, self.values.get(s)), m.shape)) for s in m.src)
     if not (isinstance(a, Value) and isinstance(b, Value)) or a.view.mask or b.view.mask: return None
     shape, summed = m.shape, list(order[:u.arg[1]])
     full = lambda v, k: shape[k] == 1 or v.view.strides[k] != 0
@@ -400,13 +404,13 @@ class Evaluator:
     if u.op is Ops.CONST: return u.arg
     if u.op is Ops.STACK and all(isinstance(v, (bool, int, float)) for v in srcs): return tuple(srcs)  # a shape. else values, stacked on the host
     if u.op is Ops.BUFFER: return self.read(u)  # its contents before any STORE in this graph
-    if u.op is Ops.COPY and on_baretile(u) and isinstance(v := self.read(srcs[0]), Tensor) and u.dtype in DTYPES and v.ndim:
+    if u.op is Ops.COPY and on_baretile(u) and isinstance(v := srcs[0], Tensor) and u.dtype in DTYPES and v.ndim:
       return to_chip(v, u.dtype)
-    if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return self.read(srcs[0])
+    if u.op in (Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.STAGE, Ops.COPY): return srcs[0]
     if u.op is Ops.AFTER: return self.now(u.src[0])
-    if u.op is Ops.STORE: return self.store(u.src[0], self.read(srcs[1]))
+    if u.op is Ops.STORE: return self.store(u.src[0], srcs[1])
     if u.op is Ops.SINK: return None
-    x = [self.read(v) for v in srcs]
+    x = srcs
     if u.op is Ops.RESHAPE and u.src[0].op is Ops.BUFFER and on_baretile(u.src[0]) and (v := self.lay_out(u, x[0])) is not None: return v
     if u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.PAD):  # symbolic shapes go to the host
       return self.movement(u, x[0]) if isinstance(x[0], Value) and all(isinstance(d, int) for d in u.shape) else self.on_host(u, x)
@@ -414,7 +418,8 @@ class Evaluator:
     if u.op is Ops.REDUCE and x[0] is DEFER:  # a deferred product: a matmul, or the product after all
       if (mm := self.matmul(u)) is not None: return mm
       x[0] = self.force(u.src[0])
-    if u.op is Ops.REDUCE and isinstance(x[0], Value) and x[0].dtype in DTYPES and u.arg[0] in (Ops.ADD, Ops.MAX): return self.reduce(u, x[0])
+    if (u.op is Ops.REDUCE and isinstance(x[0], Value) and x[0].dtype in DTYPES and x[0].dtype is not dtypes.int32 and
+        u.arg[0] in (Ops.ADD, Ops.MAX)): return self.reduce(u, x[0])
     if any(isinstance(v, Value) for v in x) and (v := self.chip_op(u, x)) is not None: return v
     return self.on_host(u, x)
 
@@ -438,9 +443,8 @@ class Evaluator:
     return self.movement(x, v) if isinstance(v, Value) else self.on_host(x, [v] + [self.values.get(s) for s in x.src[1:]])
 
   def read(self, v):
-    """Return v, resolving buffers to their current contents. A BARETILE buffer contains a chip value or bytes;
+    """Read BUFFER v's current contents. A BARETILE buffer contains a chip value or bytes;
     other devices supply bytes."""
-    if not (isinstance(v, UOp) and v.op is Ops.BUFFER): return v
     buf = v.buffer
     if buf.nbytes == 0: return Tensor.zeros(v.shape, dtype=v.dtype, device="CPU")
     if on_baretile(v):
@@ -448,13 +452,15 @@ class Evaluator:
       if recording is not None and isinstance(h, Holder):
         before, _, alias = noted(h)
         if alias is not None and h.value is before: return Value(alias, before.view, before.dtype)
+        if h.value is None and h.bytes is not None: recording[h][0] = HOST
       if h.value is not None: return Value(h.value.t, h.value.view, h.value.dtype)
       if (data := h.bytes) is None: return Tensor.zeros(buf.nbytes // v.dtype.itemsize, dtype=v.dtype, device="CPU")  # nothing stored yet
       # up to 32 values, like an optimizer's scalars, are uploaded now
       if isinstance(h, Holder) and v.dtype in DTYPES and len(data) <= 32 * v.dtype.itemsize:
-        h.set(value=Value(upload(np.frombuffer(data, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype))
+        h.set(value=Value(upload(np.frombuffer(data, npdtype(v.dtype)), DTYPES[v.dtype]), View(v.shape), v.dtype), stored=False)
         return Value(h.value.t, h.value.view, h.value.dtype)
       return cpu(np.frombuffer(data, npdtype(v.dtype)), v.dtype)  # on the host until a use gives it a shape
+    if not buf.device.startswith(("PYTHON", "NPY")): note_host_work()  # replay would freeze another device's current contents
     return cpu(np.frombuffer(buf.as_memoryview(), npdtype(v.dtype)).copy().reshape(v.shape), v.dtype)
 
   def store(self, target, value):
@@ -614,10 +620,10 @@ def tinyjit(self, *args, **kwargs):
     ret = self.fxn(*args, **kwargs)
     if params := get_parameters(ret): Tensor.realize(*params)
     return ret
-  recording, hosted, self.inputs = {}, 0, (names, info)
-  for i, h in enumerate(holders): noted(h, i)  # inputs bind by position
-  rec = tensor.Recording(runtime())
   try:
+    recording, hosted, self.inputs = {}, 0, (names, info)
+    for i, h in enumerate(holders): noted(h, i)  # inputs bind by position
+    rec = tensor.Recording(runtime())
     with rec:
       ret = self.fxn(*args, **kwargs)
       if params := get_parameters(ret): Tensor.realize(*params)
@@ -634,8 +640,11 @@ def tinyjit(self, *args, **kwargs):
       for h, old, stored, alias in bound if replayable else ():
         if stored: alias.assign(h.value.t)
         h.value = old
-    self.replay = bool(rec.launches) and replayable and (rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
-                                                         [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None])
+    # A buffer uploaded from host bytes and then written needs another recording, once its current value is on the chip.
+    uploaded_store = any(old is HOST and stored for old, stored, _ in recording.values())
+    self.replay = None if uploaded_store else bool(rec.launches) and replayable and (
+      rec, ret, [(alias.addr.key, layout(old)) for _, old, _, alias in bound],
+      [(h, h.version) for h, (_, _, alias) in recording.items() if alias is None])
     if not self.replay: rec.close()
   finally: recording = None
   return ret
