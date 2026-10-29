@@ -8,7 +8,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import tensor
 from baretile.tensor import Tensor
-from models import gpt2
+from baretile.models import gpt2
 
 def text():  # README.md, then the pages in docs/ by name
   root = pathlib.Path(__file__).parent.parent

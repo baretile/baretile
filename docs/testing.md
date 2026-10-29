@@ -66,7 +66,7 @@ target.
 `llama.accuracy` compares generated choices with Tenstorrent reference tokens:
 
 ```sh
-python3 models/llama.py /path/to/model /path/to/<model>.refpt [steps] [mode] [numpy]
+python3 -m baretile.models.llama /path/to/model /path/to/<model>.refpt [steps] [mode] [numpy]
 ```
 
 `numpy` runs the comparison on the host instead. Reading the reference file

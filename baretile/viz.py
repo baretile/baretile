@@ -1,6 +1,6 @@
 # Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings and
 # graphs of fused expressions. It contains its own data and needs a browser with JavaScript enabled.
-#   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args]
+#   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args], or -m module [args]
 # The page includes the runtimes still open when the script ends. Closing a runtime, or replacing it with an
 # overlapping one, discards its launch records.
 import json, pathlib, runpy, struct, sys
@@ -63,15 +63,16 @@ def _how(mode):  # describe B's read mode: I selects matrices by index, C stores
 
 if __name__ == "__main__":
   # Keep runtimes alive until save, including when the script raises an exception or receives Ctrl-C.
-  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.viz script.py [args]")
+  if len(sys.argv) < 2 or sys.argv[1] == "-m" and len(sys.argv) < 3: sys.exit("usage: python3 -m baretile.viz script.py [args], or -m module [args]")
   runtimes, init = [], Runtime.__init__
   def keep(rt, *args, **kwargs):
     init(rt, *args, **kwargs)
     runtimes.append(rt)
   Runtime.__init__ = keep
-  sys.argv = sys.argv[1:]
-  sys.path.insert(0, str(pathlib.Path(sys.argv[0]).resolve().parent))  # what python3 puts first for a script
-  try: runpy.run_path(sys.argv[0], run_name="__main__")
+  module = sys.argv[1] == "-m"  # run a module, as python3 -m does, such as baretile.models.llama
+  sys.argv = sys.argv[1 + module:]
+  if not module: sys.path.insert(0, str(pathlib.Path(sys.argv[0]).resolve().parent))  # what python3 puts first for a script
+  try: runpy.run_module(sys.argv[0], run_name="__main__", alter_sys=True) if module else runpy.run_path(sys.argv[0], run_name="__main__")
   finally:
     # A closed or replaced runtime's launch records went with its host memory, so the page holds the open ones
     if live := [rt for rt in runtimes if not rt.closed]:

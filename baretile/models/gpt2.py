@@ -1,13 +1,12 @@
 # GPT-2 on baretile and NumPy, using the same pretrained weights. The command compares greedy
 # choices at each step and continues with NumPy's token. A fixed KV cache lets decode replay from
 # its third call onward (tensor.jit).
-#   TTSIM=/path/to/libttsim.so python3 models/gpt2.py path/to/model.safetensors "prompt" [tokens] [bfp8]
+#   TTSIM=/path/to/libttsim.so python3 -m baretile.models.gpt2 path/to/model.safetensors "prompt" [tokens] [bfp8]
 # Use model.safetensors from openai-community/gpt2 and tiktoken's gpt2 tokenizer. With bfp8,
 # NumPy reads back the converted weights so both versions use the same values.
-import functools, json, math, os, struct, sys, time
+import functools, json, math, struct, sys, time
 from types import SimpleNamespace
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile.tensor import Tensor, jit
 
 HEADS = 12
@@ -162,6 +161,7 @@ def generate(enc, ids, steps, chip, numpy):
   print(f"\nbaretile picked the same token as NumPy {agree} times out of {steps}")
 
 def main():
+  if len(sys.argv) < 2: sys.exit('usage: python3 -m baretile.models.gpt2 model.safetensors ["prompt"] [tokens] [bf16|bfp8]')
   import tiktoken
   from baretile import pci
   from baretile.chip import Chip

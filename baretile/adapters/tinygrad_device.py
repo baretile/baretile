@@ -2,12 +2,11 @@
 # Movement operations remain views until an operation needs their data. Unsupported operations,
 # including random-number generation and other dtypes, run on tinygrad's CPU device.
 # TinyJit records and replays launches through tensor.Recording.
-#   import adapters.tinygrad_baretile, then DEV=BARETILE or Tensor(..., device="BARETILE")
-#   TTSIM=/path/to/libttsim.so python3 adapters/tinygrad_baretile.py script.py [args]
+#   import baretile.adapters.tinygrad_device, then DEV=BARETILE or Tensor(..., device="BARETILE")
+#   TTSIM=/path/to/libttsim.so python3 -m baretile.adapters.tinygrad_device script.py [args]
 # PyTorch uses tinygrad's torch frontend (extra/torch_backend, the "tiny" device).
 import collections, dataclasses, math, os, runpy, sys, types
 import numpy as np
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import tinygrad, tinygrad.tensor, tinygrad.engine.jit
 from tinygrad.helpers import JIT
 from tinygrad.engine.jit import JitError, _check_no_non_tensor_return, _prepare_jit_inputs
@@ -650,7 +649,7 @@ tinygrad.engine.jit._TinyJit.__call__ = tinyjit
 
 if __name__ == "__main__":  # run a tinygrad script on baretile, unchanged
   from tinygrad.helpers import DEV
-  if len(sys.argv) < 2: sys.exit("usage: python3 adapters/tinygrad_baretile.py script.py [its arguments]")
+  if len(sys.argv) < 2: sys.exit("usage: python3 -m baretile.adapters.tinygrad_device script.py [its arguments]")
   DEV.value = "BARETILE"
   sys.argv = sys.argv[1:]
   sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))

@@ -1,9 +1,9 @@
 # Models, serving and adapters
 
-The code in [models/](../models) runs pretrained models on baretile and serves
-them over HTTP. [adapters/](../adapters) lets tinygrad scripts, and PyTorch
-through tinygrad, run on baretile. These are layer 4: they use `Tensor` and add
-the kernels that only they need.
+The code in [baretile/models/](../baretile/models) runs pretrained models on
+baretile and serves them over HTTP. [baretile/adapters/](../baretile/adapters)
+lets tinygrad scripts, and PyTorch through tinygrad, run on baretile. These are
+layer 4: they use `Tensor` and add the kernels that only they need.
 
 The [first P150a workload](workload.md) fixes the initial release target,
 checkpoint revisions and acceptance checks. The capabilities described here
@@ -11,10 +11,10 @@ are broader than that target; hardware qualification is still pending.
 
 ## Running a model
 
-`models/gpt2.py` and `models/llama.py` can run the same model operations with
-baretile tensors or NumPy arrays. The generation scripts compare the two at
-each step. They feed NumPy's chosen token to both versions on the next step,
-so one disagreement won't make the rest of the comparison useless.
+`baretile/models/gpt2.py` and `baretile/models/llama.py` can run the same model
+operations with baretile tensors or NumPy arrays. The generation scripts compare
+the two at each step. They feed NumPy's chosen token to both versions on the next
+step, so one disagreement won't make the rest of the comparison useless.
 
 `llama.load` reads a local Hugging Face config and safetensors weights. It
 handles dense Llama-family models, several mixtures of experts, and the text
@@ -26,14 +26,14 @@ the alphabet are skipped before merging, as Hugging Face BPE does with no unknow
 token. Loading raises `ValueError` for BPE dropout, subword affixes, byte
 fallback, an unknown token or ByteLevel's prefix space, which the tokenizer
 doesn't implement. The standalone GPT-2 command also needs `tiktoken`.
-From Python in a checkout, import these helpers with `from models import llama`
-or `from models import serve`. Models and adapters are outside the PyPI package.
+Import them as `from baretile.models import llama` or `from baretile.models import
+serve`. They need NumPy, which `pip install 'baretile[models]'` installs.
 
 Choose the precision as the fourth argument after the script name:
 
 ```sh
-python3 models/llama.py /path/to/SmolLM-135M "Hello" 6 bfp8
-python3 models/gpt2.py /path/to/gpt2/model.safetensors "Hello" 6 bf16
+python3 -m baretile.models.llama /path/to/SmolLM-135M "Hello" 6 bfp8
+python3 -m baretile.models.gpt2 /path/to/gpt2/model.safetensors "Hello" 6 bf16
 ```
 
 `bf16` is the default. `bfp8` stores weight matrices in bfp8. The Llama `bfp4`
@@ -51,7 +51,7 @@ at its position.
 
 ## Experts and Gated DeltaNet
 
-`models/qwen.py` contains the operations that extend a Llama block. Expert
+`baretile/models/qwen.py` contains the operations that extend a Llama block. Expert
 routing uses `topk` on the chip. During decode, `touched` lists the selected
 experts so tokens can share their weight reads. For longer prompts, `group`
 sorts tokens by expert.
@@ -83,7 +83,7 @@ are model, port, slots, positions, precision, optional KV format and optional
 connection limit:
 
 ```sh
-python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16
+python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000 4 512 bf16
 ```
 
 Here, four requests can run at once, with 512 positions per slot. Choose a
@@ -130,7 +130,7 @@ client can use every slot, but its idle sockets can't take every handler. Past
 the total a connection gets HTTP 503, and past its address's share HTTP 429,
 each with a JSON error that names the limit. The seventh argument sets the
 total, for example
-`python3 models/serve.py HuggingFaceTB/SmolLM-135M 8000 4 512 bf16 "" 64`, where
+`python3 -m baretile.models.serve HuggingFaceTB/SmolLM-135M 8000 4 512 bf16 "" 64`, where
 `""` keeps the precision's KV format. Behind a reverse proxy every client has the
 proxy's address, so they share a quarter of the handlers. To give that address
 all of them, start the server from Python as `serve.main` does, and pass
@@ -212,7 +212,7 @@ deep as its level leaves; deeper ones get HTTP 400.
 
 ## tinygrad and PyTorch
 
-Import `adapters.tinygrad_baretile` before using tinygrad's `BARETILE` device.
+Import `baretile.adapters.tinygrad_device` before using tinygrad's `BARETILE` device.
 The adapter translates tinygrad's graph into baretile tensors before tinygrad
 schedules kernels. It recognizes a broadcast multiply followed by a reduction
 as a matmul. `TinyJit` uses baretile recordings when the call can be recorded.
@@ -220,7 +220,7 @@ as a matmul. `TinyJit` uses baretile recordings when the call can be recorded.
 You can run an existing tinygrad script through the adapter:
 
 ```sh
-python3 adapters/tinygrad_baretile.py /path/to/script.py
+python3 -m baretile.adapters.tinygrad_device /path/to/script.py
 ```
 
 The adapter calls tinygrad's internal APIs, so a tinygrad update can break it.
@@ -259,10 +259,10 @@ PyTorch, a C++ compiler and ninja. `test_torch_frontend` exercises that path.
 
 ## Estimating cost
 
-`models/cost.py` estimates memory use and serving cost from a model config:
+`baretile/models/cost.py` estimates memory use and serving cost from a model config:
 
 ```sh
-python3 models/cost.py /path/to/Qwen3.6-35B-A3B experts context=16384 accept=0.55
+python3 -m baretile.models.cost /path/to/Qwen3.6-35B-A3B experts context=16384 accept=0.55
 ```
 
 Add `probe=probe.json` once you've measured a card. Until then, the model assumes

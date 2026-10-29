@@ -204,7 +204,7 @@ subtracts them after the full scores have accumulated, which avoids overflow
 from rounding a large maximum or subtracting it too early. `attention_plan`
 gives units as many rows as still leave a unit for every worker, so a long
 prefill reads K/V once per 256 query rows and a short prompt still occupies the
-chip; `models/cost.py` uses the same plan. Heads whose frames do not fit in L1
+chip; `baretile/models/cost.py` uses the same plan. Heads whose frames do not fit in L1
 raise `ValueError` before allocation or launch. A supported frame with no space
 to retain keys streams them again for the second sweep.
 

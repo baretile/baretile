@@ -112,5 +112,5 @@ step(xs, ys)
 check(abs(w.tolist()[0][0] - 3) < 0.01 and abs(b.tolist()[0][0] - 1) < 0.01 and loss.tolist()[0][0] < 1e-4)
 print(f"9. after 81 steps: w = {w.tolist()[0][0]:.4f}, b = {b.tolist()[0][0]:.4f}; {rt.launches - since} launches for the last step and readbacks")
 
-# See ramps/2_runtime.py for the kernels under these tensors, and models/gpt2.py for a model built with Tensor.
+# See ramps/2_runtime.py for the kernels under these tensors, and baretile/models/gpt2.py for a model built with Tensor.
 print(f"the ramp ran {rt.launches} launches")

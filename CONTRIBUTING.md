@@ -38,14 +38,15 @@ hangs.
 
 ## How the code is organized
 
-The code has five layers. Each module in `baretile/` imports only the standard
-library and the layers below it, and `test_layers` checks this.
+The code has five layers. Each module imports only the layers below it, and
+`test_layers` checks this.
 
 - Layer 0 is the device (`bh.py`, `pci.py`, `chip.py`) and layer 1 is the runtime
   (`runtime.py`).
 - Layer 2 is Tensix codegen (`tensix.py`) and layer 3 is the kernels and `Tensor`
   (`kernels.py`, `tensor.py`).
-- Layer 4 is everything outside `baretile/`: the models, the server and the adapters.
+- Layer 4 is the models and the server (`baretile/models/`) and the adapters
+  (`baretile/adapters/`).
 
 If only one workload uses a kernel, that kernel lives in layer 4 next to the
 workload. It moves down when a second workload needs it. No file uses another
@@ -53,8 +54,8 @@ file's private names.
 
 ## Style
 
-- `baretile/` uses only the standard library. The tests, `adapters/` and `models/`
-  can use NumPy.
+- Layers 0 to 3 use only the standard library. Layer 4 and the tests can use
+  NumPy, and an adapter the library it adapts.
 - Keep it flat: few files, no class hierarchies and no config systems. Don't add
   an abstraction until it has a second user.
 - Facts about the chip live as data in [bh.py](baretile/bh.py). An instruction's

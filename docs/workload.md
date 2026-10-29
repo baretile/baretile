@@ -73,7 +73,7 @@ All layers and the full vocabulary participate: 32 layers for Llama and 30 for
 SmolLM. No layer cutting, vocabulary reduction or CPU fallback qualifies.
 The model's CPU tokenizer and sampling are allowed; transformer computations
 run on the card. The comparison uses baretile's `tt` mode, defined in
-[`llama.precision`](../models/llama.py), against a separate `bf16` diagnostic.
+[`llama.precision`](../baretile/models/llama.py), against a separate `bf16` diagnostic.
 
 | Operation | Llama `tt` | `bf16` diagnostic / SmolLM fixture |
 | --- | --- | --- |
@@ -161,7 +161,7 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 LLAMA="$SMOLLM_DIR" \
   test/test_models.py::test_token_accuracy
 ```
 
-The ordinary `models/llama.py model "prompt"` demonstration follows NumPy's
+The ordinary `python3 -m baretile.models.llama model "prompt"` demonstration follows NumPy's
 choices. It is not the autonomous test. The independent reference checks are
 tracked in [#5](https://github.com/baretile/baretile/issues/5), and the full
 checkpoint autonomous runner in [#6](https://github.com/baretile/baretile/issues/6).
@@ -173,15 +173,15 @@ accuracy; compare their reported percentages with the gate, since the CLI does
 not enforce the threshold or return a failure code for a low score.
 
 ```sh
-python3 models/llama.py "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt
-python3 models/llama.py "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 bf16
-python3 models/llama.py "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt numpy
+python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt
+python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 bf16
+python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt numpy
 ```
 
 For the HTTP case, start one slot, 1,024 positions, `tt` precision and bfp8 KV:
 
 ```sh
-python3 models/serve.py "$LLAMA_DIR" 8000 1 1024 tt bfp8
+python3 -m baretile.models.serve "$LLAMA_DIR" 8000 1 1024 tt bfp8
 ```
 
 In another terminal, submit each of the three prompts, one request at a time:
