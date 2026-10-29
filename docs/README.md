@@ -31,6 +31,7 @@ model in under 200 lines. It runs the same code on baretile tensors and NumPy ar
 
 | Page | What it covers |
 | --- | --- |
+| [Public API](api.md) | What's stable, what's experimental, and the behavior you can rely on, with the test behind each promise |
 | [Runtime](runtime.md) | Workers and the dispatcher, L1 layout, the command ring, DRAM allocation, `jit` and profiling |
 | [Compiler](compiler.md) | Tile layout and storage formats, fusion and reductions, unpack, math and pack, matmul and attention |
 | [Models, serving and adapters](models.md) | The model loaders, precision modes, the OpenAI-compatible server, tinygrad and PyTorch, and cost estimates |

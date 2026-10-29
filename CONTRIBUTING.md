@@ -33,7 +33,9 @@ hangs.
   `sha256sum $XDG_CACHE_HOME/baretile/* | cut -d' ' -f1 | sort`. Their names hash
   the source, so they change with any edit to the C text.
 - Docs that stay true. If your change alters how something works, update the page
-  in [docs/](docs) that describes it.
+  in [docs/](docs) that describes it. A change to a name that
+  [the public API](docs/api.md) calls stable goes in [CHANGELOG.md](CHANGELOG.md),
+  with how to update.
 
 ## How the code is organized
 
