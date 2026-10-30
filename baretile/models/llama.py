@@ -24,8 +24,9 @@ def fns(x):
     return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(-1, keepdims=True), rsqrt=lambda a: 1 / np.sqrt(a), topk=topk,
                            silu=lambda a: a / (1 + np.exp(-a)), sigmoid=lambda a: 1 / (1 + np.exp(-a)), repeat=lambda a, n: np.repeat(a, n, 0),
                            mm=lambda a, b, phases, dtype=None: a @ b, experts=qwen.numpy_experts, minimum=np.minimum, maximum=np.maximum,
-                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, bf16=lambda a: a, now=lambda a: a, swap=lambda a: a.transpose(1, 0, 2),
-                           cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None], assign=lambda a, b: a.__setitem__(..., b),
+                           sink_softmax=sink_softmax, exp=np.exp, log=np.log, bf16=lambda a: a, float=lambda a: a, now=lambda a: a,
+                           swap=lambda a: a.transpose(1, 0, 2), cat=lambda *xs: np.concatenate(xs, -2), heads=lambda a: a.T[:, :, None],
+                           assign=lambda a, b: a.__setitem__(..., b),
                            tri=lambda n, lower=False: (np.tril if lower else np.triu)(np.ones((n, n), np.float32)),
                            parts=lambda a, n: a.reshape(a.shape[0] * n, a.shape[1] // n, a.shape[2]), expand=np.broadcast_to,
                            pad=lambda a, rows: np.pad(a, ((0, 0), (0, rows), (0, 0))), empty=lambda shape: np.empty(shape, np.float32),
@@ -34,7 +35,7 @@ def fns(x):
   return SimpleNamespace(**vars(gpt2.fns(x)), mean=lambda a: a.mean(2), rsqrt=Tensor.rsqrt, silu=Tensor.silu, sigmoid=Tensor.sigmoid,
                          repeat=Tensor.repeat_interleave, mm=lambda a, b, phases, dtype=None: a.matmul(b, dtype, fidelity=phases), topk=Tensor.topk,
                          experts=qwen.chip_experts, where=lambda cond, a, b: cond.where(a, b), minimum=Tensor.minimum, maximum=Tensor.maximum,
-                         sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, bf16=Tensor.bfloat16, now=Tensor.realize,
+                         sink_softmax=sink_softmax, exp=Tensor.exp, log=Tensor.log, bf16=Tensor.bfloat16, float=Tensor.float, now=Tensor.realize,
                          cat=lambda a, *xs: a.cat(*xs, axis=1), heads=lambda a: a.permute(2, 1, 0), swap=lambda a: a.permute(1, 0, 2),
                          assign=lambda a, b: a.assign(b), tri=lambda n, lower=False: triangle(x.rt, n, lower), parts=lambda a, n: a.split(n, 1),
                          pad=lambda a, rows: a.pad(((0, 0), (0, rows), (0, 0))), expand=lambda a, shape: a.expand(*shape), delta=qwen.delta,
@@ -85,8 +86,11 @@ def precision_of(c, op, block=None): return (c.precision or {}).get((op, block),
 
 def cache_format(c): return precision_of(c, "kv")[0] or "bf16"  # the KV cache's format
 
-def rms(x, w, c):  # RMSNorm scaled by w. Qwen3.5 scales by 1 + w as n w + n, which stays exact where 1 + w would round in bf16
+# RMSNorm scaled by w. Qwen3.5 scales by 1 + w as n w + n, which stays exact where 1 + w would round in bf16. It reads
+# the fp32 residual stream rounded to bf16, so the norm runs on the FPU, where fp32 would run it all on the SFPU.
+def rms(x, w, c):
   f = fns(x)
+  x = f.bf16(x)
   n = x * f.rsqrt(f.mean(x * x) + c.eps)
   return n * w + n if c.centered else n * w
 
@@ -115,8 +119,10 @@ def layer(x, p, c, rotary, mask, cache, rows, l=0, prefill=False, live=None, acc
   accept goes to qwen.deltanet, and slots comes from forward."""
   f, phases = fns(x), lambda op, block=l: precision_of(c, op, block)[1]  # None means tensor.FIDELITY
   h = rms(x, p["input_layernorm"], c)
-  # Each half adds onto the residual stream in its last kernel (the output's matmul, or the experts' sum). f.now
-  # realizes the stream there, so later norms don't add up the blocks' outputs again.
+  # The residual stream is fp32, and each half's output is the fp32 sum of its last matmul (the output's, the down's
+  # or the experts'). In bf16, a large value that a later block cancels would lose the low bits of what's left. Each
+  # half adds onto the stream in its own kernel, and f.now realizes the stream there, so later norms don't add up the
+  # blocks' outputs again.
   mixed = (qwen.deltanet(h, p, c, cache, phases, live, accept) if "conv" in p
            else attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots))
   x = f.now(x + mixed)
@@ -160,13 +166,13 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
     o = f.mm(f.softmax(s + mask) if sinks is None else f.sink_softmax(s + mask, sinks), v, attention)
   if slots: o = o.reshape(c.kv, n, rep * hd)  # each key head's query heads side by side again
   if gated: o = o * f.sigmoid(f.split(qkv[:, (c.heads + 2 * c.kv) * hd:], o.shape[0]))
-  o = f.mm(f.merge(o), p["o_proj"], phases("o"))
+  o = f.mm(f.merge(o), p["o_proj"], phases("o"), "fp32")
   return o + p["o_proj.bias"] if "o_proj.bias" in p else o
 
 def mlp(h, p, phases, pre=""):  # SwiGLU: silu(h @ gate) * (h @ up), then down. gate_up_proj holds gate and up side by side
   f, m = fns(h), p[pre + "down_proj"].shape[-2]
   gate_up = f.mm(h, p[pre + "gate_up_proj"], phases("gate_up"))
-  return f.mm(glu(gate_up[:, :m], gate_up[:, m:]), p[pre + "down_proj"], phases("down"))
+  return f.mm(glu(gate_up[:, :m], gate_up[:, m:]), p[pre + "down_proj"], phases("down"), "fp32")
 
 def glu(gate, up, limit=None):  # silu(gate) * up. A limit makes it gpt-oss's, which clamps up both ways and gate from above
   f = fns(gate)
@@ -335,7 +341,7 @@ def forward(ids, places, w, c, caches, slots=None, every=False, accept=None, hid
   if capacity is not None and (type(capacity) is not int or not 0 < capacity <= table or size is not None and size != capacity * (slots or 1)):
     raise ValueError("forward capacity must fit RoPE tables and match attention cache rows per sequence")
   size = size if size is not None else (capacity or table) * (slots or 1)
-  x = f.rows(w["embed"], ids)
+  x = f.float(f.rows(w["embed"], ids))  # the residual stream, in fp32 (layer)
   rows, rotary, mask, window, live = around(w, c, places, size, slots, length)
   prefill = slots is None and x.shape[-2] > 1
   for l in range(c.layers):

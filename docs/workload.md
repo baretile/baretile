@@ -84,8 +84,10 @@ run on the card. The comparison uses baretile's `tt` mode, defined in
 | KV cache | bfp8 | bf16 |
 | Embeddings, norms, RoPE tables | bf16 | bf16 |
 
-Token and position tensors are int32. Stored block activations are bf16;
-matmul accumulators and the final logits are fp32. Fused intermediates need not
+Token and position tensors are int32. The residual stream between blocks is
+fp32: attention's output and the MLP's down keep their fp32 sums and add them
+to it, and each norm reads it rounded to bf16. Other stored activations are
+bf16; matmul accumulators and the final logits are fp32. Fused intermediates need not
 round at the same boundaries as separate operations; [compiler](compiler.md)
 describes these limits. Record the baretile commit as part of the precision
 definition. NumPy's same-weight reference uses full products and does not

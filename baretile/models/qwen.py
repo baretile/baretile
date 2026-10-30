@@ -65,7 +65,7 @@ def deltanet(h, p, c, state, phases, live=None, accept=None):
     f.assign(state[1], big(state[1], S2))
     o = o if seqs == 1 else f.swap(o.reshape(seqs, c.vh, m * c.vd)).reshape(c.vh, n, c.vd)
   o = o * f.rsqrt(f.mean(o * o) + c.eps) * p["norm"] * f.silu(f.split(x[:, width:width + vw], c.vh))  # each head RMS-normed and gated by z
-  return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"))
+  return f.mm(f.merge(f.bf16(o)), p["o_proj"], phases("o"), "fp32")
 
 class Row:
   """View row u across a batch of matrices, one row per sequence. llama.slot uses this for DeltaNet convolution
@@ -518,8 +518,8 @@ def chip_experts(h, p, ids, w, phases, limit=None):
   plus = lambda y, name, by=1: y + bias(name) * by if name in p else y
   x = plus(x.matmul(gate_up, fidelity=phases[0], index=picks), "experts.gate_up_bias")
   g = llama.glu(x[:, :, :m], x[:, :, m:], limit)
-  if dense: return plus((g * weights).matmul(down, fidelity=phases[1], index=picks), "experts.down_bias", weights).sum(0)
-  y = plus(g.matmul(down, fidelity=phases[1], index=picks), "experts.down_bias").reshape(order.cols, down.cols)
+  if dense: return plus((g * weights).matmul(down, "fp32", phases[1], picks), "experts.down_bias", weights).sum(0)
+  y = plus(g.matmul(down, "fp32", phases[1], picks), "experts.down_bias").reshape(order.cols, down.cols)
   run = places.cols // k  # the length of the run of places for each choice
   terms = [y.gather(places[:, :, j * run:j * run + n]) * w[:, :, j:j + 1] for j in range(k)]
   return sum(terms[1:], terms[0])
@@ -713,7 +713,7 @@ def draft(ids, places, h, w, c, caches, slots=None, length=None, every=True):
   f, d, l = llama.fns(h), c.dim, c.layers
   e, h = llama.rms(f.rows(w["embed"], ids), w["mtp.pre_fc_norm_embedding"], c), llama.rms(h, w["mtp.pre_fc_norm_hidden"], c)
   fc = w["mtp.fc"]
-  x = f.mm(e, fc[:d, :], None) + f.mm(h, fc[d:, :], None)
+  x = f.mm(e, fc[:d, :], None, "fp32") + f.mm(h, fc[d:, :], None, "fp32")
   rows, rotary, mask, _, live = llama.around(w, c, places, caches[l].shape[-2], slots, length)
   x = llama.layer(x, gpt2.block(w, f"layers.{l}."), c, rotary, mask, caches[l], rows, l, slots is None and x.shape[-2] > 1, live, slots=slots)
   own = "embed.T draft" in w  # a copy of the output layer for the draft, when the precision has a "draft head"
