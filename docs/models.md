@@ -66,6 +66,12 @@ and the KV cache in bfp8. `llama.precision` has the settings for each operation.
 We haven't measured Qwen3.6 token accuracy with all matrix weights in bfp8 or
 with a bfp4 KV cache.
 
+In every mode, the Llama families keep the residual stream between blocks in
+fp32. Each half of a block adds its last matmul's fp32 sum to it, and each norm
+reads it rounded to bf16. In bf16, a large activation that a later block cancels
+would lose the low bits of what's left: SmolLM-135M has one of about 31,000,
+which a bf16 copy holds only to within 128. GPT-2's stream is still bf16.
+
 The loader fuses q, k and v projections, and gate and up projections, where
 appropriate. Matmul weights are stored by tile columns. The KV cache is
 allocated once and zeroed on the chip, and each token writes its keys and values
