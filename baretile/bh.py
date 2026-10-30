@@ -63,7 +63,8 @@ TAG_FIRMWARE = 28  # firmware bundle version, a byte each for major, minor, patc
 # There are 14 Ethernet tiles on NoC0's row y=1, and each drives a 400 GbE link. A QSFP-DD port is two links.
 # Tenstorrent's Ethernet firmware runs on the first core of each tile and keeps the link up. See ISA EthernetTile/,
 # tt-metal's eth_fw_api.h and dev_mem_map.h, and "Ethernet links" in docs/hardware.md.
-ETH = [(1, 1), (16, 1), (2, 1), (15, 1), (3, 1), (14, 1), (4, 1), (13, 1), (5, 1), (12, 1), (6, 1), (11, 1), (7, 1), (10, 1)]  # channel n's tile
+ETH = [(1, 1), (16, 1), (2, 1), (15, 1), (3, 1), (14, 1), (4, 1), (13, 1), (5, 1), (12, 1), (6, 1), (11, 1), (7, 1),
+       (10, 1)]  # channel n's tile
 TAG_ETH_ENABLED = 35  # telemetry: a bit for each channel that isn't harvested, numbered as in tt-umd and ETH
 ETH_FIRMWARE = 0x70000  # the firmware owns a tile's L1 from here up
 ETH_PORT_STATUS, ETH_PORT_UP = 0x7CC04, 1  # port state in the firmware's boot results, 1 when the link is up
@@ -92,7 +93,8 @@ NIU = 0xFFB20000  # NoC 0 interface (ISA NoC/MemoryMap.md). request initiator i 
 NIU_REGS = {  # offsets from NIU
   # A request has a target and a return address (64 bits each, then the tile as x | y << 6), a tag, control bits
   # (NOC_CMD) and a length. Writing CMD = 1 sends it. AT_DATA is the operand of an atomic.
-  "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18, "CTRL": 0x1C,
+  "TARG_LO": 0x0, "TARG_MID": 0x4, "TARG_HI": 0x8, "RET_LO": 0xC, "RET_MID": 0x10, "RET_HI": 0x14, "PACKET_TAG": 0x18,
+  "CTRL": 0x1C,
   "LEN": 0x20, "AT_DATA": 0x28, "CMD": 0x40, "NODE_ID": 0x44,  # this tile's raw x | y << 6, with the grid size above
   "CLEAR_OUTSTANDING": 0x60, "ID_LOGICAL": 0x148,  # this tile's translated x | y << 6
   "INITIATOR": 0x800,  # stride of the four request initiators. each keeps its registers between requests
@@ -101,15 +103,18 @@ NIU_REGS = {  # offsets from NIU
   "OUTSTANDING": 0x240,
   "OUTGOING": 0x280}  # writes with transaction id 0 whose data the NIU hasn't read out of L1 yet
 NOC_CMD = {"READ": 0x10, "WRITE": 0x12,  # both acknowledged, so OUTSTANDING counts them
-           "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,  # a write to a rectangle: broadcast, path reserve, static VC
+           # a write to a rectangle: broadcast, path reserve, static VC
+           "MCAST": 0x12 | 1 << 5 | 1 << 7 | 1 << 8 | MCAST_VC << 14,
            "ATOMIC": 0x11 | 1 << 7,  # acknowledged on static VC class 0; completion remains visible after a core stops
            "STATIC": 1 << 7,  # choose VC class 0, preserving request order between the same two tiles
            # NOC_AT_LEN_BE: add AT_DATA to all 32 bits of word 0 of the 16-byte line. OR in i for word i.
            "INCREMENT": 1 << 12 | 31 << 2}
 MAX_PACKET = 16384  # the most bytes a NoC request can carry
-NIU_READS = NIU + NIU_REGS["READS"]  # NIU_MST_RD_RESP_RECEIVED: read requests answered. a request counts once, however long it is
+# NIU_MST_RD_RESP_RECEIVED: read requests answered. a request counts once, however long it is
+NIU_READS = NIU + NIU_REGS["READS"]
 def noc_xy(x, y): return x | y << 6  # a tile, as the *_HI registers of a request and ID_LOGICAL encode it
-def noc_rect(start, end): return noc_xy(*end) | noc_xy(*start) << 12  # a multicast's rectangle, start to end, for RET_HI
+# a multicast's rectangle, start to end, for RET_HI
+def noc_rect(start, end): return noc_xy(*end) | noc_xy(*start) << 12
 # The raw grid, x by y. Each NoC is a torus that wraps. NoC0's links run to higher x and y, NoC1's to lower.
 NOC_SIZE = 17, 12
 # hops from raw a to raw b over NoC0's links. NoC1 takes as many from b to a.
@@ -127,24 +132,31 @@ TENSIX_PUSH = 0xFFE40000
 TENSIX_DONE = 0xFFE80004  # CoprocessorDoneCheck: a load returns once this thread has run the instructions it was given
 TENSIX_SEM = 0xFFE80020  # semaphore i at +4i. a load reads its value, storing 0 posts it and storing 1 takes one
 _ELW = {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 2), "dest_accum_en": (21, 1), "clear_dvalid": (22, 2)}
-_ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3), "cnt_set_mask": (21, 3)}
+_ADC = {"bit_mask": (0, 4), "ch0_x": (6, 3), "ch0_y": (9, 3), "ch1_x": (12, 3), "ch1_y": (15, 3),
+        "cnt_set_mask": (21, 3)}
 TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "REPLAY": (0x04, {"load": (0, 1), "exec": (1, 1), "count": (4, 6), "index": (14, 5)}),  # the thread's 32-entry buffer
   "ZEROACC": (0x10, {"where": (0, 10), "addr_mode": (14, 3), "use_32_bit_mode": (18, 1), "clear_mode": (19, 2)}),
   "MVMUL": (0x26, {"dst": (0, 10), "addr_mode": (14, 3), "instr_mod19": (19, 1), "clear_dvalid": (22, 2)}),
   "ELWMUL": (0x27, _ELW), "ELWADD": (0x28, _ELW), "ELWSUB": (0x30, _ELW),
-  "SETRWC": (0x37, {"bit_mask": (0, 4), "rwc_a": (6, 4), "rwc_b": (10, 4), "rwc_d": (14, 4), "rwc_cr": (18, 4), "clear_ab_vld": (22, 2)}),
+  "SETRWC": (0x37,
+             {"bit_mask": (0, 4), "rwc_a": (6, 4), "rwc_b": (10, 4), "rwc_d": (14, 4), "rwc_cr": (18, 4),
+              "clear_ab_vld": (22, 2)}),
   "PACR": (0x41, {"last": (0, 1), "read_intf_sel": (8, 4), "addr_mode": (15, 2)}),
-  "UNPACR": (0x42, {"last": (0, 1), "set_dat_valid": (6, 1), "ovrd_thread_id": (7, 1), "addr_mode": (15, 8), "unpack_block_selection": (23, 1)}),
+  "UNPACR": (0x42,
+             {"last": (0, 1), "set_dat_valid": (6, 1), "ovrd_thread_id": (7, 1), "addr_mode": (15, 8),
+              "unpack_block_selection": (23, 1)}),
   "SETADC": (0x50, {"value": (0, 18), "dimension_index": (18, 2), "channel_index": (20, 1), "cnt_set_mask": (21, 3)}),
   "SETADCXY": (0x51, _ADC), "SETADCZW": (0x54, _ADC),  # in ZW, x means z and y means w
   "SETADCXX": (0x5E, {"x_start": (0, 10), "x_end2": (10, 10), "cnt_set_mask": (21, 3)}),
   "STALLWAIT": (0xA2, {"wait_res": (0, 13), "stall_res": (15, 9)}),
   "SEMINIT": (0xA3, {"sem_sel": (2, 8), "init_value": (16, 4), "max_value": (20, 4)}),
   "SEMPOST": (0xA4, {"sem_sel": (2, 8)}), "SEMGET": (0xA5, {"sem_sel": (2, 8)}),
-  "SEMWAIT": (0xA6, {"wait_sem_cond": (0, 2), "sem_sel": (2, 8), "stall_res": (15, 9)}),  # cond 1: while 0, 2: while at max
+  # cond 1: while 0, 2: while at max
+  "SEMWAIT": (0xA6, {"wait_sem_cond": (0, 2), "sem_sel": (2, 8), "stall_res": (15, 9)}),
   "SETC16": (0xB2, {"setc16_value": (0, 16), "setc16_reg": (16, 8)}),
-  **{f"RMWCIB{i}": (0xB3 + i, {"cfg_reg_addr": (0, 8), "data": (8, 8), "mask": (16, 8)}) for i in range(4)},  # byte i of a config word
+  # byte i of a config word
+  **{f"RMWCIB{i}": (0xB3 + i, {"cfg_reg_addr": (0, 8), "data": (8, 8), "mask": (16, 8)}) for i in range(4)},
   # The SFPU is the 32-lane vector unit that works on Dst (ISA VectorUnit.md). Field names are the ones on the ISA
   # pages. vd, vc, vb and va are LRegs. 0-7 are writable, 8 = 0.8373, 9 = 0.0, 10 = 1.0 and 15 = 2 * lane (ISA
   # LReg.md). Only SFPCONFIG writes 11-14, and leaving the SFPU's soft reset sets 11 to -1.0 (ISA SoftReset.md), where
@@ -153,7 +165,8 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPLOADI": (0x71, {"imm16": (0, 16), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPSTORE": (0x72, {"imm10": (0, 10), "addr_mode": (13, 3), "mod0": (16, 4), "vd": (20, 4)}),
   "SFPEXEXP": (0x77, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: exponent as an integer, 1: biased
-  "SFPEXMAN": (0x78, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 0: mantissa as an integer, with the hidden bit
+  # mod1 0: mantissa as an integer, with the hidden bit
+  "SFPEXMAN": (0x78, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPIADD": (0x79, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSHFT": (0x7A, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "imm12": (12, 12)}),
   "SFPSETCC": (0x7B, {"mod1": (0, 4), "vc": (8, 4)}),  # lane flags from vc. mod1 0: where its sign bit is set
@@ -168,13 +181,15 @@ TENSIX_OPS = {  # name: (opcode, {field: (first bit, width)})
   "SFPMUL": (0x86, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4), "va": (16, 4)}),  # vc must be LReg 9
   "SFPENCC": (0x8A, {"mod1": (0, 4), "vd": (4, 4), "imm2": (12, 2)}),
   "SFPSWAP": (0x92, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
-  "SFPSHFT2": (0x94, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 3: rotate each 8-lane group (a Dst row) by one
+  # mod1 3: rotate each 8-lane group (a Dst row) by one
+  "SFPSHFT2": (0x94, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   # SFPTRANSP treats LRegs 0-3, and 4-7, as a 4 x 4 of 8-lane groups and transposes it: group j of LReg i swaps with
   # group i of LReg j.
   "SFPTRANSP": (0x8C, {}),
   # SFPCAST mod1 0 turns a sign-magnitude int into a float. mod1 3 turns two's complement into sign-magnitude and back.
   "SFPCAST": (0x90, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
-  "SFPGT": (0x97, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),  # mod1 8: vd = all ones if vd > vc (as ordered floats), else 0
+  # mod1 8: vd = all ones if vd > vc (as ordered floats), else 0
+  "SFPGT": (0x97, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4)}),
   "SFPNOP": (0x8F, {}),
   "SFPARECIP": (0x99, {"mod1": (0, 4), "vd": (4, 4), "vc": (8, 4), "vb": (12, 4)}),  # Blackhole only
 }
@@ -191,20 +206,26 @@ FP32, TF32, BF16, BFP8, BFP4, INT32 = 0, 4, 5, 6, 7, 8
 # to tt-metal's cfg_defines.h. Ours come from ttsim's data/bh/tensix_regs.json and still need checking on silicon.
 TENSIX_CFG_FIELDS = {
   "Dstacc": (1, 25, 4), "Fp32_enabled": (1, 29, 1), "Zero_Flag_disabled_src": (2, 0, 1),
-  "PCK0_Ystride": (12, 16, 16), "PCK0_ZW": (13, 0, 32), "PCK0_Ystride_1": (14, 16, 16), "PCK0_ZW_1": (15, 0, 32), "PCK0_Base_1": (17, 0, 18),
+  "PCK0_Ystride": (12, 16, 16), "PCK0_ZW": (13, 0, 32), "PCK0_Ystride_1": (14, 16, 16), "PCK0_ZW_1": (15, 0, 32),
+  "PCK0_Base_1": (17, 0, 18),
   "Read_32b_data": (18, 0, 1), "Edge_mask": (24, 0, 16), "pack_reads_per_xy_plane": (28, 8, 8),
-  "UNP0_add_dest_addr_cntr": (50, 8, 1), "UNP0_Ystride_1": (56, 16, 16), "UNP0_ZW_1": (57, 0, 32), "UNP1_ZW_1": (59, 0, 32),
-  "SEC0_format": (64, 0, 4), "SEC0_x_dim": (64, 16, 16), "SEC0_y_dim": (65, 0, 8), "SEC0_z_dim": (65, 16, 8), "Exp_section_size": (68, 16, 16),
-  "L1_Dest_addr": (69, 0, 32), "Disable_zero_compress": (70, 0, 1), "Pack_out_format": (70, 4, 4), "Pack_in_format": (70, 8, 4),
+  "UNP0_add_dest_addr_cntr": (50, 8, 1), "UNP0_Ystride_1": (56, 16, 16), "UNP0_ZW_1": (57, 0, 32),
+  "UNP1_ZW_1": (59, 0, 32),
+  "SEC0_format": (64, 0, 4), "SEC0_x_dim": (64, 16, 16), "SEC0_y_dim": (65, 0, 8), "SEC0_z_dim": (65, 16, 8),
+  "Exp_section_size": (68, 16, 16),
+  "L1_Dest_addr": (69, 0, 32), "Disable_zero_compress": (70, 0, 1), "Pack_out_format": (70, 4, 4),
+  "Pack_in_format": (70, 8, 4),
   "Pack_L1_Acc": (71, 19, 1),  # the packer adds what it packs to what L1 already holds there
   "SEC0_out_format": (72, 0, 4), "SEC0_Haloize_mode": (72, 8, 1),
   "SEC0_uncompressed": (73, 0, 1), "SEC0_base": (76, 0, 32), "SEC0_dest_addr": (84, 0, 16),
   "SEC0_tile_x_dim": (86, 0, 16), "SEC0_offset": (92, 0, 16),
   # the second context of unpacker 0, which unpacks into Dst. A thread picks it with UNPACK_MISC in its thread config.
-  "SEC0_uncompressed_1": (73, 1, 1), "SEC0_to_dst_1": (73, 5, 1), "SEC0_base_1": (77, 0, 32), "SEC0_dest_addr_1": (84, 16, 16),
+  "SEC0_uncompressed_1": (73, 1, 1), "SEC0_to_dst_1": (73, 5, 1), "SEC0_base_1": (77, 0, 32),
+  "SEC0_dest_addr_1": (84, 16, 16),
   "SEC0_tile_x_dim_1": (86, 16, 16), "SEC0_offset_1": (93, 0, 16),
   "SEC1_format": (112, 0, 4), "SEC1_x_dim": (112, 16, 16), "SEC1_y_dim": (113, 0, 8), "SEC1_z_dim": (113, 16, 8),
-  "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32), "PCK_dest_offset": (180, 0, 12),
+  "SEC1_out_format": (120, 0, 4), "SEC1_uncompressed": (121, 0, 1), "SEC1_base": (124, 0, 32),
+  "PCK_dest_offset": (180, 0, 12),
 }
 # Thread config: 16-bit registers for each thread, written only by SETC16 from that thread. These are register indices.
 # AB, DST and BIAS address modes have 8 slots and PACK has 4, slot i at base + i. Blackhole's addr_mode field is 3 bits
@@ -215,7 +236,8 @@ THREAD_CFG = {"StateID": 0, "MATH_Offset": 1, "DISABLE_IMPLIED_SRCA": 2, "DISABL
 SRCA_SET_BY_ADDR = 1 << 2  # SrcA and SrcB rows come from the unpacker's address. our UNPACRs rely on that
 UNPACKABLE = 256  # an unpacker sees only the low 8 bits of its Z counter, so it reads tiles below this (ISA ADCs.md)
 BFP_FIRST_DATUM = 1 << 16  # the unpacker finds a bfp tile's exponents from its first datum, which must stay below this
-LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}  # SFPU registers that hold these constants (see the SFPU note above). LReg 8 holds 0.8373
+# SFPU registers that hold these constants (see the SFPU note above). LReg 8 holds 0.8373
+LREG_CONSTS = {0.0: 9, 1.0: 10, -1.0: 11}
 # Address modes: 8 slots each of AB, DST and BIAS, and 4 of PACK. AB holds SrcAIncr | SrcBIncr << 8, DST holds
 # DestIncr | FidelityIncr << FIDELITY_INCR, PACK holds YsrcIncr, and BIAS is the packer's. Row counters wrap at 64 in
 # Src and 1024 in Dst.

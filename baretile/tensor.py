@@ -5,8 +5,9 @@ from baretile import bh
 from baretile.runtime import Bound
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
 from baretile.kernels import attention_plan, link_flags
-from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel, link_kernel, move_kernel,
-                             put_kernel, readback_kernel, storage_kernel, topk_kernel, transpose_kernel, upload_kernel, zeros_kernel)
+from baretile.kernels import (attention_kernel, bfp4_kernel, columns_kernel, copy_kernel, fused_kernel, gather_kernel,
+                              link_kernel, move_kernel, put_kernel, readback_kernel, storage_kernel, topk_kernel,
+                              transpose_kernel, upload_kernel, zeros_kernel)
 
 FIDELITY = 4  # phases a bf16 matmul takes by default. 4 gives exact products, and tensix.matmul says what fewer drop
 # frombytes sends at least this many bytes through upload_kernel, and less through the BAR, which starts sooner but
@@ -45,14 +46,18 @@ class Tensor:
   def requires_grad_(self, on=True):
     self.requires_grad = on
     return self
-  def _where(self, runs=False):  # the address and tile strides a kernel reads it by, or for a tensor by columns, its runs
-    if self.runs and not runs: raise ValueError("cast a tensor by columns to bf16 for operations other than matmul's B or readback")
-    return (self.addr, *self.runs) if self.runs else (self.addr, self.bstride if self.batch > 1 else 0, self.stride, self.offset)
+  # the address and tile strides a kernel reads it by, or for a tensor by columns, its runs
+  def _where(self, runs=False):
+    if self.runs and not runs:
+      raise ValueError("cast a tensor by columns to bf16 for operations other than matmul's B or readback")
+    return (self.addr, *self.runs) if self.runs else (self.addr, self.bstride if self.batch > 1 else 0, self.stride,
+                                                      self.offset)
   def _alloc(self): return self.rt.dram_alloc(-(-self.tiles // len(bh.DRAM)) * tile_bytes(self.dtype))
   def _same_runtime(self, *xs):
     if any(x.rt is not self.rt for x in xs): raise ValueError("tensor operands must use the same runtime")
   def _alias(self, into):  # take into's storage as this tensor's
-    self.addr, self.owner, self.bstride, self.stride, self.offset = into.addr, _root(into), into.bstride, into.stride, into.offset
+    self.addr, self.owner, self.bstride, self.stride, self.offset = (into.addr, _root(into), into.bstride, into.stride,
+                                                                     into.offset)
 
   def __del__(self):  # free the DRAM. the runtime holds it until the launches queued so far are done
     if self.addr is not None and self.owner is None: self.rt.dram_free(self.addr)
@@ -66,7 +71,8 @@ class Tensor:
     zeros in their L1, so nothing crosses PCIe. Model caches start this way."""
     t = cls(rt, rows, cols, batch=batch, dtype=dtype)
     each = -(-t.tiles // len(bh.DRAM)) * tile_bytes(dtype)  # the bytes it has in each bank
-    return t.run(("zeros",), zeros_kernel, t.addr, each, units=len(bh.DRAM) * -(-each // 4096), name="zeros")  # a unit: 4 KiB of a bank
+    # a unit: 4 KiB of a bank
+    return t.run(("zeros",), zeros_kernel, t.addr, each, units=len(bh.DRAM) * -(-each // 4096), name="zeros")
 
   @classmethod
   def of(cls, rt, data, dtype="bf16"):
@@ -89,7 +95,8 @@ class Tensor:
     if dtype not in ITEMSIZE: raise ValueError(f"unknown tensor dtype: {dtype}")
     batch, rows, cols = _shape((batch, rows, cols))
     n, tr, tc, data = ITEMSIZE[dtype], -(-rows // 32), -(-cols // 32), memoryview(data).cast("B")
-    if len(data) != n * batch * rows * cols: raise ValueError(f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}")
+    if len(data) != n * batch * rows * cols:
+      raise ValueError(f"{len(data)} bytes for {batch} x {rows} x {cols} of {dtype}")
     t = cls(rt, rows, cols, batch=batch, dtype=dtype)
     tb, run = tile_bytes(dtype), 2 * n  # bytes per tile, and 8-byte words per run of 16 values (a row of a face)
     tiles = memoryview(bytearray(t.tiles * tb)).cast("Q")  # the tiles in order, zero where they're padding
@@ -97,12 +104,14 @@ class Tensor:
       at = n * (b * rows + (r if rows > 1 else 0)) * cols
       row = bytes(data[at:at + n]) * 32 if cols == 1 else bytes(data[at:at + n * cols]) + bytes(n * (32 * tc - cols))
       src, first = memoryview(row).cast("Q"), (b * tr + r // 32) * tc * tb // 8 + r % 16 * run
-      for half, q in ((half, q) for half in (0, 1) for q in range(run)):  # word q of the runs in the left or right faces
+      # word q of the runs in the left or right faces
+      for half, q in ((half, q) for half in (0, 1) for q in range(run)):
         start = first + (r % 32 // 16 * 2 + half) * tb // 32 + q  # faces as in the tile layout at the top of tensix.py
         tiles[start:start + tc * tb // 8:tb // 8] = src[half * run + q::2 * run]
     tiles = tiles.cast("B")
     # tile i is in bank i % 8 at addr + i // 8 tiles, so each bank's tiles are one run
-    banks = [b"".join(tiles[i * tb:(i + 1) * tb] for i in range(bank, t.tiles, len(bh.DRAM))) for bank in range(len(bh.DRAM))]
+    banks = [b"".join(tiles[i * tb:(i + 1) * tb] for i in range(bank, t.tiles, len(bh.DRAM)))
+             for bank in range(len(bh.DRAM))]
     if len(tiles) < DMA_UPLOAD:
       for bank, run in enumerate(banks): t.rt.chip.write(*bh.DRAM[bank], t.addr, run)
     else: t._upload(banks)
@@ -125,7 +134,8 @@ class Tensor:
         part = run[at:at + k]
         stage[b * k:b * k + len(part)], stage[b * k + len(part):(b + 1) * k] = part, bytes(k - len(part))
       piece = min(bh.MAX_PACKET, -(-k // (64 * workers)) * 64)
-      rt.send(*rt.block([(kernel, (bus & 0xFFFFFFFF, bus >> 32, self.addr + at, k, piece), d * -(-k // piece), "upload")]))
+      rt.send(*rt.block([(kernel, (bus & 0xFFFFFFFF, bus >> 32, self.addr + at, k, piece), d * -(-k // piece),
+                          "upload")]))
       last[h] = rt.launches
     rt.wait()
 
@@ -134,21 +144,27 @@ class Tensor:
     Queue a kernel to write tiles into host memory and wait for completion. This avoids a PCIe
     round trip for each host load through the BARs."""
     self.realize()
-    n, rows, cols, tc, tb = 2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols, -(-self.cols // 32), tile_bytes(self.dtype)
+    n, rows, cols, tc, tb = (2 if self.dtype in BFP else ITEMSIZE[self.dtype], self.rows, self.cols,
+                             -(-self.cols // 32), tile_bytes(self.dtype))
     # readback_kernel sends sent bytes of each tile: v rows, with face f starting at faces[f]
     v = 32 if self.dtype in BFP else min(rows, 32)
-    sent, faces = tb if v == 32 else 32 * v * n, [16 * n * f for f in (0, min(v, 16), 2 * min(v, 16), 2 * min(v, 16) + max(v - 16, 0))]
+    sent, faces = (tb if v == 32 else 32 * v * n,
+                   [16 * n * f for f in (0, min(v, 16), 2 * min(v, 16), 2 * min(v, 16) + max(v - 16, 0))])
     by = bool(self.runs)
-    per, tiles, kernel = len(self.rt.back) // sent, bytearray(), _cached(("readback", self.dtype, by), lambda: readback_kernel(self.dtype, by))
+    per, tiles, kernel = (len(self.rt.back) // sent, bytearray(),
+                          _cached(("readback", self.dtype, by), lambda: readback_kernel(self.dtype, by)))
     for start in range(0, self.tiles, per):
       k = min(per, self.tiles - start)
       self.rt.launch(kernel, (start, *self._where(True), tc, self.tiles // self.batch, self.rep,
                               self.rt.back_bus & 0xFFFFFFFF, self.rt.back_bus >> 32, v), units=k, name="readback")
       self.rt.wait()
       tiles += self.rt.back[:k * sent]
-    if self.dtype in BFP: tiles, sent = b"".join(_bf16s(tiles[i * sent:(i + 1) * sent], self.dtype) for i in range(self.tiles)), 2048
-    words, sw, run, matrix = memoryview(tiles).cast("Q"), sent // 8, 2 * n, self.tiles // self.batch  # 8-byte words per tile sent, per run
-    out, row = bytearray(n * self.batch * rows * cols), memoryview(bytearray(32 * n * tc)).cast("Q")  # a row across the tile columns
+    if self.dtype in BFP:
+      tiles, sent = b"".join(_bf16s(tiles[i * sent:(i + 1) * sent], self.dtype) for i in range(self.tiles)), 2048
+    # 8-byte words per tile sent, per run
+    words, sw, run, matrix = memoryview(tiles).cast("Q"), sent // 8, 2 * n, self.tiles // self.batch
+    # a row across the tile columns
+    out, row = bytearray(n * self.batch * rows * cols), memoryview(bytearray(32 * n * tc)).cast("Q")
     # frombytes in reverse: row by row, word q of its runs from the left or right faces of the tiles along it
     for b, r in ((b, r) for b in range(self.batch) for r in range(rows)):
       first = (b * matrix + r // 32 * tc) * sw + (r % 16 * 16 * n) // 8
@@ -161,9 +177,11 @@ class Tensor:
 
   def tolist(self):  # rows of numbers, or a list of them for a batch
     raw = self.tobytes()
-    if self.dtype == "bf16" or self.dtype in BFP: raw = array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()
+    if self.dtype == "bf16" or self.dtype in BFP:
+      raw = array.array("I", [b << 16 for b in array.array("H", raw)]).tobytes()
     values = array.array("i" if self.dtype == "int32" else "f", raw).tolist()
-    m = [[values[(b * self.rows + r) * self.cols:(b * self.rows + r + 1) * self.cols] for r in range(self.rows)] for b in range(self.batch)]
+    m = [[values[(b * self.rows + r) * self.cols:(b * self.rows + r + 1) * self.cols] for r in range(self.rows)]
+         for b in range(self.batch)]
     return m if self.batch > 1 else m[0]
 
   def gather(self, ids):
@@ -171,10 +189,12 @@ class Tensor:
     the chip. Python indices are bounds-checked; tensor indices aren't."""
     if self.dtype not in ITEMSIZE: raise ValueError("cast block-float storage to bf16 before gathering rows")
     if not isinstance(ids, Tensor):
-      if not all(0 <= i < self.rows for i in ids): raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
+      if not all(0 <= i < self.rows for i in ids):
+        raise IndexError(f"gather picks rows of a {self.rows}-row matrix: {list(ids)}")
       ids = Tensor.of(self.rt, [list(ids)], "int32")
     self._same_runtime(ids)
-    if not (self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1)): raise ValueError("gather needs batch 1, and ids as an int32 row")
+    if not (self.batch == 1 and ids.dtype == "int32" and ids.shape[:2] == (1, 1)):
+      raise ValueError("gather needs batch 1, and ids as an int32 row")
     out, d, ids = Tensor(self.rt, ids.cols, self.cols, dtype=self.dtype), self.dtype, ids.realize()
     addr, _, stride, offset = _plain(self.realize())._where()
     return out.run(("gather", d), lambda: gather_kernel(d), out.addr, addr, stride, offset,
@@ -187,7 +207,8 @@ class Tensor:
     if not (ids.dtype == "int32" and ids.shape[:2] == (1, 1) and ids.cols == x.rows):
       raise ValueError("put needs ids as an int32 row, with one position for each row of x")
     if not ((x.batch, x.cols) == (self.batch, self.cols) and x.dtype == ("bf16" if self.dtype in BFP else self.dtype)):
-      raise ValueError(f"put needs rows of the cache's batch and width, bf16 for a block float: {x.shape} {x.dtype} into {self.shape} {self.dtype}")
+      raise ValueError(f"put needs rows of the cache's batch and width, "
+                       f"bf16 for a block float: {x.shape} {x.dtype} into {self.shape} {self.dtype}")
     if self.rep != 1: raise ValueError("put requires a tensor with rep=1")
     x, ids, tc, tr = _plain(x.realize()), ids.realize(), -(-self.cols // 32), -(-self.rows // 32)
     if 2 * x.rows + tr > 2**17: raise ValueError("put has too many rows to track in a worker's L1")
@@ -199,8 +220,10 @@ class Tensor:
                               ids.offset, x.rows, tc, tr, self.rows, units=self.batch * x.rows * tc, name="put")
 
   def _view(self, rows, cols, batch, offset, bstride=0, runs=None):
-    if self.rep != 1: raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
-    if self.runs and not runs: raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
+    if self.rep != 1:
+      raise ValueError("can't view a repeat: a view addresses stored matrices, and a repeat's aren't all stored")
+    if self.runs and not runs:
+      raise ValueError("a tensor by columns can only be viewed by split, cutting K into a batch")
     v = Tensor(self.rt, rows, cols, "view", batch=batch, dtype=self.dtype)
     v.op, v.addr, v.owner = None, self.realize().addr, _root(self)
     v.offset, v.bstride, v.stride, v.runs = self.offset + offset, bstride, self.stride, runs
@@ -222,11 +245,14 @@ class Tensor:
     ranges = [range(*k.indices(n)) for k, n in zip((slice(None),) * (3 - len(key)) + tuple(key), self.shape)]
     shape = tuple(map(len, ranges))
     if not all(shape): raise ValueError(f"an empty slice of {self.shape}")
-    if all(g.step > 0 if ax == 0 else g.step == 1 and g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n) and (len(g) > 1 or n == 1)
-           for ax, (g, n) in enumerate(zip(ranges, self.shape))):  # tile-aligned. a slice of length 1 must be a copy, filling its tile
+    if all(g.step > 0 if ax == 0 else g.step == 1 and g.start % 32 == 0 and (g.stop % 32 == 0 or g.stop == n)
+           and (len(g) > 1 or n == 1)
+           # tile-aligned. a slice of length 1 must be a copy, filling its tile
+           for ax, (g, n) in enumerate(zip(ranges, self.shape))):
       if terms := _terms(self): return sum((t[key] for t in terms[1:]), terms[0][key])
       b, r, c = (g.start for g in ranges)
-      t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32, self.bstride * ranges[0].step)
+      t = self._view(shape[1], shape[2], shape[0], b * self.bstride + r // 32 * self.stride + c // 32,
+                     self.bstride * ranges[0].step)
     else:
       t = self._map(shape, (0, 1, 2), [g.start for g in ranges], [g.step for g in ranges])
     return t._track("slice", (self,), ranges)
@@ -243,11 +269,13 @@ class Tensor:
       shape, strides, lo = (tuple(map(operator.index, values)) for values in (shape, strides, lo))
       hi, offset = shape if hi is None else tuple(map(operator.index, hi)), operator.index(offset)
     except TypeError: raise ValueError("move needs integer dimensions, offset, strides and bounds") from None
-    if any(len(values) != 3 for values in (shape, strides, lo, hi)): raise ValueError("move needs three dimensions, strides and bounds")
+    if any(len(values) != 3 for values in (shape, strides, lo, hi)):
+      raise ValueError("move needs three dimensions, strides and bounds")
     shape = _shape(shape)
     if not all(0 <= a <= b <= n < 2**31 for a, b, n in zip(lo, hi, shape)):
       raise ValueError("move bounds must lie inside its signed 32-bit output dimensions")
-    if not all(-2**31 <= v < 2**31 for v in (offset, *strides)): raise ValueError("move offset and strides must fit signed 32 bits")
+    if not all(-2**31 <= v < 2**31 for v in (offset, *strides)):
+      raise ValueError("move offset and strides must fit signed 32 bits")
     if all(a < b for a, b in zip(lo, hi)):
       ends = [(a * s, (b - 1) * s) for a, b, s in zip(lo, hi, strides)]
       first, last = offset + sum(min(v) for v in ends), offset + sum(max(v) for v in ends)
@@ -260,14 +288,17 @@ class Tensor:
     """Map output index e on axis a to starts[a] + steps[a] * e on source axis axes[a], using zero outside the
     source. Return shape (batch, rows, cols). Compose with an unrealized move so a chain of maps can run in
     one launch."""
-    if self.op == "move": x, offset, strides, lo, hi = self.srcs[0], self.map[0], self.map[1:4], self.map[4:7], self.map[7:]
+    if self.op == "move":
+      x, offset, strides, lo, hi = self.srcs[0], self.map[0], self.map[1:4], self.map[4:7], self.map[7:]
     else: x, offset, strides, lo, hi = self, 0, (self.rows * self.cols, self.cols, 1), (0, 0, 0), self.shape
     inside = [_inside(o, s, lo[k], hi[k], n) for k, o, s, n in zip(axes, starts, steps, shape)]
-    return x.move(shape, offset + sum(strides[k] * o for k, o in zip(axes, starts)), [strides[k] * s for k, s in zip(axes, steps)], *zip(*inside))
+    return x.move(shape, offset + sum(strides[k] * o for k, o in zip(axes, starts)),
+                  [strides[k] * s for k, s in zip(axes, steps)], *zip(*inside))
   def reshape(self, *shape):  # up to three sizes. missing leading sizes are 1
     shape = _shape(shape)
     if math.prod(shape) != math.prod(self.shape): raise ValueError(f"cannot reshape {self.shape} to {shape}")
-    return self if shape == self.shape else self.move(shape, 0, (shape[1] * shape[2], shape[2], 1))._track("reshape", (self,))
+    return (self if shape == self.shape else
+            self.move(shape, 0, (shape[1] * shape[2], shape[2], 1))._track("reshape", (self,)))
   def permute(self, *order):
     if sorted(order) != [0, 1, 2]: raise ValueError(f"permute needs an order of the axes 0, 1 and 2, not {order}")
     if order == (0, 2, 1): return self.T
@@ -275,13 +306,16 @@ class Tensor:
     return self._map(tuple(self.shape[k] for k in order), order, (0, 0, 0), (1, 1, 1))._track("permute", (self,), order)
   def expand(self, *shape):  # repeats dimensions of 1. missing leading sizes are 1
     shape = _shape(shape)
-    if not all(n in (m, 1) for n, m in zip(self.shape, shape)): raise ValueError(f"cannot expand {self.shape} to {shape}")
+    if not all(n in (m, 1) for n, m in zip(self.shape, shape)):
+      raise ValueError(f"cannot expand {self.shape} to {shape}")
     if shape == self.shape: return self
-    return self._map(shape, (0, 1, 2), (0, 0, 0), [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
+    return self._map(shape, (0, 1, 2), (0, 0, 0),
+                     [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
   def pad(self, widths):  # zeros, with (before, after) for each of the last len(widths) axes, like numpy
     try: widths = tuple(tuple(map(operator.index, w)) for w in widths)
     except TypeError: raise ValueError("pad needs integer (before, after) pairs") from None
-    if len(widths) > 3 or any(len(w) != 2 for w in widths): raise ValueError("pad needs at most three (before, after) pairs")
+    if len(widths) > 3 or any(len(w) != 2 for w in widths):
+      raise ValueError("pad needs at most three (before, after) pairs")
     widths = ((0, 0),) * (3 - len(widths)) + widths
     shape = tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
     return self._map(shape, (0, 1, 2), [-w[0] for w in widths], (1, 1, 1))._track("pad", (self,), widths)
@@ -318,20 +352,24 @@ class Tensor:
     if self.runs:  # by columns, split cuts K: each part reads further along the same runs
       if not (axis == 1 and self.batch == 1 and self.rows % (32 * n) == 0):
         raise ValueError("a tensor by columns splits K, with batch 1, into tile-aligned parts")
-      return self._view(self.rows // n, self.cols, n, 0, runs=(0, self.runs[1], self.rows // n // 32))._track("split", (self,), axis)
+      return self._view(self.rows // n, self.cols, n, 0,
+                        runs=(0, self.runs[1], self.rows // n // 32))._track("split", (self,), axis)
     if axis == 2:
-      if not (self.batch == 1 and self.cols % (32 * n) == 0): raise ValueError("split needs batch 1 and tile-aligned parts")
+      if not (self.batch == 1 and self.cols % (32 * n) == 0):
+        raise ValueError("split needs batch 1 and tile-aligned parts")
       return self._view(self.rows, self.cols // n, n, 0, self.cols // n // 32)._track("split", (self,), axis)
     if not (self.rows % (32 * n) == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride)):
       raise ValueError("split along rows needs tile-aligned parts of matrices stored one after another")
-    return self._view(self.rows // n, self.cols, self.batch * n, 0, self.rows // n // 32 * self.stride)._track("split", (self,), axis)
+    return self._view(self.rows // n, self.cols, self.batch * n, 0,
+                      self.rows // n // 32 * self.stride)._track("split", (self,), axis)
 
   def merge(self):
     """Place batch matrices side by side, reversing split: x.split(n).merge() is x. An unrealized expression
     writes directly into the result columns. Otherwise, copy the matrices there."""
     if self.cols % 32: raise ValueError(f"merge needs matrices a whole number of tiles wide, not {self.cols} columns")
     out = Tensor(self.rt, self.rows, self.batch * self.cols, dtype=self.dtype)
-    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))  # + 0 copies a realized tensor, T or move in
+    # + 0 copies a realized tensor, T or move in
+    (self if self.op not in (None, "T", "move") else self + 0).realize(out.split(self.batch))
     return out._track("merge", (self,))
 
   @property
@@ -348,20 +386,26 @@ class Tensor:
     self.rt.check()
     if into is not None:
       self._same_runtime(into)
-      if not (into.op is None and into.rep == 1 and not into.runs and (into.shape, into.dtype) == (self.shape, self.dtype)):
-        raise ValueError("realize needs a realized destination of the same shape and dtype, not a repeat or a tensor by columns")
-      if self.op is None: raise ValueError("realize writes into a destination only from an unrealized tensor. assign copies a realized one")
+      if not (into.op is None and into.rep == 1 and not into.runs
+              and (into.shape, into.dtype) == (self.shape, self.dtype)):
+        raise ValueError("realize needs a realized destination of the same shape and dtype, "
+                         "not a repeat or a tensor by columns")
+      if self.op is None:
+        raise ValueError("realize writes into a destination only from an unrealized tensor. "
+                         "assign copies a realized one")
       _writes(into)
     if self.op is None: return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
-      if self.dtype in BFP: raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
+      if self.dtype in BFP:
+        raise ValueError("a block float moves only as a matmul's B. Cast it to bf16 to transpose or move it")
       x, op, d = _plain(self.srcs[0].realize()), self.op, self.dtype
       src = x._where()  # check the source before this tensor counts as realized
       self.addr, self.op, self.srcs = self._alloc(), None, ()
       where = (self.addr, *src)
       if op == "T" and d == "bf16":
-        return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where, name="transpose")
+        return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where,
+                        name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self.shape)
       return self.run(("move", d), lambda: move_kernel(d), *where, x.rows, x.cols, self.rows, self.cols,
                       *(v & 0xFFFFFFFF for v in self.map), name="move")
@@ -405,9 +449,11 @@ class Tensor:
     in args and pass their address, batch stride, row stride and offset. Launches execute in order; this
     call doesn't wait for completion."""
     self._same_runtime(*(a for a in args if isinstance(a, Tensor)))
-    args = [_plain(a.realize()) if isinstance(a, Tensor) else a for a in args]  # the list keeps each copy alive until it's queued
+    # the list keeps each copy alive until it's queued
+    args = [_plain(a.realize()) if isinstance(a, Tensor) else a for a in args]
     units = self.tiles if units is None else units
-    self.rt.launch(_cached(key, make), tuple(v for a in args for v in (a._where() if isinstance(a, Tensor) else (a,))), units, name)
+    self.rt.launch(_cached(key, make), tuple(v for a in args for v in (a._where() if isinstance(a, Tensor) else (a,))),
+                   units, name)
     return self
 
   @property
@@ -429,10 +475,12 @@ class Tensor:
   def _binop(self, op, x, reverse=False):
     """numpy broadcasting. A number becomes a 1 x 1 tensor of this dtype (fp32 for a float with int32). Mixed dtypes
     meet in fp32, and so does int32 for ops that have no int32 form, like mul, which is then exact below 2^24."""
-    if not isinstance(x, Tensor): x = self.number(x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
+    if not isinstance(x, Tensor):
+      x = self.number(x, "fp32" if self.dtype == "int32" and isinstance(x, float) else self.dtype)
     a, b = (x, self) if reverse else (self, x)
     if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32_OPS): a, b = a.float(), b.float()
-    if not all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)): raise ValueError(f"cannot broadcast {a.shape} with {b.shape}")
+    if not all(n == m or 1 in (n, m) for n, m in zip(a.shape, b.shape)):
+      raise ValueError(f"cannot broadcast {a.shape} with {b.shape}")
     batch, rows, cols = map(max, a.shape, b.shape)
     return Tensor(self.rt, rows, cols, op, (a, b), batch, a.dtype)
   def cast(self, dtype):  # bfp4 isn't lazy: bfp4_kernel makes it now from the bf16 value, and says why
@@ -441,21 +489,25 @@ class Tensor:
     if self.dtype in BFP or self.runs:
       x, out, tc = self.realize(), Tensor(self.rt, self.rows, self.cols, batch=self.batch), -(-self.cols // 32)
       key = ("storage", self.dtype, bool(self.runs))
-      return out.run(key, lambda: storage_kernel(*key[1:]), out.addr, *x._where(True), tc, self.tiles // self.batch, self.rep,
+      return out.run(key, lambda: storage_kernel(*key[1:]), out.addr, *x._where(True), tc, self.tiles // self.batch,
+                     self.rep,
                      name="storage")._track("cast", (self,)).cast(dtype)
     if dtype != "bfp4": return Tensor(self.rt, self.rows, self.cols, "cast", (self,), self.batch, dtype)
-    x, out, tc = _plain(self.cast("bf16").realize()), Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32)
+    x, out, tc = (_plain(self.cast("bf16").realize()),
+                  Tensor(self.rt, self.rows, self.cols, batch=self.batch, dtype="bfp4"), -(-self.cols // 32))
     return out.run(("bfp4",), bfp4_kernel, out.addr, *x._where(), tc,
                    -(-self.rows // 32) * tc, name="bfp4")._track("cast", (self,))
   def columns(self):
     """Store each tile column of B together so matmul can read several tiles along K per request.
     Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
     readback and use as matmul's B, including indexed selection and splits along K. Cast to bf16 for ordinary operations."""
-    if self.dtype not in ("bf16", *BFP): raise ValueError(f"columns lays out a matmul's B, which is bf16 or a block float, not {self.dtype}")
+    if self.dtype not in ("bf16", *BFP):
+      raise ValueError(f"columns lays out a matmul's B, which is bf16 or a block float, not {self.dtype}")
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)
     runs = -(-tc // len(bh.DRAM))  # runs per matrix in each bank
     out = Tensor(self.rt, self.rows, self.cols, "view", batch=self.batch, dtype=self.dtype)
-    out.op, out.runs, out.addr = None, (runs, tr, 0), self.rt.dram_alloc(self.batch * runs * tr * tile_bytes(self.dtype))
+    out.op, out.runs, out.addr = (None, (runs, tr, 0),
+                                  self.rt.dram_alloc(self.batch * runs * tr * tile_bytes(self.dtype)))
     return out.run(("columns", self.dtype), lambda: columns_kernel(self.dtype), out.addr, x, tc, tr * tc, runs, tr,
                    name="columns")._track("columns", (self,))
   def float(self): return self.cast("fp32")
@@ -472,13 +524,15 @@ class Tensor:
   def rsqrt(self): return self.sqrt().reciprocal()
   def maximum(self, x): return self._binop("max", x)
   def minimum(self, x):  # -max(-a, -b). Negating -2**31 overflows, so int32 complements instead: ~v = -1 - v
-    if self.dtype == "int32" and (x.dtype == "int32" if isinstance(x, Tensor) else not isinstance(x, float)): return -1 - (-1 - self).maximum(-1 - x)
+    if self.dtype == "int32" and (x.dtype == "int32" if isinstance(x, Tensor) else not isinstance(x, float)):
+      return -1 - (-1 - self).maximum(-1 - x)
     return -((-self).maximum(-x))
   def where(self, x, y):
     """x where self isn't 0, else y. A condition of another dtype, or an int32 one that isn't a comparison's 0 or 1,
     becomes 0 or 1 in theirs first, since the SFPU tests its bits as a float's, where -0 is false."""
     dtype = next((t.dtype for t in (x, y) if isinstance(t, Tensor)), self.dtype)
-    c = self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmple", "cmpne")) else self.ne(0).cast(dtype)
+    c = (self if self.dtype == dtype and (dtype != "int32" or self.op in ("cmplt", "cmple", "cmpne")) else
+         self.ne(0).cast(dtype))
     return c._binop("keep", x)._binop("join", c._binop("drop", y))
   def __add__(self, x): return self._binop("add", x)
   def __sub__(self, x): return self._binop("sub", x)
@@ -486,7 +540,8 @@ class Tensor:
   def __rsub__(self, x): return self._binop("sub", x, True)
   __radd__, __rmul__ = __add__, __mul__
   def __truediv__(self, x): return self * (1 / x if isinstance(x, (int, float)) else x.reciprocal())
-  def __neg__(self): return 0 - self if self.dtype == "int32" else self * -1  # int32 subtracts exactly but multiplies through fp32
+  # int32 subtracts exactly but multiplies through fp32
+  def __neg__(self): return 0 - self if self.dtype == "int32" else self * -1
   def __lt__(self, x): return self._binop("cmplt", x)
   def __gt__(self, x): return self._binop("cmplt", x, True)
   def __ge__(self, x): return self._binop("cmple", x, True)
@@ -497,7 +552,8 @@ class Tensor:
   def __hash__(self): return id(self)  # == is elementwise, so hash by identity, like tinygrad
   def sigmoid(self): return (1 + (-self).exp()).reciprocal()
   def silu(self): return self * self.sigmoid()
-  def gelu(self):  # GPT-2's tanh form: 0.5 x (1 + tanh(z)) with z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
+  # GPT-2's tanh form: 0.5 x (1 + tanh(z)) with z = sqrt(2/pi) (x + 0.044715 x^3), which is x / (1 + e^-2z)
+  def gelu(self):
     k = 2 * math.sqrt(2 / math.pi)
     return self * (1 + (self * (self * self * (-0.044715 * k) - k)).exp()).reciprocal()
 
@@ -512,7 +568,8 @@ class Tensor:
     if self.dtype == "int32": return self.float()._reduce(f, axis).cast("int32")  # exact below 2^24
     if axis is None: return self._reduce(f, 0)._reduce(f, 1)._reduce(f, 2)
     shape = [1 if ax == axis % 3 else s for ax, s in enumerate(self.shape)]
-    return self if shape == list(self.shape) else Tensor(self.rt, shape[1], shape[2], f"{f}{axis % 3}", (self,), shape[0], self.dtype)
+    return self if shape == list(self.shape) else Tensor(self.rt, shape[1], shape[2], f"{f}{axis % 3}", (self,),
+                                                         shape[0], self.dtype)
   def mean(self, axis=None):
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
@@ -526,7 +583,8 @@ class Tensor:
     if k <= 0 or parts <= 0: raise ValueError("topk needs positive k and parts")
     cols = self.cols // parts
     if not (self.dtype in ("bf16", "fp32") and k <= min(cols, 64) and parts * cols == self.cols):
-      raise ValueError(f"topk needs bf16 or fp32, k up to 64 and a part's width, and equal parts: {self.dtype}, k={k}, {parts} parts of {self.cols}")
+      raise ValueError(f"topk needs bf16 or fp32, k up to 64 and a part's width, "
+                       f"and equal parts: {self.dtype}, k={k}, {parts} parts of {self.cols}")
     if labels is not None and not (labels.dtype == "int32" and labels.shape == self.shape and parts == 1):
       raise ValueError("topk's labels need int32, x's shape and parts=1")
     x, labels = _plain(self.realize()), None if labels is None else _plain(labels.realize())
@@ -534,7 +592,8 @@ class Tensor:
     ids = Tensor(self.rt, x.rows, parts * k, batch=x.batch, dtype="int32")
     key = ("topk", k, cols, x.dtype, parts, labels is not None)
     return values.run(key, lambda: topk_kernel(*key[1:]), values.addr, ids.addr, *x._where(), x.rows,
-                      *(labels._where() if labels is not None else ()), units=x.batch * parts * -(-x.rows // 32) * 32, name="topk"), ids
+                      *(labels._where() if labels is not None else ()), units=x.batch * parts * -(-x.rows // 32) * 32,
+                      name="topk"), ids
   def to(self, rt, ch, back):
     """Copy to rt's chip over Ethernet channel ch, with channel back at the peer (see Chip.links). Wait for
     queued launches on both chips before clearing the transfer flags. This can't be recorded because replay
@@ -543,13 +602,16 @@ class Tensor:
       raise ValueError("to requires different runtimes with neither recording launches")
     x = self.realize()
     if x.runs: raise ValueError("cast a tensor by columns to bf16 before transferring it to another chip")
-    if x.owner is not None or x.rep > 1 or x.offset: x = _copy(x)  # transfer a view from its own storage, preserving its bits
+    # transfer a view from its own storage, preserving its bits
+    if x.owner is not None or x.rep > 1 or x.offset: x = _copy(x)
     out = Tensor(rt, x.rows, x.cols, batch=x.batch, dtype=x.dtype)
     x.rt.wait(), rt.wait()
     flags, n = link_flags(x.dtype)
     for chip, end in ((x.rt.chip, ch), (rt.chip, back)): chip.write(*bh.ETH[end], flags, bytes(n))
-    out.run(("link", False, x.dtype), lambda: link_kernel(False, x.dtype), out.addr, out.tiles, *bh.ETH[back], units=1, name="link in")
-    x.run(("link", True, x.dtype), lambda: link_kernel(True, x.dtype), x.addr, x.tiles, *bh.ETH[ch], units=1, name="link out")
+    out.run(("link", False, x.dtype), lambda: link_kernel(False, x.dtype), out.addr, out.tiles, *bh.ETH[back], units=1,
+            name="link in")
+    x.run(("link", True, x.dtype), lambda: link_kernel(True, x.dtype), x.addr, x.tiles, *bh.ETH[ch], units=1,
+          name="link out")
     return out
   def softmax(self, axis=-1):  # max first, so exp stays in range
     e = (self - self.max(axis)).exp()
@@ -580,7 +642,8 @@ class Tensor:
     if index is not None:
       if not (index.dtype == "int32" and self.dtype == "bf16" and x.dtype in ("bf16", *BFP) and self.cols == x.rows
               and self.batch in (1, index.rows * index.cols)):
-        raise ValueError(f"matmul by index needs bf16 A, a bf16 or block-float B and int32 indices to fit: {self.shape} {self.dtype} @ "
+        raise ValueError(f"matmul by index needs bf16 A, "
+                         f"a bf16 or block-float B and int32 indices to fit: {self.shape} {self.dtype} @ "
                          f"{x.shape} {x.dtype}, {index.shape} {index.dtype}")
       out = Tensor(self.rt, self.rows, x.cols, "matmul", (self, x, index), index.rows * index.cols, dtype or "bf16")
       out.fidelity = fidelity
@@ -589,19 +652,23 @@ class Tensor:
     # RoPE turns the parts of a split K
     if x.tiles <= 16 and (terms := _terms(self)):
       return sum((t.matmul(x, dtype, fidelity) for t in terms[1:]), terms[0].matmul(x, dtype, fidelity))
-    if "int32" in (self.dtype, x.dtype): raise ValueError(f"matmul needs floats, since the FPU has no int32: {self.dtype} @ {x.dtype}")
+    if "int32" in (self.dtype, x.dtype):
+      raise ValueError(f"matmul needs floats, since the FPU has no int32: {self.dtype} @ {x.dtype}")
     dtype = dtype or ("fp32" if "fp32" in (self.dtype, x.dtype) else "bf16")
-    if "fp32" in (self.dtype, x.dtype):  # autograd sees one op, and keeps the bf16 parts for the two fp32 matmuls of backward
+    # autograd sees one op, and keeps the bf16 parts for the two fp32 matmuls of backward
+    if "fp32" in (self.dtype, x.dtype):
       a, b = _parts(self), _parts(x)
       return _bf16x3(a, b)._track("matmul", (self, x), a, b).cast(dtype)
     if not (self.cols == x.rows and (self.batch == x.batch or 1 in (self.batch, x.batch))):
-      raise ValueError(f"matmul needs A's columns to match B's rows, and batches that match or broadcast: {self.shape} @ {x.shape}")
+      raise ValueError(f"matmul needs A's columns to match B's rows, "
+                       f"and batches that match or broadcast: {self.shape} @ {x.shape}")
     if self.cols == 1: return (self * x).cast(dtype)  # (R, 1) @ (1, C) is broadcasting
     k, tr = -(-self.cols // 32), -(-self.rows // 32)
     # A row of tiles, like a token's MLP, has too few blocks to keep the workers busy. Cut K into s parts of at least 4
     # tiles as a batch, then sum them. With more rows this doesn't help: the matrices of a batch read their own tiles,
     # while blocks of the same matrix share them.
-    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and tr == 1 and self.cols % (32 * s) == 0 and k // s >= 4
+    s = max([s for s in (2, 4, 8) if self.batch == x.batch == 1 and tr == 1 and self.cols % (32 * s) == 0
+             and k // s >= 4
              and s * -(-x.cols // 32) <= len(self.rt.cores)], default=1)
     if s > 1:
       b = x.srcs[0].split(s).T if x.op == "T" else x.split(s, 1)
@@ -622,14 +689,20 @@ class Tensor:
     self._same_runtime(k, v, places)
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("attention fidelity must be between one and four phases")
-    if window < 0 or parts is not None and parts <= 0: raise ValueError("attention needs a nonnegative window and positive parts")
+    if window < 0 or parts is not None and parts <= 0:
+      raise ValueError("attention needs a nonnegative window and positive parts")
     ht, kt, rep, ra = -(-self.cols // 32), -(-k.rows // 32), k.rep, -(-self.rows // 32)
-    if not (self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep and self.batch == k.batch == v.batch):
-      raise ValueError(f"attend needs bf16 queries, keys and values in one format, repeated alike, equal batches: {self.dtype} {k.dtype} {v.dtype}")
+    if not (self.dtype == "bf16" and k.dtype == v.dtype and k.dtype in ("bf16", *BFP) and v.rep == rep
+            and self.batch == k.batch == v.batch):
+      raise ValueError(f"attend needs bf16 queries, keys and values in one format, repeated alike, "
+                       f"equal batches: {self.dtype} {k.dtype} {v.dtype}")
     if not (self.cols == k.cols == v.cols and self.cols % 32 == 0 and self.cols >= 64 and k.rows == v.rows):
-      raise ValueError(f"attend needs heads of one width, 64 or more in steps of 32, and a value for each key: {self.shape} {k.shape} {v.shape}")
-    if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1 and places.dtype == "int32"):
-      raise ValueError(f"attend needs places as an int32 column with a row for each query: {places.shape} {places.dtype} for {self.shape}")
+      raise ValueError(f"attend needs heads of one width, 64 or more in steps of 32, "
+                       f"and a value for each key: {self.shape} {k.shape} {v.shape}")
+    if not (places.rows == self.rows and places.batch in (1, self.batch) and places.cols == 1
+            and places.dtype == "int32"):
+      raise ValueError(f"attend needs places as an int32 column with a row for "
+                       f"each query: {places.shape} {places.dtype} for {self.shape}")
     wt = k.dtype if k.dtype in BFP else None
     R, units, P, kept = attention_plan(ht, ra, self.batch, wt, kt, len(self.rt.cores), parts)
     q, places = (_plain(t.realize()) for t in (self, places))
@@ -637,13 +710,17 @@ class Tensor:
     out = Tensor(self.rt, self.rows, self.cols + (33 if P > 1 else 1), batch=self.batch * P, dtype="fp32")
     # the exact row count is an argument, so the key rounds it up to tiles
     key = ("attend", ht, ra, R, rep, wt, fidelity, window, P, kept > 0)
-    out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(), *places._where(), kt,
+    out.run(key, lambda: attention_kernel(*key[1:]), *out._where(), *q._where(), *k._where(), *v._where(),
+            *places._where(), kt,
             self.rows, units=units * P, name="attention")
-    part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)  # cols of part p, from tile at
-    if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")  # each sum fills its tile's 32 columns, a valid 1-column view
+    # cols of part p, from tile at
+    part = lambda p, at, cols: out._view(out.rows, cols, self.batch, p * out.bstride + at, out.bstride * P)
+    # each sum fills its tile's 32 columns, a valid 1-column view
+    if P == 1: return (part(0, 0, self.cols) / part(0, ht, 1)).cast("bf16")
     largest = [part(p, ht + 1, 1) for p in range(P)]
     top = functools.reduce(Tensor.maximum, largest)
-    weighted = lambda at, cols: functools.reduce(Tensor.__add__, [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
+    weighted = lambda at, cols: functools.reduce(Tensor.__add__,
+                                                 [(m - top).exp() * part(p, at, cols) for p, m in enumerate(largest)])
     return (weighted(0, self.cols) / weighted(ht, 1)).cast("bf16")
 
   # Convolution and pooling of an image (channels, height, width), built from the ops above so autograd works on them
@@ -653,16 +730,19 @@ class Tensor:
     that wrap past the right edge are dropped."""
     k = math.isqrt(w.cols)
     if not (k * k == w.cols and w.rows == self.batch):
-      raise ValueError(f"conv2d needs w as (out channels, in channels, k * k), an in channel for each of x's: {self.shape} by {w.shape}")
+      raise ValueError(f"conv2d needs w as (out channels, in channels, k * k), "
+                       f"an in channel for each of x's: {self.shape} by {w.shape}")
     x = self.pad(((padding, padding), (padding, padding))) if padding else self
     (c, h, wd), ho, wo = x.shape, x.rows - k + 1, x.cols - k + 1
-    rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))  # k - 1 zeros at the end, for the wrapped columns of the last tap
+    # k - 1 zeros at the end, for the wrapped columns of the last tap
+    rows = x.reshape(1, c, h * wd).pad(((0, 0), (0, k - 1)))
     taps = [rows[:, :, ky * wd + kx:ky * wd + kx + ho * wd] for ky in range(k) for kx in range(k)]
     out = w.permute(0, 2, 1).reshape(1, w.batch, k * k * c) @ taps[0].cat(*taps[1:], axis=1)
     return out.reshape(w.batch, ho, wd)[:, :, :wo]
   def max_pool2d(self, k=2):  # max of each k x k block: over each k rows, then each k columns
     c, h, w = self.shape
-    if not (h % k == 0 and w % k == 0): raise ValueError(f"max_pool2d needs a height and width that {k} divides: {self.shape}")
+    if not (h % k == 0 and w % k == 0):
+      raise ValueError(f"max_pool2d needs a height and width that {k} divides: {self.shape}")
     return self.reshape(c * h // k, k, w).max(1).reshape(1, c * h * w // (k * k), k).max(2).reshape(c, h // k, w // k)
 
   # Autograd, like tinygrad's: a rule per op (_backward), made of the same lazy ops, so the backward fuses into kernels
@@ -726,7 +806,8 @@ def _backward(t, g):
   x, y = (srcs + (None,))[:2]
   if op in ("add", "sub", "mul", "max", "keep", "drop", "join", "cmplt", "cmple", "cmpne"):
     if op in ("cmplt", "cmple", "cmpne"): return (None, None)
-    if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape))  # halves of where: the condition has no gradient
+    # halves of where: the condition has no gradient
+    if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape))
     if op in ("add", "join"): gx, gy = g, g  # join combines where's disjoint masks
     elif op == "sub": gx, gy = g, -g
     elif op == "mul": gx, gy = g * y, g * x
@@ -737,7 +818,8 @@ def _backward(t, g):
     m = x.eq(t)
     return (g * m / m.sum(FOLDS[op]),)
   unary = {"exp": lambda: g * t, "exp2": lambda: g * t * math.log(2), "log": lambda: g * x.reciprocal(),
-           "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(), "cos": lambda: -(g * x.sin()),
+           "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(),
+           "cos": lambda: -(g * x.sin()),
            "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
            "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g}
   if op in unary: return (unary[op](),)
@@ -768,7 +850,8 @@ def _backward(t, g):
     g = g[tuple(slice(None, None, r.step) for r in args[0])] if any(r.step < 0 for r in args[0]) else g
     lo = [min(r) for r in args[0]]
     return (g.pad([(a, n - a - len(r)) for a, n, r in zip(lo, x.shape, args[0])]),)
-  if op == "gather":  # sum each row's gradient into its source row: one-hot(ids)^T @ g, whose row i is 1 where ids are i
+  # sum each row's gradient into its source row: one-hot(ids)^T @ g, whose row i is 1 where ids are i
+  if op == "gather":
     return ((Tensor.of(t.rt, [[i] for i in range(x.rows)], "int32") == args[0]).bfloat16().matmul(g, x.dtype),)
   raise NotImplementedError(f"no backward for {op}")
 
@@ -783,7 +866,8 @@ def _fit(t):
     u = todo[0]
     dtype = u.srcs[1].dtype
     if (len(u.srcs) == 3 and indexed) or (dtype in BFP and block is not None and dtype != block):
-      u.realize()  # one index stream and one block-float unpack format per fused kernel. t no longer reaches u's matmuls
+      # one index stream and one block-float unpack format per fused kernel. t no longer reaches u's matmuls
+      u.realize()
     else:
       kept.add(id(u))
       indexed |= len(u.srcs) == 3
@@ -805,13 +889,16 @@ def _terms(t):  # the terms of t, if it's an unrealized sum of realized tensors 
   if t.op != "add" or any(s.shape != t.shape or s.dtype != t.dtype for s in t.srcs): return None
   terms = [[s] if s.op is None else _terms(s) for s in t.srcs]
   return None if None in terms else [u for ts in terms for u in ts]
-def _parts(t):  # an fp32 matmul operand as bf16 (hi, lo), lo None for bf16. a transpose splits its source, then transposes the parts
+# an fp32 matmul operand as bf16 (hi, lo), lo None for bf16. a transpose splits its source, then transposes the parts
+def _parts(t):
   if t.op == "T": return _pT(_parts(t.srcs[0]))
   if t.dtype == "bf16": return t, None
-  return t.bfloat16(), (t - t._unary("ftob")).bfloat16()  # lo is t minus t rounded as the bf16 cast rounds, in one kernel
+  # lo is t minus t rounded as the bf16 cast rounds, in one kernel
+  return t.bfloat16(), (t - t._unary("ftob")).bfloat16()
 def _pT(parts): return tuple(p if p is None else p.T for p in parts)
 def _plain(t): return _copy(t) if t.rep > 1 else t  # copy a repeat, for a kernel that finds tiles by their position
-def _copy(t): return Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t)  # t in a new tensor of its own
+# t in a new tensor of its own
+def _copy(t): return Tensor(t.rt, t.rows, t.cols, batch=t.batch, dtype=t.dtype).assign(t)
 def _root(t): return t if t.owner is None else t.owner  # the tensor that owns t's storage
 def _rows_free(e):
   """Whether the kernel needs only the output row count, supplied as an argument. Row reductions, transposed B
@@ -821,7 +908,8 @@ def _rows_free(e):
   return all(_rows_free(x) for x in e[1:] if isinstance(x, tuple))
 def _bf16x3(a, b):  # hi@hi + (hi@lo + lo@hi) in fp32, from the parts of two operands
   (ah, al), (bh, bl) = a, b
-  out, lo = ah.matmul(bh, "fp32", 4), [p.matmul(q, "fp32", 4) for p, q in ((ah, bl), (al, bh)) if p is not None and q is not None]
+  out, lo = (ah.matmul(bh, "fp32", 4),
+             [p.matmul(q, "fp32", 4) for p, q in ((ah, bl), (al, bh)) if p is not None and q is not None])
   return out + sum(lo[1:], lo[0]) if lo else out
 
 def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (first, end)
@@ -831,7 +919,8 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
   return (first, end) if first < end else (0, 0)
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are realized first, not fused into the same kernel
-def _below(t, root):  # what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root
+# what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root
+def _below(t, root):
   return t.srcs if t.op not in WHOLE or root and t.op == "cast" else ()
 def _lazy(t, seen):  # the unrealized ops under t, t first
   stack = [(t, True)]
@@ -851,7 +940,8 @@ def _tree(t, inputs):
   dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
   if dtype in BFP: raise ValueError("a block float can only be a matmul's B")
   axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
-  n = ext(t.shape, axis)  # the sweep is as long as t along the axis. if t is a tile long there, its first reduction sets it
+  # the sweep is as long as t along the axis. if t is a tile long there, its first reduction sets it
+  n = ext(t.shape, axis)
   return _expr(t, t.shape, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
 
 # A block-float tile's values as bf16, the way the unpacker converts them (ISA FormatConversion.md): normalized, with 7
@@ -894,9 +984,11 @@ def _expr(t, shape, inputs, kernel):
     if FOLDS[t.op] != axis: return _expr(t.realize(), shape, inputs, kernel)
     n = ext(t.srcs[0].shape, axis)
     if n > 1 and kernel[1] is None: kernel[1] = n
-    if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)): return _expr(t.realize(), shape, inputs, kernel)
+    if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)):
+      return _expr(t.realize(), shape, inputs, kernel)
     kernel[2].add(id(t))
-  if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)  # kernels of their own, but a matmul can read B transposed (below)
+  # kernels of their own, but a matmul can read B transposed (below)
+  if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)
   if t.op == "matmul":  # a matmul reads its operands as matrices, not tile by tile, so realize them first
     a, b, *picked = t.srcs  # picked: the indices that pick B's matrices, if any
     if b.op == "T":  # read transposed. a block float, like a bfp8 key cache, is read as is and transposed on the way in
@@ -905,7 +997,9 @@ def _expr(t, shape, inputs, kernel):
       b = ("T" + src.dtype, _input(src, inputs)) if src.dtype in BFP else ("T", _expr(src, shape, inputs, kernel))
     elif b.runs: b = ("C" + (b.dtype if b.dtype in BFP else ""), _input(b, inputs))  # laid out by columns()
     else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
-    if picked: b = ("I" + b[0], b[1], _input(picked[0].realize(), inputs)) if isinstance(b, tuple) else ("I", b, _input(picked[0].realize(), inputs))
+    if picked:
+      b = (("I" + b[0], b[1], _input(picked[0].realize(), inputs)) if isinstance(b, tuple) else
+           ("I", b, _input(picked[0].realize(), inputs)))
     return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
 
@@ -919,7 +1013,8 @@ class Recording:
   """Record launches and keep their DRAM allocations for replay. Rebuild commands when a kernel has been
   evicted from L1. If the kernels don't fit together, replay reloads them in batches. A replay can give each Bound
   argument another value, so the same launches read and write other tensors."""
-  def __init__(self, rt): self.rt, self.launches, self.block, self.pins, self.made, self.active = rt, None, None, set(), set(), False
+  def __init__(self, rt):
+    self.rt, self.launches, self.block, self.pins, self.made, self.active = rt, None, None, set(), set(), False
   def close(self):
     """Release this recording's allocations after queued replays finish. Live tensors keep their storage."""
     if self.active: raise RuntimeError("cannot close an active recording")
@@ -946,9 +1041,12 @@ class Recording:
     binding = binding or {}
     if self.block is None or self.block[2] != self.rt.evictions:
       evictions, take = self.rt.evictions, lambda v: Bound(binding.get(v.key, v), v.key) if isinstance(v, Bound) else v
-      cmds, sent = self.rt.block([(kernel, tuple(map(take, args)), units, name) for kernel, args, units, name in self.launches])
-      # If block had to evict, it already sent part of the commands, and the new eviction count makes the next replay rebuild
-      self.block = (cmds, sent, evictions, self.rt.bound(cmds, self.launches) if len(sent) == len(self.launches) else None)
+      cmds, sent = self.rt.block([(kernel, tuple(map(take, args)), units, name)
+                                  for kernel, args, units, name in self.launches])
+      # If block had to evict, it already sent part of the commands, and the new eviction count makes the next replay
+      # rebuild
+      self.block = (cmds, sent, evictions,
+                    self.rt.bound(cmds, self.launches) if len(sent) == len(self.launches) else None)
       return self.rt.send(cmds, sent)
     cmds, sent, _, bound = self.block
     if bound:  # the block holds the values it was built with
@@ -961,9 +1059,11 @@ def _writes(t):  # while jit records, note that t's allocation is written in pla
 
 def _bindable(t):  # whether a replay can read t where it is, laid out as a new tensor of its shape or by columns
   tr, tc = -(-t.rows // 32), -(-t.cols // 32)
-  return t.runs is not None or (t.offset, t.rep, t.stride, t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
+  return t.runs is not None or (t.offset, t.rep, t.stride,
+                                t.bstride if t.batch > 1 else 0) == (0, 1, tc, tr * tc if t.batch > 1 else 0)
 
-def _on_input(t, inputs):  # t, or if it's a view of a recorded input, the same view of this call's input, with a plain address
+# t, or if it's a view of a recorded input, the same view of this call's input, with a plain address
+def _on_input(t, inputs):
   if not isinstance(t.addr, Bound): return t
   v = inputs[t.addr.key]._view(t.rows, t.cols, t.batch, t.offset, t.bstride, t.runs)
   v.addr, v.rep = int(v.addr), t.rep
@@ -984,7 +1084,8 @@ def jit(f):
   @functools.wraps(f)
   def run(*xs):
     nonlocal signature, runs, wrote, taken, out, rec, grads
-    if not xs or not all(isinstance(x, Tensor) for x in xs): raise ValueError("jit inputs must be tensors, with at least one input")
+    if not xs or not all(isinstance(x, Tensor) for x in xs):
+      raise ValueError("jit inputs must be tensors, with at least one input")
     rt = xs[0].rt
     if any(x.rt is not rt for x in xs): raise ValueError("jit inputs must use the same runtime")
     if signature is None:
@@ -994,29 +1095,35 @@ def jit(f):
     if len(xs) != len(signature): raise ValueError(f"jit expected {len(signature)} inputs, got {len(xs)}")
     for x, (runtime, shape, dtype) in zip(xs, signature):
       if x.rt is not runtime: raise ValueError("jit inputs must use the recorded runtime")
-      if (x.shape, x.dtype) != (shape, dtype): raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
+      if (x.shape, x.dtype) != (shape, dtype):
+        raise ValueError(f"a jit input is {x.shape} {x.dtype}, where the first call had {shape} {dtype}")
     xs = [x.realize() if x.op is not None else x for x in xs]
     if rec is None:
-      # Record on each input where it is, under an address bound to its position. Copy those a replay couldn't read in place.
+      # Record on each input where it is, under an address bound to its position. Copy those a replay couldn't read in
+      # place.
       ins = [x._view(x.rows, x.cols, x.batch, 0, x.bstride, x.runs) if _bindable(x) else _copy(x) for x in xs]
       for i, (x, t) in enumerate(zip(xs, ins)): t.addr, t.requires_grad = Bound(t.addr, i), x.requires_grad
       rt.written = set()
       try:
         with Recording(rt) as recording: result = f(*ins).realize()
       finally: written, rt.written = rt.written, None
-      runs, rec, out, wrote = [x.runs for x in xs], recording, result, {i for i, t in enumerate(ins) if t.addr in written}
-      taken = rec.made | {a for a in written if not isinstance(a, Bound)}  # storage the recording makes, and captured storage f writes
+      runs, rec, out, wrote = ([x.runs for x in xs], recording, result,
+                               {i for i, t in enumerate(ins) if t.addr in written})
+      # storage the recording makes, and captured storage f writes
+      taken = rec.made | {a for a in written if not isinstance(a, Bound)}
       for i in wrote:
         if ins[i].owner is None: xs[i].assign(ins[i])  # a copy that f wrote
       grads = [t.grad for t in ins]  # backward gave the gradients to the stand-ins
       for x, g in zip(xs, grads):
         if g is not None: x.grad = _on_input(g, ins)
       return _on_input(out, ins)
-    if any(x.runs != r for x, r in zip(xs, runs)): raise ValueError("a jit input by columns must keep the layout it was recorded with")
+    if any(x.runs != r for x, r in zip(xs, runs)):
+      raise ValueError("a jit input by columns must keep the layout it was recorded with")
     # Copy an input that the recording's own results overwrite, one that f only reads where this replay writes, and one
     # a replay can't read in place
     writes = taken | {xs[i].addr for i in wrote}
-    bound = [x if _bindable(x) and x.addr not in rec.made and (i in wrote or x.addr not in writes) else _copy(x) for i, x in enumerate(xs)]
+    bound = [x if _bindable(x) and x.addr not in rec.made and (i in wrote or x.addr not in writes) else _copy(x)
+             for i, x in enumerate(xs)]
     rec.send({i: t.addr for i, t in enumerate(bound)})
     for i in wrote:
       if bound[i] is not xs[i]: xs[i].assign(bound[i])
