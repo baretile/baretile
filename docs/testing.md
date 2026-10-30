@@ -193,12 +193,46 @@ Diffing two dumps shows what a change did to the generated code.
 The [launch viewer](runtime.md#profiling) shows the same programs for the
 kernel you select.
 
+## Printing from a kernel
+
+A kernel's programs can call `print` with a format and up to six words, as they
+would call `printf`:
+
+```c
+print("tile %u of %u: %#x\n", t, a[1], value);
+```
+
+`Runtime.wait()` shows each line once the launch is done, after the worker,
+the core and the launch that printed it:
+
+```
+(1, 2) BRISC, launch 3 (add-relu): tile 0 of 4: 0x3f80
+```
+
+The core leaves a record in a ring in its L1, and the host does the formatting.
+That keeps a call to a few dozen instructions, which store the format's address and
+the words. So the format must be a string literal, which the host reads from the
+kernel's image. Each argument is a 32-bit word: `%d` reads it as a signed int,
+`%u` and `%x` as an unsigned one, and `%f` as the bits of an fp32, so pass a
+float `x` as `*(unsigned *)&x`. There's no `%s`, and a line whose format doesn't
+match its words is shown raw.
+
+Lines come grouped by worker, then by core. Each core's lines are in the order
+it printed them, but its four cores run at once, so lines from different cores
+aren't in time order. Each core's ring keeps its last 127 lines. When a launch
+prints more, or several do before a `wait()`, a line says how many came before
+the lines shown. A kernel that doesn't call `print` compiles to
+the same bytes, and the runtime reads the rings only after a kernel that calls it.
+[test_print](../test/test_device.py) shows each case.
+
 ## When a launch hangs
 
 `Runtime.wait()` times out after 60 seconds without a completed launch by
 default. Its report identifies the current launch and unfinished workers. For
 up to four workers, it prints core status, synchronization counters, flags and
-outstanding NoC requests. On a card it also reads the program counters.
+outstanding NoC requests. On a card it also reads the program counters. If the
+kernel [prints](#printing-from-a-kernel), the report ends with the last three
+lines that each of the worker's cores printed, which can show where it stopped.
 
 The 60 seconds are wall time, on ttsim too, where a launch takes as long as the
 simulator needs to run it. A large launch, such as a big model's output layer,

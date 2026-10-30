@@ -1,7 +1,7 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import atexit, bisect, collections, functools, gc, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys
-import tempfile, time, weakref
+import atexit, bisect, collections, functools, gc, hashlib, operator, os, pathlib, re, shutil, struct, subprocess
+import sys, tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -16,18 +16,21 @@ from baretile import bh, pci
 # - ARGS: two buffers of kernel arguments. Launches alternate between them, so the next launch's arguments go in
 #   while this one runs.
 # - KERNELS: the kernels it holds
+# - PRINT: a ring for each of its cores, of what that core's kernel programs printed (print_record)
 # - ZEROS: a tile of zeros (4 KiB, an fp32 tile) that kernels read but don't write
 # - DATA: free space
 # The dispatcher has its config at DISPATCH: [doorbell, ring lo, hi, ring size, status lo, hi, workers' rectangle, how
 # many]. OUTBOX holds [go, kernel, arguments, workers] [rptr, launches done], and at +32 a launch's [go, last report,
 # flits read]. DONE holds the count of the workers' reports and the sum of what they read, and STAGING holds up to
 # STAGE bytes of commands. Those two sit above the kernels, since loading a kernel writes the dispatcher's tile too.
-MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = (0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000,
-                                                            0x80000)
+MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, PRINT, ZEROS, DATA = (0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000,
+                                                                   0x7B000, 0x7F000, 0x80000)
 MCAST_STATE = 0x1030  # two words shared by workers and dispatcher, between their config/mailbox and SYNC
 ARGS_SIZE = (KERNELS - ARGS) // 2  # the size of each argument buffer
 SYNC_COUNTS = 8  # the first 8 words of SYNC are zeroed before each launch. kernels write the rest before reading them
 SYNC_NAMES = ("fetched", "unpacked", "ready", "packed", "sent", "issued")  # the first SYNC counters in compiled kernels
+PRINT_RING = (ZEROS - PRINT) // 4  # each core's ring of 32-byte print records. The first record's place holds the count
+PRINT_RECORDS = PRINT_RING // 32 - 1
 DISPATCH, OUTBOX, DONE, STAGING = 0x1000, 0x1400, DATA, DATA + 64
 STAGE = 1 << 16  # the biggest read that the dispatcher makes from the ring into STAGING, in bytes
 
@@ -115,6 +118,24 @@ static inline void tensix_idle(void) {{
   asm volatile("sw zero, 0(%0)\\n lw t0, 0(%0)\\n andi t0, t0, 0" :: "r"({bh.TENSIX_DONE:#x}) : "t0", "memory");
 }}
 #define CLOCK (*(volatile unsigned *){bh.WALL_CLOCK:#x})  // the tile's wall clock, which counts cycles
+// print(fmt, ...) leaves a record for the host, which formats it as printf would once the launch is waited for, or in a
+// hang's report. fmt is a string literal and each argument a word, at most six. %f reads a word's bits as a float.
+#define print(fmt, ...) do {{ \
+  const unsigned print_words[] = {{0, ##__VA_ARGS__}}; \
+  _Static_assert(sizeof print_words <= 28, "print takes at most six words"); \
+  print_record(fmt, print_words + 1, sizeof print_words / 4 - 1); \
+}} while (0)
+// A core's ring keeps its last {PRINT_RECORDS} records, [fmt | words << 24, launch, the words], after the count.
+// Firmware puts the core's number, 0 for BRISC and 1 + i for TRISC i, in the first word of its private RAM. The mask
+// keeps a stack that grew over it from printing outside the rings.
+static inline void print_record(const char *fmt, const unsigned *words, unsigned n) {{
+  unsigned core = *(volatile unsigned *){bh.LOCAL_RAM:#x} & 3;
+  volatile unsigned *ring = (volatile unsigned *)({PRINT:#x} + core * {PRINT_RING});
+  volatile unsigned *at = ring + 8 + ring[0] % {PRINT_RECORDS} * 8;
+  at[0] = (unsigned)fmt | n << 24; at[1] = ((volatile unsigned *){MAILBOX:#x})[0];
+  for (unsigned i = 0; i < n; i++) at[2 + i] = words[i];
+  ring[0]++;
+}}
 """
 
 CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax",
@@ -236,6 +257,21 @@ def dump(folder, kernel, name):
     if src: (at / f"{core}.c").write_text('#include "../device.h"\n' + src)
   _dumped.add((folder, kernel))
 
+# print's formats: printf's conversions, whose length modifiers Python's % doesn't take. PRINTS finds a program that
+# prints, so a runtime reads the rings only after launches that may have printed.
+FORMAT = re.compile(r"%([-+ #0]*\d*(?:\.\d+)?)(?:hh|h|ll|l|z|j|t)?([diouxXcfFeEgG%])")
+PRINTS = re.compile(r"\bprint\s*\(")
+
+def printed(fmt, words):
+  """What printf would make of fmt and the words that a kernel printed, or both shown raw if they don't match."""
+  kinds = [kind for _, kind in FORMAT.findall(fmt) if kind != "%"]
+  values = tuple(struct.unpack("<f", struct.pack("<I", w))[0] if k in "fFeEgG" else w - (w >> 31 << 32) if k in "di"
+                 else w & 255 if k == "c" else w for k, w in zip(kinds, words))
+  try:
+    if len(kinds) == len(words): return FORMAT.sub(r"%\1\2", fmt) % values
+  except (TypeError, ValueError): pass  # a conversion that print doesn't have, such as %s
+  return f"{fmt!r} with {list(words)}"
+
 # the first words of firmware. BRISC starts at 0, and TRISC i at its reset PC, 4 + 4i
 def jumps(brisc, trisc0, trisc1, trisc2):
   return (f'__attribute__((naked, section(".start"))) void _start(void) '
@@ -263,6 +299,7 @@ static void run(unsigned core) {{  // runs the kernel's program for this core, i
   if (entry) ((void (*)(volatile unsigned *))(kernel + entry))((volatile unsigned *)MAILBOX[2]);
 }}
 void brisc_loop(void) {{
+  *(volatile unsigned *){bh.LOCAL_RAM:#x} = 0;  // this core's number, for print
   noc_setup();
   for (unsigned seen = 0, phase = 0;;) {{
     // the L0 data cache misses NoC writes, and fence drops it
@@ -301,6 +338,7 @@ void brisc_loop(void) {{
   }}
 }}
 void trisc_loop(unsigned i) {{
+  *(volatile unsigned *){bh.LOCAL_RAM:#x} = 1 + i;
   for (unsigned seen = 0;;) {{
     while (TRISCS[0] == seen) asm volatile("fence" ::: "memory");
     seen = TRISCS[0];
@@ -574,10 +612,13 @@ class Runtime:
     self.recorded, self.recorded_bases = None, []  # the active recording's pins, and the allocations from before it
     self.recorded_made = None  # what the active recording allocates, including storage freed and reused since it began
     self.written = None  # while tensor.jit records a call: the allocations it writes in place
+    # The loaded kernels with a program that prints, and the count of records read from each (worker, core)'s ring.
+    # Since the last read: the last launch of a kernel that prints, and the most workers that such a launch took.
+    self.printers, self.printed, self.print_last, self.print_workers = set(), {}, 0, 0
     try:
       (dx, dy), n = self.dispatcher, len(self.cores)
       chip.write(*end, 0, worker, start)
-      chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
+      chip.write(*end, PRINT, bytes(DATA - PRINT), start)
       # zero the mailbox, the TRISCs' go and done, SYNC and FLAGS, except whom to report to and the worker's index
       for i, (x, y) in enumerate(self.cores):
         chip.write(x, y, MAILBOX,
@@ -621,14 +662,15 @@ class Runtime:
     evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
     self.check()
     if kernel not in self.loaded:
-      if len(kernel) > ZEROS - KERNELS:
-        raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}")
+      if len(kernel) > PRINT - KERNELS:
+        raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {PRINT - KERNELS}")
       if self.evicts(kernel): self.evict()
       self.chip.write(*self.end, self.room, kernel, self.start)
       self.loaded[kernel], self.room = self.room, self.room + len(kernel)  # compile_kernel makes it a multiple of 16
+      if any(PRINTS.search(src) for src in PROGRAMS.get(kernel, ()) if src): self.printers.add(kernel)
     return self.loaded[kernel]
   # whether loading kernel would evict the others
-  def evicts(self, kernel): return kernel not in self.loaded and self.room + len(kernel) > ZEROS
+  def evicts(self, kernel): return kernel not in self.loaded and self.room + len(kernel) > PRINT
 
   def evict(self):  # forget the loaded kernels, once the launches that use them are done
     self.wait()
@@ -723,6 +765,8 @@ class Runtime:
       self.launches += 1
       self.sent[self.launches % TIMES] = launch
       self.queued.append((self.launches, launch[1]))
+      if launch[2] in self.printers:
+        self.print_last, self.print_workers = self.launches, max(self.print_workers, launch[1])
     self.chip.pci.write(self.doorbell, (self.wptr % 2**32).to_bytes(4, "little"))
 
   def profile(self, since):
@@ -830,6 +874,30 @@ class Runtime:
       reports = "".join(f"\n  {self.report(c, current)}" for c in stuck[:4])
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{reports}") from None
     self.reclaim()
+    for core in self.cores[:self.print_workers]:
+      for line in self.prints(core): print(line)
+    if launch >= self.print_last: self.print_workers = 0
+
+  def prints(self, core, last=PRINT_RECORDS):
+    """The lines that core's programs printed since the last read: each program's newest, at most last of them,
+    oldest first. A ring holds a program's last PRINT_RECORDS. A line says how many came before those shown."""
+    lines = []
+    for i, program in enumerate(("BRISC", "TRISC0", "TRISC1", "TRISC2")):
+      ring = PRINT + i * PRINT_RING
+      count = self.chip.read32(*core, ring)
+      new, self.printed[core, i] = (count - self.printed.get((core, i), 0)) % 2**32, count
+      if new > (shown := min(new, last)): lines.append(f"{core} {program}: {new - shown} earlier lines not shown")
+      for k in range(count - shown, count):
+        head, launch, *words = struct.unpack("<8I", self.chip.read(*core, ring + 32 + k % PRINT_RECORDS * 32, 32))
+        at, words = head & 0xFFFFFF, words[:head >> 24]
+        # the format is in the kernel that printed it, which is still loaded
+        image, base = next(((im, b) for im, b in self.loaded.items() if b <= at < b + len(im)), (None, None))
+        end = image.find(b"\0", at - base) if image else -1
+        text = (printed(image[at - base:end].decode(errors="replace"), words).rstrip("\n") if end >= 0
+                else f"a format at {at:#x}, outside the loaded kernels, with {words}")
+        name = self.sent[launch % TIMES][0] if (self.launches - launch) % 2**32 < TIMES else ""
+        lines.append(f"{core} {program}, launch {launch}{f' ({name})' if name else ''}: {text}")
+    return lines
 
   def report(self, core, launch):
     """Describe an unfinished worker: active cores, SYNC and FLAGS, and outstanding NoC requests by transaction
@@ -847,6 +915,7 @@ class Runtime:
              f"NoC requests in flight by id: "
              f"{({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "
              f"write acknowledgements {niu(bh.NIU_REGS['WR_ACKS'])}, read responses {niu(bh.NIU_REGS['READS'])}"]
+    if self.sent[launch % TIMES][2] in self.printers: lines += [f"printed {line}" for line in self.prints(core, 3)]
     if not isinstance(self.chip.pci, pci.Sim):  # ttsim doesn't model the pc snapshots, and reading one stops it
       lines.append("pc " + ", ".join(f"{name} {self.chip.read32(x, y, bh.PC_SNAPSHOT + 4 * i):#x}"
                                      for i, name in enumerate(("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2"))))
