@@ -78,7 +78,8 @@ We divide a worker's L1 like this. The constants are in `runtime.py`.
 | `0x01040` | `SYNC`, 64 bytes shared by a kernel's cores |
 | `0x01080` | `FLAGS`, 32 words used between workers |
 | `0x01100` | Two buffers for kernel arguments |
-| `0x02000` | Loaded kernel images, ending before `0x7F000` |
+| `0x02000` | Loaded kernel images, ending before `0x7B000` |
+| `0x7B000` | A 4 KiB ring for each core, of what its programs [print](testing.md#printing-from-a-kernel) |
 | `0x7F000` | A 4 KiB tile of zeros |
 | `0x80000` | Kernel data |
 

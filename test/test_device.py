@@ -933,6 +933,32 @@ def test_dump(chip, tmp_path, monkeypatch):
     program = runtime.compile_rv32((device + rest).removeprefix(runtime.DEVICE))
     assert kernel[entry:entry + len(program)] == program, core
 
+def test_print(chip, capsys):
+  # What each core prints comes back after wait, formatted as printf would and named by worker, core and launch. A ring
+  # keeps a core's last PRINT_RECORDS lines and says how many it lost. A format that print doesn't have is shown raw.
+  rt, n = Runtime(chip, end=chip.tensix[1]), runtime.PRINT_RECORDS
+  brisc = 'void kmain(volatile unsigned *a) { print("unit %u of %lu: %d, %#x, %c, %.2f, 100%%\\n", a[0], a[1], -5, 255, 65, 0x3FC00000); }'
+  kernel = compile_kernel(brisc,
+                          'void kmain(volatile unsigned *a) { print("unpack"); }', None,
+                          f'void kmain(volatile unsigned *a) {{ for (unsigned i = 0; i < {n + 3}; i++) print("pack %u", i); print("%s", 7); }}')
+  rt.launch(kernel, name="print test")
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))
+  rt.launch(kernel, units=3)
+  rt.wait()
+  core = chip.tensix[0]
+  assert capsys.readouterr().out.splitlines() == [
+    f"{core} BRISC, launch 1 (print test): unit 0 of 1: -5, 0xff, A, 1.50, 100%", f"{core} BRISC, launch 3: unit 0 of 3: -5, 0xff, A, 1.50, 100%",
+    f"{core} TRISC0, launch 1 (print test): unpack", f"{core} TRISC0, launch 3: unpack",
+    f"{core} TRISC2: {n + 8} earlier lines not shown",  # each launch printed n + 4 lines there, and its ring keeps n
+    *[f"{core} TRISC2, launch 3: pack {i}" for i in range(4, n + 3)], f"{core} TRISC2, launch 3: '%s' with [7]"]
+  rt.launch(compile_kernel("void kmain(volatile unsigned *a) {}"))  # nothing new to show, and no ring to read after this
+  rt.wait()
+  assert capsys.readouterr().out == "" and not rt.print_workers
+  rt = Runtime(chip, end=chip.tensix[2])  # each worker's lines, in the workers' order
+  rt.launch(compile_kernel('void kmain(volatile unsigned *a) { print("unit %u", a[0]); }'))
+  rt.wait()
+  assert capsys.readouterr().out.splitlines() == [f"{core} BRISC, launch 1: unit {i}" for i, core in enumerate(rt.cores)] and len(rt.cores) == 2
+
 def test_hung_kernel_times_out(chip):
   # A timeout reports unfinished workers, active cores, synchronization counters and outstanding NoC requests.
   # Check a stuck BRISC, a stuck TRISC1 that leaves BRISC waiting for completion, and a report the dispatcher missed.
@@ -946,5 +972,10 @@ def test_hung_kernel_times_out(chip):
   rt = Runtime(chip, end=chip.tensix[1])
   rt.launch(compile_kernel(f"void kmain(volatile unsigned *a) {{ ((volatile unsigned *){MAILBOX:#x})[5] = noc_me(); }}"))  # reports to itself
   with pytest.raises(TimeoutError, match=r"launch 1, whose workers all finished, so it missed a report$"): rt.wait(timeout=0.2)
+  rt = Runtime(chip, end=chip.tensix[1])
+  # a hang's report ends with each core's last three lines
+  rt.launch(compile_kernel('void kmain(volatile unsigned *a) { for (unsigned i = 0; i < 5; i++) print("waiting on %u", i); for (;;); }'))
+  with pytest.raises(TimeoutError, match=r"not finished by BRISC\n.*\n.*\n    printed \(1, 2\) BRISC: 2 earlier lines not shown\n"
+                     r"    printed \(1, 2\) BRISC, launch 1: waiting on 2\n.*\n.*waiting on 4$"): rt.wait(timeout=0.2)
   rt.close()  # a hung ordinary kernel holds cancellation up for at most the launch's two seconds
   assert rt.resources.closed

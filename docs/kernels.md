@@ -47,7 +47,8 @@ the loop wait on those counters:
 A missing wait shows up as a wrong tile or a hang, but not always on ttsim,
 which finishes most units at once. [ttsim-chaos](testing.md#ttsim-chaos) delays
 the NoC and the math units, and that finds most of these. Run the ramp under it
-after changing a program. CI runs it there with every kind of delay.
+after changing a program. CI runs it there with every kind of delay. To see
+where a program has got to, [`print`](testing.md#printing-from-a-kernel) from it.
 
 ## The operation
 
