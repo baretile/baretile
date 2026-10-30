@@ -82,7 +82,7 @@ tile running a kernel; a tensor tile is the data it processes.
 | 3, kernels and tensors | [kernels.py](../baretile/kernels.py) | Fused elementwise, matmul and reduction kernels, attention, data movement and `topk` |
 | | [tensor.py](../baretile/tensor.py) | `Tensor`: lazy expressions, broadcasting, views, storage formats, autograd and `jit` |
 | Commands | [hello.py](../baretile/hello.py), [bench.py](../baretile/bench.py), [probe.py](../baretile/probe.py), [viz.py](../baretile/viz.py) | The fib demo, a matmul benchmark, card measurements and the launch viewer |
-| 4, on top | [baretile/models/](../baretile/models) | GPT-2, the Llama loader and its families, the server and the cost model |
+| 4, on top | [baretile/models/](../baretile/models) | GPT-2 and its training, the Llama loader and its families, the server and the cost model |
 | | [baretile/adapters/](../baretile/adapters) | The BARETILE device for tinygrad |
 
 A kernel that only one workload uses stays in layer 4 next to that workload.

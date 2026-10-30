@@ -134,10 +134,12 @@ tinygrad scripts run on baretile through
 [baretile/adapters/tinygrad_device.py](https://github.com/baretile/baretile/blob/main/baretile/adapters/tinygrad_device.py),
 and PyTorch runs through tinygrad's torch frontend.
 
-To train, `python3 test/train.py 300` in a checkout trains a small GPT-2 on
-baretile's docs and checks every step against PyTorch.
+To train, `python3 -m baretile.models.train` trains GPT-2 from scratch, by
+default GPT-2 124M on tokens such as FineWeb's, and `python3 test/train.py 300`
+in a checkout trains a small GPT-2 on baretile's docs and checks every step
+against PyTorch.
 [Training](https://github.com/baretile/baretile/blob/main/docs/models.md#training)
-shows its loss curve and how to train your own model.
+shows how to get the tokens, its settings and the small model's loss curve.
 
 ## Learn baretile
 

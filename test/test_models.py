@@ -8,6 +8,7 @@ from baretile.runtime import Runtime
 from conftest import bf16, value
 import benchmark, train
 from baretile.models import cost, gpt2, llama, qwen, serve
+from baretile.models import train as gpt2_train  # test/train.py is train
 
 def test_train(chip):
   # Train a two-block GPT on a fixed counting sequence so documentation edits don't change the test data.
@@ -18,13 +19,57 @@ def test_train(chip):
   assert all(abs(f - p) < 1e-3 and g < 2e-3 for f, p, g, _ in losses), losses
   assert losses[-1][0] < losses[0][0] - 0.25 and abs(losses[0][0] - losses[0][3]) < 1e-3, losses
 
+def shard(path, tokens):  # write tokens as an llm.c .bin shard: 256 int32s of header (magic, version, count), then uint16s
+  path.write_bytes(np.array([20240520, 1, len(tokens)] + [0] * 253, np.int32).tobytes() + np.asarray(tokens, np.uint16).tobytes())
+  return path
+
+def test_train_gpt2(chip, tmp_path):
+  # A small GPT-2 trains as baretile.models.train does, on a counting sequence in an llm.c shard, 2 sequences a step.
+  # Each step's loss and gradients match PyTorch's on the same weights and sequences. Each update is AdamW's, computed in
+  # float64 from the gradients the chip added up: the warmup and cosine, the clipping, and weight decay on the matrices
+  # only. The loss falls.
+  torch, F = pytest.importorskip("torch"), pytest.importorskip("torch.nn.functional")
+  c = SimpleNamespace(**gpt2_train.GPT2 | dict(layers=2, dim=64, heads=2, ctx=32, vocab=96, accum=2, steps=5, lr=1e-2, warmup=2, clip=0.5))
+  path = shard(tmp_path / "train.bin", np.arange(2000) % 90)
+  (tmp_path / "bad.bin").write_bytes(bytes(1024))
+  with pytest.raises(ValueError, match="llm.c token shard"): gpt2_train.shard(tmp_path / "bad.bin")
+  t, pmask = gpt2_train.Trainer(Runtime(chip), c), torch.tensor(gpt2.mask(range(c.ctx), c.ctx))
+  runs, same = gpt2_train.sequences(gpt2_train.shard(path), c.ctx), gpt2_train.sequences(gpt2_train.shard(path), c.ctx)
+  losses = []
+  for step in range(1, c.steps + 1):
+    w, state = {k: gpt2.values(v).astype(np.float64) for k, v in t.w.items()}, {k: [gpt2.values(s) for s in ms] for k, ms in t.state.items()}
+    pw = {k: torch.tensor(a, dtype=torch.float32, requires_grad=True) for k, a in w.items()}
+    seqs = [next(same) for _ in range(c.accum)]
+    want = sum(F.cross_entropy(gpt2_train.forward(s[:-1].tolist(), pw, pmask, c), torch.tensor(s[1:].astype(np.int64))) for s in seqs) / c.accum
+    want.backward()
+    loss = t.gradients(runs)
+    g = {k: gpt2.values(v).astype(np.float64) for k, v in t.grads.items()}
+    assert abs(loss - want.item()) < 1e-3, (step, loss, want.item())
+    for k, a in g.items(): assert np.abs(a - pw[k].grad.numpy()).max() < 2e-3 * np.abs(pw[k].grad.numpy()).max(), (step, k)
+    total, lr = t.update()
+    norm = math.sqrt(sum((a * a).sum() for a in g.values()))
+    assert abs(total - norm) < 1e-4 * norm and lr == gpt2_train.rate(step, c), (step, total, norm)
+    scale = min(1, c.clip / (norm + 1e-6))
+    for k, a in w.items():  # AdamW, as PyTorch has it
+      m, v = c.b1 * state[k][0] + (1 - c.b1) * scale * g[k], c.b2 * state[k][1] + (1 - c.b2) * (scale * g[k]) ** 2
+      kept = a * (1 - lr * c.decay) if gpt2_train.decays(k) else a
+      new = kept - lr / (1 - c.b1 ** step) * m / (np.sqrt(v) / math.sqrt(1 - c.b2 ** step) + c.eps)
+      assert np.abs(gpt2.values(t.w[k]) - new).max() < 1e-3 * np.abs(new - a).max() + 1e-7, (step, k)
+    losses.append(loss)
+  assert {k for k in w if gpt2_train.decays(k)} == {"wte.weight", "wpe.weight"} | {f"h.{l}.{n}.weight" for l in range(2)
+                                                                                   for n in ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj")}
+  assert losses[-1] < losses[0] - 0.5, losses
+
 def test_adam_original_gradients(chip):
+  # Updating a in place doesn't change b's gradient, which backward() computed from a's value before the update
   rt = Runtime(chip)
-  a, b = (Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for v in (1, 2))
-  state = {id(p): [Tensor.full(rt, 1, 1, 0, "fp32") for _ in range(2)] for p in (a, b)}
-  (a * b).backward()
-  train.adam((a, b), state, Tensor.full(rt, 1, 1, 10, "fp32"), Tensor.full(rt, 1, 1, 1 / np.sqrt(0.001), "fp32"))
-  assert np.allclose([state[id(p)][0].tolist()[0][0] for p in (a, b)], [0.2, 0.1])
+  w = {k: Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for k, v in (("a", 1), ("b", 2))}
+  state = {k: [Tensor.full(rt, 1, 1, 0, "fp32") for _ in range(2)] for k in w}
+  (w["a"] * w["b"]).backward()
+  c = SimpleNamespace(b1=train.B1, b2=train.B2, eps=train.EPS, decay=0)
+  gpt2_train.adamw(w, {k: p.grad for k, p in w.items()}, state, c, None, Tensor.full(rt, 1, 1, 10, "fp32"),
+                   Tensor.full(rt, 1, 1, 1 / np.sqrt(0.001), "fp32"))
+  assert np.allclose([state[k][0].tolist()[0][0] for k in w], [0.2, 0.1])
 
 def need_tinygrad(name="tinygrad"):
   """Import name from tinygrad. With TINYGRAD=/path/to/a/checkout, it comes from the checkout and must import, so CI

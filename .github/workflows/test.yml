@@ -41,7 +41,7 @@ jobs:
       - run: python -m pip install "$(ls dist/*.whl)[models]"
       - name: Check the installed models and server
         run: |
-          python -I -c "from baretile.models import cost, gpt2, llama, qwen, serve"
+          python -I -c "from baretile.models import cost, gpt2, llama, qwen, serve, train"
           python -I -m baretile.models.serve 2>&1 | grep -q "usage"
   test:
     runs-on: ubuntu-24.04
@@ -113,7 +113,7 @@ jobs:
           restore-keys: kernels-
       - run: python -m baretile.chip ttsim
       - run: >-
-          python -m pytest -s -rs test/test_models.py::test_train test/test_models.py::test_llama_frequencies
+          python -m pytest -s -rs test/test_models.py::test_train test/test_models.py::test_train_gpt2 test/test_models.py::test_llama_frequencies
           test/test_models.py::test_tokenizer test/test_models.py::test_hf_families test/test_models.py::test_qwen3_moe
           test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4 test/test_models.py::test_torch_frontend
         env:
