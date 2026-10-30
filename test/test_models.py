@@ -534,14 +534,15 @@ def qwen35(rng, vocab=256, places=64):
 
 def test_llama_frequencies():
   # Llama 3.1's RoPE scaling slows long wavelengths by 8, keeps short ones, and blends those between. Our frequencies
-  # must match Hugging Face's float32 ones within one float32 step: PyTorch's float32 powers round differently on CPUs
-  # with different vector instructions, so CI's runners don't all agree with it bit for bit.
+  # must match Hugging Face's float32 ones within a relative 1e-6. PyTorch's float32 powers differ from NumPy's by up to
+  # two float32 steps on some of CI's runners, and between the scaled and unscaled wavelengths, the blend moves by up
+  # to four steps for each step its input moves. A mistake in the scaling would be off by far more.
   m, transformers = pytest.importorskip("transformers.modeling_rope_utils"), pytest.importorskip("transformers")
   rope = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
   hf = transformers.LlamaConfig(hidden_size=4096, num_attention_heads=32, rope_theta=500000.0, rope_scaling=rope, max_position_embeddings=131072)
   want = m.ROPE_INIT_FUNCTIONS["llama3"](hf, "cpu")[0].numpy()
   got = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0, rope=rope))
-  assert got.dtype == np.float32 and np.abs(got.view(np.int32) - want.view(np.int32)).max() <= 1, np.abs(got - want).max()
+  assert got.dtype == np.float32 and np.allclose(got, want, rtol=1e-6, atol=0), np.abs(got / want - 1).max()
   plain = llama.frequencies(llama.model(dim=4096, heads=32, theta=500000.0))
   assert plain[0] == got[0] and plain[-1] == 8 * got[-1], "short wavelengths kept, long ones slowed by the factor"
 
