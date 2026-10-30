@@ -61,12 +61,15 @@ def test_train_gpt2(chip, tmp_path):
   assert losses[-1] < losses[0] - 0.5, losses
 
 def test_adam_original_gradients(chip):
+  # Updating a in place doesn't change b's gradient, which backward() computed from a's value before the update
   rt = Runtime(chip)
-  a, b = (Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for v in (1, 2))
-  state = {id(p): [Tensor.full(rt, 1, 1, 0, "fp32") for _ in range(2)] for p in (a, b)}
-  (a * b).backward()
-  train.adam((a, b), state, Tensor.full(rt, 1, 1, 10, "fp32"), Tensor.full(rt, 1, 1, 1 / np.sqrt(0.001), "fp32"))
-  assert np.allclose([state[id(p)][0].tolist()[0][0] for p in (a, b)], [0.2, 0.1])
+  w = {k: Tensor.full(rt, 1, 1, v, "fp32").requires_grad_() for k, v in (("a", 1), ("b", 2))}
+  state = {k: [Tensor.full(rt, 1, 1, 0, "fp32") for _ in range(2)] for k in w}
+  (w["a"] * w["b"]).backward()
+  c = SimpleNamespace(b1=train.B1, b2=train.B2, eps=train.EPS, decay=0)
+  gpt2_train.adamw(w, {k: p.grad for k, p in w.items()}, state, c, None, Tensor.full(rt, 1, 1, 10, "fp32"),
+                   Tensor.full(rt, 1, 1, 1 / np.sqrt(0.001), "fp32"))
+  assert np.allclose([state[k][0].tolist()[0][0] for k in w], [0.2, 0.1])
 
 def need_tinygrad(name="tinygrad"):
   """Import name from tinygrad. With TINYGRAD=/path/to/a/checkout, it comes from the checkout and must import, so CI
