@@ -30,7 +30,8 @@ a P150a.
 | `tensor.Recording`, `runtime.Bound` | Recordings by hand | experimental |
 | `baretile.tensix`, `baretile.kernels` | Tensix code generation and the kernels | experimental |
 | `python3 -m baretile.models.serve` and its HTTP API | The OpenAI-compatible server | stable |
-| `baretile.models` from Python: `llama`, `qwen`, `gpt2`, `serve`, `cost` | Loading and running models | experimental |
+| `python3 -m baretile.models.train` | Training GPT-2 from scratch | experimental |
+| `baretile.models` from Python: `llama`, `qwen`, `gpt2`, `serve`, `train`, `cost` | Loading, running and training models | experimental |
 | `baretile.adapters.tinygrad_device` | The tinygrad device | experimental, since it calls tinygrad's internals |
 
 ## What you can rely on

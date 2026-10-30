@@ -281,8 +281,49 @@ PyTorch, a C++ compiler and ninja. `test_torch_frontend` exercises that path.
 
 ## Training
 
+`python3 -m baretile.models.train` trains GPT-2 from scratch on GPT-2 tokens.
+Its defaults are GPT-2 124M's shape and nanoGPT's recipe:
+
+- 12 blocks 768 wide, with 12 heads, on sequences of 1,024 tokens, and the
+  vocabulary padded to 50,304.
+- Weights, gradients and AdamW's state in fp32. AdamW uses betas 0.9 and 0.95,
+  and decays the matrices and embeddings by 0.1, but not the biases or the
+  layer norms. Gradients are clipped to a norm of 1.
+- 524,288 tokens a step, as the gradients of 512 sequences added up. The
+  learning rate warms up to 6e-4 over 700 steps, then follows a cosine down to
+  a tenth of that at the last of 19,073 steps, which read 10B tokens once.
+
+Each sequence's forward and backward pass, and each update, runs as a recorded
+replay (`jit`), so the host only sends the sequence's tokens. The chip compares
+the targets with each column of the logits to pick them out, so no one-hot
+matrix crosses PCIe.
+
+The tokens come from llm.c's `.bin` shards: a 1 KiB header whose first three
+int32s are 20240520, 1 and the token count, then the tokens as uint16s. FineWeb's
+10B-token sample comes in that form, in shards of 100M tokens:
+
+```sh
+hf download kjj0/fineweb10B-gpt2 --repo-type dataset --local-dir fineweb fineweb_train_000001.bin fineweb_val_000000.bin
+python3 -m baretile.models.train fineweb/fineweb_train_000001.bin fineweb/fineweb_val_000000.bin log=train.json
+```
+
+Settings go after the files as `key=value`. Run the command with no arguments to
+list them. Every 250 steps it reports the validation loss over the same 20
+sequences of the second file, and `log` writes each step's numbers as a line of
+JSON. On ttsim, try a small model, such as `layers=2 dim=64 heads=2 ctx=32
+accum=2 steps=10`.
+
+`test_train_gpt2` trains a small GPT-2 this way on a counting sequence. At each
+step, the loss and gradients must match PyTorch's on the same weights and
+sequences, and the update must be AdamW's, computed in float64 from the
+gradients the chip added up. Nothing has trained on a card yet. llm.c and the
+modded-nanogpt speedrun train GPT-2 124M on FineWeb to a validation loss of
+3.28, and [#45](https://github.com/baretile/baretile/issues/45) tracks doing
+that on a P150a. fp32 matmuls take three bf16 products each, so training speed
+is work for the card.
+
 [test/train.py](../test/train.py) trains a small character-level GPT-2 on the
-README and these docs, with baretile tensors in fp32 and Adam. It has 2 blocks
+README and these docs, with the same model code and Adam, which is AdamW without decay. It has 2 blocks
 64 wide, and reads 64 characters at a time. Every step runs as one recording
 (`jit`), so the host only uploads each step's inputs. At each step PyTorch
 computes the loss and gradients on baretile's current weights, and a separate
