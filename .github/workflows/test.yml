@@ -2,7 +2,7 @@
 # test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. The suite on ttsim
 # includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or
 # tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a newer push to it cancels
-# the run still going.
+# the run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
 name: test
 on:
   push:
@@ -163,3 +163,24 @@ jobs:
       - run: env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} python -m pytest -s ${{ matrix.tests }}
         env:
           TTSIM: ${{ runner.temp }}/ttsim-chaos/src/_out/release_bh/libttsim.so
+  # The bring-up stages on a P150a, from preflight through the model tests, on the self-hosted runner in the card's
+  # machine. They run once a maintainer sets the repository variable CARD to true, and never for a pull request from a
+  # fork: a self-hosted runner runs whatever the pull request's code does, with the machine's access. With the variable
+  # SMOLLM naming a SmolLM-135M folder on that machine, its checkpoint stage runs too. The record is kept either way.
+  card:
+    if: vars.CARD == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, p150a]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pytest
+      - name: Bring up the card and run the suite on it
+        run: python test/bringup.py record --only preflight,chip,transfers,launches,math,kernels,models,smollm ${{ vars.SMOLLM && format('--smollm {0}', vars.SMOLLM) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bring-up-record
+          path: record/
