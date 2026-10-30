@@ -101,7 +101,9 @@ BRISC and the TRISCs are its RISC-V cores. A tensor tile holds 32 by 32 values.
 
 Use one short commit subject under 70 characters and no body, for example
 "matmul: read B by columns" or "adapter: fix JIT input ownership". Put any
-longer explanation in the pull request.
+longer explanation in the pull request. A pull request is squashed into one
+commit whose subject is the pull request's title, so give the title that form
+too.
 
 ## Reporting a bug
 
