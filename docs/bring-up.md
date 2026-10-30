@@ -121,6 +121,29 @@ fourth workload sends concurrent HTTP requests to baretile. The TT-NN runs need
 tt-metal's Python environment. You'll also need PyTorch to load the reference
 file, and `cloc` to count lines of code. The script lists its commands at the top.
 
+## Running CI on the card
+
+Once bring-up passes, CI can run it on the card for every change, so the card
+path doesn't break between manual checks. The `card` job in
+[the workflow](../.github/workflows/test.yml) runs `test/bringup.py` from
+preflight through the model tests, keeps the record as an artifact, and fails
+at the first failing stage. It also runs the SmolLM stage when the repository
+variable `SMOLLM` names a SmolLM-135M folder on the card's machine. It leaves
+out the probe, which measures, and the Llama stage, which takes hours.
+
+To set it up on the card's machine:
+
+1. Install tt-kmd, so the runner needs no root, and clang and lld.
+2. Add a self-hosted runner for the repository, with the label `p150a`, running
+   as an ordinary user. The repository's runner settings give the commands.
+3. In the repository's variables, set `CARD` to `true`, and `SMOLLM` if you like.
+
+The job never runs for a pull request from a fork. A self-hosted runner runs
+whatever a pull request's code does, with the machine's access, so keep the
+machine for the card, and its runner for this repository. It becomes a required
+check once it has passed reliably for a week
+([#43](https://github.com/baretile/baretile/issues/43)).
+
 ## What still needs checking
 
 On a card, we need to check that DMA reaches host memory, ARC turns the clocks

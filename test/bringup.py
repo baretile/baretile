@@ -4,9 +4,10 @@
 # explains the stages.
 #   python3 test/bringup.py record-folder [--smollm path/to/SmolLM-135M] [--llama path/to/Llama-3.1-8B-Instruct
 #     --reference path/to/Llama-3.1-8B-Instruct.refpt] [--from stage] [--only stage,stage]
-# On a card, run it as root from the checkout, with TTSIM unset. On ttsim every stage runs too, but the later ones take
-# hours there. The SmolLM and Llama stages run when their files are given; the Llama one is the first workload's
-# token-accuracy gate (docs/workload.md).
+# On a card, run it from the checkout with TTSIM unset, and as root when tt-kmd doesn't drive the card. On ttsim every
+# stage runs too, but the later ones take hours there. CI's card job runs it on a P150a (docs/bring-up.md). The SmolLM
+# and Llama stages run when their files are given; the Llama one is the first workload's token-accuracy gate
+# (docs/workload.md).
 import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baretile import pci
