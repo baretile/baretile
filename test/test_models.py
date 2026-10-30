@@ -1,5 +1,5 @@
 # Model, server, training, adapter and benchmark tests (layer 4). See conftest.py for simulator setup.
-import importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
+import html, importlib, json, math, os, pathlib, re, struct, subprocess, sys, threading, time, unicodedata, pytest
 import numpy as np
 from types import SimpleNamespace
 from baretile import pci, tensor
@@ -1191,6 +1191,17 @@ def test_readme_examples():
   said, out = re.search(r"`baretile.hello` prints:\n\n```text\n(.*)\n```", readme)[1], run("-m", "baretile.hello")
   workers = lambda text: re.sub(r"^\d+ Tensix workers", "N Tensix workers", text.strip())
   assert out.returncode == 0 and workers(out.stdout) == workers(said), out.stdout + out.stderr
+
+def test_website_matches_readme():
+  # Each line in the homepage's code blocks is a line in one of the README's, so the two can't drift apart. Comments
+  # at the end of a homepage line are its own.
+  root = pathlib.Path(__file__).parent.parent
+  readme = {line for block in re.findall(r"```\w*\n(.*?)```", (root / "README.md").read_text(), re.S) for line in block.splitlines()}
+  page = (root / "website/public/index.html").read_text()
+  lines = [html.unescape(re.sub(r"<[^>]+>", "", line)) for block in re.findall(r"<pre[^>]*><code>(.*?)</code></pre>", page, re.S)
+           for line in block.splitlines()]
+  missing = [line for line in (re.sub(r"\s+# .*$", "", line) for line in lines) if line.strip() and line not in readme]
+  assert lines and not missing, missing
 
 def test_doc_links():
   # Each link in the Markdown files to a file of the repository, by a relative path or on GitHub's main branch, finds
