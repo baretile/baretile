@@ -462,7 +462,7 @@ class Runtime:
     start, end = start or chip.tensix[0], end or chip.tensix[-1]
     if ring < 64 or ring & (ring - 1): raise ValueError("ring size must be a power of two, at least 64 bytes")
     back = 64 + ring + 16 * TIMES
-    if back + 4096 > 1 << 21: raise ValueError("the ring leaves no room in the hugepage to read a tile back")
+    if back + 4096 > 1 << 21: raise ValueError("the ring leaves no room in the host page to read a tile back")
     if start not in chip.tensix or end not in chip.tensix: raise ValueError("runtime endpoints must be available Tensix tiles")
     if chip.banks != list(range(len(bh.DRAM))): raise RuntimeError(f"the runtime needs all eight DRAM banks, and the card has {chip.banks}")
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
@@ -507,7 +507,7 @@ class Runtime:
     chip.halt(*end, start)
     try: buf, bus = chip.pci.alloc(1 << 21)  # status, command ring, times, then transfer staging
     except MemoryError:
-      _reap(chip, collect=True)  # a dropped runtime may hold the hugepage
+      _reap(chip, collect=True)  # a dropped runtime may hold the host page
       buf, bus = chip.pci.alloc(1 << 21)
     self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
     self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))

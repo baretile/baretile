@@ -19,7 +19,7 @@ The displaced runtime, its tensors and its recordings reject further work.
 Disjoint rectangles can run together and allocate from the same DRAM pool.
 Both endpoints must be available Tensix tiles. The runtime requires all eight
 DRAM banks. A custom command ring must be a power of two from 64 bytes through
-1 MiB, leaving room for status, timing records and tensor data in its hugepage.
+1 MiB, leaving room for status, timing records and tensor data in its 2 MiB host page.
 
 Call `rt.close()` when finished, or use `with Runtime(chip) as rt:`. Closing stops
 all workers and cancels queued work; call `rt.wait()` first if it must finish.
@@ -36,7 +36,7 @@ Collecting a runtime without closing it doesn't touch the card, since a
 collection can interrupt another runtime's access to the shared TLB window. Its
 cores keep running and its memory stays reserved until a safe point closes it:
 the next runtime on the chip, once Python has collected the dropped one, or an
-allocation of DRAM or a hugepage that finds no room, which collects first. A
+allocation of DRAM or of a host page that finds no room, which collects first. A
 dropped runtime is usually in a reference cycle through its cached number
 tensors, so call `close()` to release it promptly. If a multicast never finishes
 or the NoC never drains, closing resets the cores anyway and keeps the runtime's
@@ -114,7 +114,7 @@ writes timing data before completion status, using ordered acknowledged writes.
 `Runtime.wait()` polls that status in host memory. `Runtime.wait(launch=n)` waits
 only until launch `n` is done.
 
-The rest of the hugepage, `Runtime.back`, holds tensor data that crosses PCIe.
+The rest of the host page, `Runtime.back`, holds tensor data that crosses PCIe.
 `tobytes` launches workers that write a tensor's tiles there. `frombytes` writes
 small tensors into DRAM through the BAR, and from `tensor.DMA_UPLOAD` bytes on
 it stages each bank's share there for `upload_kernel`, whose workers read it
