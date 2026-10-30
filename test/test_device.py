@@ -53,7 +53,8 @@ def code_lines(text, width=WIDTH):
 
 def test_size():
   # The core, from the PCIe driver to Tensor, stays under its budget, and the README says what that is. Long lines and
-  # comments can't move the count: lines count by width, and comments and docstrings don't count.
+  # comments can't move the count: lines count by width, and comments and docstrings don't count. Every line of the
+  # core fits in WIDTH columns, the C in its strings too. ruff allows 150 elsewhere, for the tests and the models.
   root = pathlib.Path(__file__).parent.parent
   sample = ["x = 1  # a comment", "", "def f():", "  'what f does'", "  s = '#define ONE 1'  # C in a string is code",
             "  return " + " + ".join("1" * 60)]
@@ -61,6 +62,9 @@ def test_size():
   lines = sum(code_lines((root / "baretile" / f"{m}.py").read_text()) for m in CORE)
   assert lines <= BUDGET, f"the core is {lines:,} lines at {WIDTH} columns, over its budget of {BUDGET:,}. Remove or reuse something first"
   assert re.search(rf"under {BUDGET:,} lines of code at {WIDTH} columns", (root / "README.md").read_text()), "the README states the budget"
+  wide = [f"{m}.py:{i}" for m in CORE for i, line in enumerate((root / "baretile" / f"{m}.py").read_text().splitlines(), 1)
+          if len(line) > WIDTH]
+  assert not wide, f"lines over {WIDTH} columns in the core: {wide}"
 
 def test_open_device(chip):
   # A device has one opener at a time, since two Chips on one chip would hand out the same TLBs and DRAM.

@@ -70,7 +70,8 @@ model.
 
 Layers 0 to 3 stay under 4,500 lines of code at 120 columns, not counting
 comments and docstrings, and `test_size` checks it. A line counts once for each
-120 characters it takes, so a longer line doesn't make the count smaller.
+120 characters it takes, so a longer line doesn't make the count smaller, and
+no line in them, the C in their strings included, is longer than 120.
 
 ## Style
 
