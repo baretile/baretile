@@ -99,7 +99,8 @@ The version is in [pyproject.toml](pyproject.toml). The package on PyPI holds
 `baretile/`, with its models and adapters. To publish a new version:
 
 1. Raise the version, and describe the release's changes in
-   [CHANGELOG.md](CHANGELOG.md).
+   [CHANGELOG.md](CHANGELOG.md). A change to a name that
+   [the public API](docs/api.md) calls stable says how to update.
 2. Build it with `uv build`.
 3. Install the wheel with `[models]` in a clean environment, outside the
    checkout so imports can't fall back to it, and run the README's commands.
