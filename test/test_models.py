@@ -1201,6 +1201,10 @@ def test_website_commands_match_readme():
     "python3 -m baretile.chip check",
     "python3 -m baretile.chip",
     "python3 -m baretile.hello",
+    "python3 ramps/1_tensors.py",
+    "python3 ramps/2_runtime.py",
+    "python3 ramps/3_tensix.py",
+    "python3 ramps/4_kernel.py",
     "python3 -m pip install 'baretile[models]'",
   ]
   missing = [command for command in commands if command not in homepage or command not in readme]
