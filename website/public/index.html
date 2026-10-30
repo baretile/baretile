@@ -75,7 +75,7 @@ python3 -m baretile.hello</code></pre>
 
 <p>For a different simulator build, such as <a href="https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos">ttsim-chaos</a>, set <code>TTSIM=/absolute/path/to/libttsim.so</code>. That library is tried before a physical card and before the downloaded release. Without <code>TTSIM</code>, baretile opens a real card if one is present; card access needs root and takes the card away from its kernel driver.</p>
 
-<p>For model inference or the HTTP server, install <code>baretile[models]</code> to add NumPy. The models include GPT-2 and Llama, and the server accepts OpenAI-compatible requests.</p>
+<p>For model inference or the HTTP server, install NumPy with <code>python3 -m pip install 'baretile[models]'</code>. The models include GPT-2 and Llama, and the server accepts OpenAI-compatible requests.</p>
 
 <h2>Learning it</h2>
 
