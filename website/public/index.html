@@ -32,7 +32,7 @@ We haven't tested baretile on a card yet. Simulator timings don't predict card p
 
 <h2>Using it</h2>
 
-<p>After <a href="#getting-started">setting up ttsim</a>, run this in Python from the checkout:</p>
+<p>After <a href="#getting-started">setting up ttsim</a>, install baretile and run it from Python:</p>
 
 <pre tabindex="0" aria-label="Python example"><code><span class="k">from</span> baretile <span class="k">import</span> pci
 <span class="k">from</span> baretile.chip <span class="k">import</span> Chip
@@ -54,22 +54,28 @@ We check the models against NumPy and the training example against PyTorch.</p>
 
 <h2 id="getting-started">Getting started</h2>
 
-<p>You can run the examples on the simulator.
-You'll need Python 3.12 or later, clang with a RISC-V target, lld, and the Blackhole library from <a href="https://github.com/tenstorrent/ttsim">ttsim</a>.
-ttsim's <a href="https://github.com/tenstorrent/ttsim/releases">releases</a> include it as <code>libttsim_bh.so</code>, or you can <a href="https://github.com/baretile/baretile#try-it">build it</a>.</p>
+<p>Install baretile in a Python 3.12 or later virtual environment on Linux. On Debian and Ubuntu, install <code>python3-venv</code>, clang with a RISC-V target, lld, curl and git. Then install the package, download the simulator and check the setup:</p>
 
-<p>Then clone baretile and run this from the checkout:</p>
+<pre tabindex="0" aria-label="Setup commands"><code>python3 -m venv baretile-env
+. baretile-env/bin/activate
+python3 -m pip install baretile
+python3 -m baretile.chip ttsim
+python3 -m baretile.chip check</code></pre>
 
-<pre tabindex="0" aria-label="Shell commands"><code>git clone https://github.com/baretile/baretile
-<span class="k">cd</span> baretile
-<span class="k">export</span> TTSIM=/absolute/path/to/libttsim.so
+<p>In fish, activate with <code>. baretile-env/bin/activate.fish</code>. The simulator download uses the tested ttsim v1.11.5 release. If setup reports a missing dependency, <code>chip check</code> explains how to fix it.</p>
+
+<p>You can run the examples on the simulator using the setup steps above. baretile is installed as a package, so you do not need a checkout to run its commands.</p>
+
+<p>To run the Fibonacci example and inspect the chip:</p>
+
+<pre tabindex="0" aria-label="Shell commands"><code>python3 -m baretile.chip
 python3 -m baretile.hello</code></pre>
 
-<p>This runs a Fibonacci program on the simulated workers and reads back their answers.
-Keep <code>TTSIM</code> set for the tensor example too.
-Without <code>TTSIM</code>, baretile tries to open a real card.</p>
+<p>On ttsim, <code>baretile.hello</code> reports that 119 of 120 Tensix workers computed <code>fib(30) = 832040</code>, while one tile dispatched the work.</p>
 
-<p><code>pip install baretile</code> installs the package alone, which is enough for this command and the tensor example.</p>
+<p>For a different simulator build, such as <a href="https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos">ttsim-chaos</a>, set <code>TTSIM=/absolute/path/to/libttsim.so</code>. That library is tried before a physical card and before the downloaded release. Without <code>TTSIM</code>, baretile opens a real card if one is present; card access needs root and takes the card away from its kernel driver.</p>
+
+<p>For model inference or the HTTP server, install <code>baretile[models]</code> to add NumPy. The models include GPT-2 and Llama, and the server accepts OpenAI-compatible requests.</p>
 
 <h2>Learning it</h2>
 
