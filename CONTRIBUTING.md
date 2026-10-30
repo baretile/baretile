@@ -4,6 +4,12 @@ baretile is small on purpose. One person should be able to read all of it, from
 the PCIe driver to the model server. Before you add something, check whether
 you can remove or reuse something instead.
 
+## Finding work
+
+The [project board](https://github.com/orgs/baretile/projects/1) shows what's
+next, and its README explains the plan and how the issues are tracked. Issues
+labeled `good first issue` are small and a good way into the code.
+
 ## Setting up
 
 Follow [Try it](README.md#try-it) to set up clang, lld and ttsim, then install

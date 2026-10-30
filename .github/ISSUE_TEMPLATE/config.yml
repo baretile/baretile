@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/baretile/baretile/blob/main/docs/README.md
+    about: How baretile works, and how to run it on ttsim or a card.
+  - name: Roadmap and board
+    url: https://github.com/orgs/baretile/projects/1
+    about: What we're building first, and how we choose what comes next.

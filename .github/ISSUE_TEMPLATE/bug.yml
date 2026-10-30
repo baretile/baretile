@@ -1,0 +1,40 @@
+name: Bug report
+description: baretile computes something wrong, hangs, crashes or won't install
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting it. The details below are what we need to reproduce it, as CONTRIBUTING.md describes.
+  - type: dropdown
+    id: device
+    attributes:
+      label: Where it ran
+      options: [ttsim, A card]
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: baretile (version or commit), the ttsim release if you used it, Python and clang.
+      placeholder: baretile 0.0.3, ttsim v1.11.5, Python 3.12.3, clang 18.1.3
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: What you ran and what happened
+      description: The command or script, and its full output. If a launch hung, include the whole TimeoutError report.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: textarea
+    id: card
+    attributes:
+      label: On a card, the output of the chip commands
+      description: python3 -m baretile.chip check, then python3 -m baretile.chip
+      render: text
