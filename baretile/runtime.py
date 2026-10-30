@@ -1,6 +1,7 @@
 # Load and launch kernels on Tensix tiles. Resident firmware starts each kernel without a core reset.
 # A dispatcher reads commands from a ring in host memory and sends them to the workers.
-import atexit, bisect, collections, functools, gc, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys, tempfile, time, weakref
+import atexit, bisect, collections, functools, gc, hashlib, operator, os, pathlib, shutil, struct, subprocess, sys
+import tempfile, time, weakref
 from baretile import bh, pci
 
 # The L1 layout, which is ours to choose. Firmware sits at 0 and starts with a jump for each core: BRISC's at 0 and
@@ -21,7 +22,8 @@ from baretile import bh, pci
 # many]. OUTBOX holds [go, kernel, arguments, workers] [rptr, launches done], and at +32 a launch's [go, last report,
 # flits read]. DONE holds the count of the workers' reports and the sum of what they read, and STAGING holds up to
 # STAGE bytes of commands. Those two sit above the kernels, since loading a kernel writes the dispatcher's tile too.
-MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = 0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000, 0x80000
+MAILBOX, TRISCS, SYNC, FLAGS, ARGS, KERNELS, ZEROS, DATA = (0x1000, 0x1020, 0x1040, 0x1080, 0x1100, 0x2000, 0x7F000,
+                                                            0x80000)
 MCAST_STATE = 0x1030  # two words shared by workers and dispatcher, between their config/mailbox and SYNC
 ARGS_SIZE = (KERNELS - ARGS) // 2  # the size of each argument buffer
 SYNC_COUNTS = 8  # the first 8 words of SYNC are zeroed before each launch. kernels write the rest before reading them
@@ -54,7 +56,8 @@ static inline void l1_settle(unsigned addr) {{
 }}
 // Copy n bytes between (x, y, addr) and this tile's L1. The low 4 bits of the two addresses must match (6 for DRAM).
 static inline void noc_read(unsigned x, unsigned y, unsigned long long addr, unsigned l1, unsigned n) {{
-  for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
+  for (unsigned k; n; addr += k, l1 += k, n -= k)
+    noc_issue(addr, x | y << 6, l1, noc_me(), READ, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
 // noc_get reads into this L1 and noc_put writes from it, at most MAX_PACKET bytes, through request initiators 1 and 2.
 // The firmware sets those up once (noc_setup), so each call writes only four registers and the go, where noc_read
@@ -76,7 +79,8 @@ static inline void noc_put(unsigned l1, unsigned x, unsigned y, unsigned addr, u
 }}
 static inline void noc_write(unsigned l1, unsigned x, unsigned y, unsigned long long addr, unsigned n) {{
   l1_settle(l1);  // the NIU doesn't see this core's stores in flight, so they must land first
-  for (unsigned k; n; addr += k, l1 += k, n -= k) noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
+  for (unsigned k; n; addr += k, l1 += k, n -= k)
+    noc_issue(l1, noc_me(), addr, x | y << 6, WRITE, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
 // Publish the active region before checking cancellation. Once the host requests cancellation and sees no active
 // region, no later multicast can issue. Ordinary requests can still issue until reset; shutdown drains their counters.
@@ -100,7 +104,8 @@ static inline void mcast_done(unsigned acks) {{
   l1_settle({MCAST_STATE + 4:#x});
 }}
 static inline void noc_wait(void) {{  // wait until reads have landed and writes are acknowledged
-  (void)NIU(CMD); (void)NIU1(CMD); (void)NIU2(CMD);  // reading the initiators back keeps the counter read behind their last requests
+  // reading the initiators back keeps the counter read behind their last requests
+  (void)NIU(CMD); (void)NIU1(CMD); (void)NIU2(CMD);
   while (NIU(OUTSTANDING)) {{}}
   asm volatile("fence" ::: "memory");  // drop L0 data cache lines that the NoC may have overwritten
 }}
@@ -112,9 +117,11 @@ static inline void tensix_idle(void) {{
 #define CLOCK (*(volatile unsigned *){bh.WALL_CLOCK:#x})  // the tile's wall clock, which counts cycles
 """
 
-CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax", "-fno-jump-tables",
+CLANG = ["clang", "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32", "-mcmodel=medany", "-mno-relax",
+         "-fno-jump-tables",
          "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections", "-fuse-ld=lld",
-         "-Wl,--emit-relocs,-e,0"]  # keep relocations for _position_independent_image; the image starts at 0, with no _start
+         # keep relocations for _position_independent_image; the image starts at 0, with no _start
+         "-Wl,--emit-relocs,-e,0"]
 CACHE = pci.CACHE  # compiled images, by what made them. pruning leaves the downloads in its subdirectories alone
 
 @functools.cache
@@ -142,7 +149,8 @@ def _position_independent_image(elf):
     for at in range(off, off + size, entry):
       relocation = struct.unpack_from("<I", elf, at + 4)[0] & 255
       if relocation not in (0, 16, 17, 18, 19, 23, 24, 25):  # NONE, branches/calls and PC-relative HI20/LO12
-        raise ValueError(f"kernel relocation {relocation} is not position-independent; use offsets instead of static pointers")
+        raise ValueError(f"kernel relocation {relocation} is not position-independent; "
+                         f"use offsets instead of static pointers")
   return bytes(image)
 
 def compile_rv32(src):
@@ -152,8 +160,10 @@ def compile_rv32(src):
   initializers; use offsets into a const array instead. Cache images by compiler version, flags, linker script
   and source. Entries expire after a week without use."""
   link = ("SECTIONS { .text 0 : { *(.start) *(.text.kmain) *(.text*) *(.rodata*) *(.srodata*) *(.data*) *(.sdata*) "
-          ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")  # one section: .bss is zeros in the image
-  cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode() + (DEVICE + src).encode()).hexdigest()
+          # one section: .bss is zeros in the image
+          ". = ALIGN(4); __bss_start = .; *(.sbss*) *(.bss*) . = ALIGN(4); __bss_end = .; } }")
+  cached = CACHE / hashlib.sha256(_clang_version() + repr(CLANG).encode() + link.encode()
+                                  + (DEVICE + src).encode()).hexdigest()
   _prune()
   try:
     os.utime(cached)
@@ -228,7 +238,8 @@ def dump(folder, kernel, name):
 
 # the first words of firmware. BRISC starts at 0, and TRISC i at its reset PC, 4 + 4i
 def jumps(brisc, trisc0, trisc1, trisc2):
-  return f'__attribute__((naked, section(".start"))) void _start(void) {{ asm("j {brisc}\\n j {trisc0}\\n j {trisc1}\\n j {trisc2}"); }}'
+  return (f'__attribute__((naked, section(".start"))) void _start(void) '
+          f'{{ asm("j {brisc}\\n j {trisc0}\\n j {trisc1}\\n j {trisc2}"); }}')
 
 # BRISC receives go, the kernel and argument addresses, and the worker count n in its mailbox. Workers with index
 # n or higher skip the launch. BRISC divides the work into [first unit, unit count], clears SYNC, and invalidates
@@ -254,7 +265,8 @@ static void run(unsigned core) {{  // runs the kernel's program for this core, i
 void brisc_loop(void) {{
   noc_setup();
   for (unsigned seen = 0, phase = 0;;) {{
-    while (MAILBOX[0] == seen) asm volatile("fence" ::: "memory");  // the L0 data cache misses NoC writes, and fence drops it
+    // the L0 data cache misses NoC writes, and fence drops it
+    while (MAILBOX[0] == seen) asm volatile("fence" ::: "memory");
     seen = MAILBOX[0];
     asm volatile("fence" ::: "memory");  // the rest of the mailbox and the arguments came over the NoC before go
     unsigned me = MAILBOX[7], n = MAILBOX[3];
@@ -271,7 +283,9 @@ void brisc_loop(void) {{
     CFG[{bh.CFG_IC_INVALIDATE}] = 0xF;  // drop the cached instructions of BRISC and the TRISCs
     l1_settle({bh.TENSIX_CFG:#x});
     l1_settle({SYNC:#x});  // the SYNC counters are zero before any core of the kernel looks at them
-    TRISCS[0] = phase ^= 1;  // a phase, not the launch number: the TRISCs see only the launches this worker runs, and a number can recur after a wrap
+    // a phase, not the launch number: the TRISCs see only the launches this worker runs, and a number can recur after a
+    // wrap
+    TRISCS[0] = phase ^= 1;
     run(0);
     noc_wait();  // what the kernel sent has landed before we report done
     for (unsigned i = 1; i <= 3; i++) while (TRISCS[i] != phase) asm volatile("fence" ::: "memory");
@@ -290,7 +304,8 @@ void trisc_loop(unsigned i) {{
   for (unsigned seen = 0;;) {{
     while (TRISCS[0] == seen) asm volatile("fence" ::: "memory");
     seen = TRISCS[0];
-    asm volatile("fence" ::: "memory");  // the mailbox and the kernel came over the NoC, after anything we may have cached
+    // the mailbox and the kernel came over the NoC, after anything we may have cached
+    asm volatile("fence" ::: "memory");
     run(1 + i);
     tensix_idle();
     TRISCS[1 + i] = seen;
@@ -330,7 +345,8 @@ static void multicast(unsigned l1, unsigned addr, unsigned n) {{
 // initiator 1 holds it and a launch starts with one store.
 static void go(void) {{ mcast_begin(); unsigned acks = NIU(WR_ACKS) + CONFIG[7]; NIU1(CMD) = 1; mcast_done(acks); }}
 void loop(void) {{
-  unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32, status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
+  unsigned long long ring = CONFIG[1] | (unsigned long long)CONFIG[2] << 32,
+                     status = CONFIG[4] | (unsigned long long)CONFIG[5] << 32;
   unsigned size = CONFIG[3], rptr = 0, launches = 0, me = noc_me();
   unsigned ready = 0, ready_n = 0, ready_end = 0, prepared = 0;  // the next launch, and whether its arguments are ready
   // the launch the workers are on, the ring pointer past it, the report count once it's done, when its go went, and
@@ -339,7 +355,8 @@ void loop(void) {{
   unsigned long long times = ring + size;  // launch n's [go, last report, flits read] at times + n % TIMES * 16
   unsigned words = 0;  // the flits the workers read, up to the last launch done
   unsigned staged = 0, first = 0;  // the ring's bytes [first, staged) are in STAGING
-  NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me(); NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
+  NIU1(TARG_LO) = {OUTBOX:#x}; NIU1(TARG_MID) = 0; NIU1(TARG_HI) = noc_me();
+  NIU1(RET_LO) = {MAILBOX:#x}; NIU1(RET_MID) = 0;
   NIU1(RET_HI) = CONFIG[6]; NIU1(PACKET_TAG) = 0; NIU1(CTRL) = MCAST; NIU1(LEN) = 16;
   for (;;) {{
     asm volatile("fence" ::: "memory");  // the host rings the doorbell with its write pointer
@@ -368,7 +385,8 @@ void loop(void) {{
       while (*(volatile unsigned *){DONE:#x} != reports) asm volatile("fence" ::: "memory");
     asm volatile("fence" ::: "memory");
     unsigned complete = active && *(volatile unsigned *){DONE:#x} == reports, done = running, end = running_end;
-    unsigned took = began, finished = complete ? CLOCK : 0, read = complete ? *(volatile unsigned *){DONE + 4:#x} - words : 0;
+    unsigned took = began, finished = complete ? CLOCK : 0,
+             read = complete ? *(volatile unsigned *){DONE + 4:#x} - words : 0;
     words += read;
     if (complete) active = 0;
     if (prepared && !active) {{  // the workers have finished the last launch
@@ -413,7 +431,8 @@ def _reap(chip, collect=False):
 def _exit():  # stop every runtime still running when Python exits, since the card would outlive the host pages
   for resources in list(_open):
     try: resources.close()
-    except Exception as e: print(f"baretile: could not stop the runtime from {resources.start} to {resources.end}: {e}", file=sys.stderr)
+    except Exception as e: print(f"baretile: could not stop the runtime from {resources.start} to {resources.end}: {e}",
+                                 file=sys.stderr)
 
 class Bound(int):
   """A launch argument that a replay can replace, such as the address of a jit input. key names it in a binding.
@@ -446,21 +465,24 @@ class _Resources:
       try:
         self.chip.write32(*self.end, MCAST_STATE, 1)
         self.chip.wait(lambda: self.chip.read32(*self.end, MCAST_STATE + 4) == 0, "finish the dispatcher's multicast")
-        self.chip.wait(lambda: all(finished(mail(x, y)) for x, y in self.cores - {self.end}), "finish the running launch")
+        self.chip.wait(lambda: all(finished(mail(x, y)) for x, y in self.cores - {self.end}),
+                       "finish the running launch")
       except TimeoutError: pass  # a hung kernel stops where it is
       try:
         self.chip.write32(*self.end, MCAST_STATE, 1, self.start)
-        self.chip.wait(lambda: all(self.chip.read32(x, y, MCAST_STATE) == 1 and self.chip.read32(x, y, MCAST_STATE + 4) == 0
-                                  for x, y in self.cores),
+        self.chip.wait(lambda: all(self.chip.read32(x, y, MCAST_STATE) == 1
+                                   and self.chip.read32(x, y, MCAST_STATE + 4) == 0 for x, y in self.cores),
                        "finish the runtime's active multicasts")
-      except TimeoutError: settled = False  # the multicast's counters are wrong until it finishes, so draining can't tell
+      # the multicast's counters are wrong until it finishes, so draining can't tell
+      except TimeoutError: settled = False
     self.chip.halt(*self.end, self.start)
     try:
       # Read reset back before polling the NoC: requests issued before the cores stopped can still be in flight.
       for x, y in self.cores: self.chip.read32(x, y, bh.SOFT_RESET)
       # Every initiator must finish accepting its command before the transaction counters can be trusted.
       if settled:
-        self.chip.wait(lambda: all(not self.chip.read32(x, y, bh.NIU + i * bh.NIU_REGS["INITIATOR"] + bh.NIU_REGS["CMD"]) & 1
+        self.chip.wait(lambda: all(not self.chip.read32(x, y,
+                                                        bh.NIU + i * bh.NIU_REGS["INITIATOR"] + bh.NIU_REGS["CMD"]) & 1
                                   for x, y in self.cores for i in range(4)), "stop issuing the runtime's NoC requests")
         self.chip.wait(lambda: all(self.chip.read32(x, y, bh.NIU + bh.NIU_REGS[kind] + 4 * i) == 0
                                   for x, y in self.cores for kind in ("OUTSTANDING", "OUTGOING") for i in range(16)),
@@ -489,8 +511,10 @@ class Runtime:
     if ring < 64 or ring & (ring - 1): raise ValueError("ring size must be a power of two, at least 64 bytes")
     back = 64 + ring + 16 * TIMES
     if back + 4096 > 1 << 21: raise ValueError("the ring leaves no room in the host page to read a tile back")
-    if start not in chip.tensix or end not in chip.tensix: raise ValueError("runtime endpoints must be available Tensix tiles")
-    if chip.banks != list(range(len(bh.DRAM))): raise RuntimeError(f"the runtime needs all eight DRAM banks, and the card has {chip.banks}")
+    if start not in chip.tensix or end not in chip.tensix:
+      raise ValueError("runtime endpoints must be available Tensix tiles")
+    if chip.banks != list(range(len(bh.DRAM))):
+      raise RuntimeError(f"the runtime needs all eight DRAM banks, and the card has {chip.banks}")
     cores = [(x, y) for x, y in chip.tensix if start[0] <= x <= end[0] and start[1] <= y <= end[1]]
     if len(cores) < 2: raise ValueError("a rectangle needs a dispatcher and at least one worker")
     self.chip, self.launches, self.wptr = chip, 0, 0
@@ -516,10 +540,12 @@ class Runtime:
     # A pair is taken while the worker has no port yet, the bank has fewer than its share of workers, and the port
     # fewer than a third of that. This keeps any row's links from carrying the reads of many workers.
     n, ports = len(xs) * len(ys), [(b, (x, y + p)) for b, (x, y) in enumerate(bh.DRAM) for p in range(3)]
-    pairs = sorted((bh.hops(chip.raw(*port), chip.raw(x, y)), i, b, port) for i, (x, y) in enumerate(self.cores[:n]) for b, port in ports)
+    pairs = sorted((bh.hops(chip.raw(*port), chip.raw(x, y)), i, b, port)
+                   for i, (x, y) in enumerate(self.cores[:n]) for b, port in ports)
     readers, count = [None] * n, collections.Counter()  # count: how many readers each bank and each port has
     for _, i, b, port in pairs:
-      if readers[i] is None and count[b] < n // len(bh.DRAM) + (b < n % len(bh.DRAM)) and count[port] < -(-n // len(ports)):
+      if (readers[i] is None and count[b] < n // len(bh.DRAM) + (b < n % len(bh.DRAM))
+          and count[port] < -(-n // len(ports))):
         readers[i], count[b], count[port] = (b, port), count[b] + 1, count[port] + 1
     self.readers = tuple(readers)  # (bank, translated (x, y) of the port) for each grid worker, in grid order
     self.counts = chip.pci.counts  # whether profile knows the bytes each launch read
@@ -535,10 +561,12 @@ class Runtime:
     except MemoryError:
       _reap(chip, collect=True)  # a dropped runtime may hold the host page
       buf, bus = chip.pci.alloc(1 << 21)
-    self.status, self.ring, self.times, self.back, self.back_bus = buf[:64], buf[64:64 + ring], buf[64 + ring:back], buf[back:], bus + back
+    self.status, self.ring, self.times, self.back, self.back_bus = (buf[:64], buf[64:64 + ring], buf[64 + ring:back],
+                                                                    buf[back:], bus + back)
     self.resources = _Resources(self, (self.status, self.ring, self.times, self.back, buf))
     chip.taken[start, end] = self.resources
-    self.sent = [("", 0, b"")] * TIMES  # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
+    # (name, workers, kernel) of the last TIMES launches, for profile and baretile.viz
+    self.sent = [("", 0, b"")] * TIMES
     self.numbers = {}  # (repr(value), dtype) -> a tensor holding that number, uploaded once by Tensor.number
     # log holds the launches while a Recording records. pinned counts the recordings that keep each allocation, which
     # dram_free then leaves until the last of them closes (pinned_freed)
@@ -552,14 +580,18 @@ class Runtime:
       chip.write(*end, ZEROS, bytes(DATA - ZEROS), start)
       # zero the mailbox, the TRISCs' go and done, SYNC and FLAGS, except whom to report to and the worker's index
       for i, (x, y) in enumerate(self.cores):
-        chip.write(x, y, MAILBOX, struct.pack("<8I", 0, 0, 0, 0, 0, bh.noc_xy(dx, dy), 0, i).ljust(ARGS - MAILBOX, b"\0"))
+        chip.write(x, y, MAILBOX,
+                   struct.pack("<8I", 0, 0, 0, 0, 0, bh.noc_xy(dx, dy), 0, i).ljust(ARGS - MAILBOX, b"\0"))
       chip.write(dx, dy, 0, dispatcher)
       rect = bh.noc_rect(start, end)
-      chip.write(dx, dy, DISPATCH, struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32, rect, n))
+      chip.write(dx, dy, DISPATCH,
+                 struct.pack("<8I", 0, (bus + 64) & 0xFFFFFFFF, (bus + 64) >> 32, ring, bus & 0xFFFFFFFF, bus >> 32,
+                             rect, n))
       chip.write(dx, dy, DONE, bytes(8))
       chip.write(*end, MCAST_STATE, bytes(8), start)
       chip.write(dx, dy, OUTBOX, bytes(64))  # clear completion status left by the previous dispatcher
-      self.doorbell = chip.map(dx, dy, DISPATCH)  # its own TLB, so ringing the doorbell doesn't have to move a window first
+      # its own TLB, so ringing the doorbell doesn't have to move a window first
+      self.doorbell = chip.map(dx, dy, DISPATCH)
       for i in range(3): chip.write32(*end, bh.TRISC_RESET_PC + 4 * i, 4 + 4 * i, start)
       chip.write32(*end, bh.TRISC_RESET_PC_OVERRIDE, 0b111, start)
       self.resources.started = True
@@ -589,7 +621,8 @@ class Runtime:
     evicting kernels. Strict TLB ordering makes the kernel arrive before a later doorbell write."""
     self.check()
     if kernel not in self.loaded:
-      if len(kernel) > ZEROS - KERNELS: raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}")
+      if len(kernel) > ZEROS - KERNELS:
+        raise ValueError(f"kernel is {len(kernel)} bytes, and kernel space holds {ZEROS - KERNELS}")
       if self.evicts(kernel): self.evict()
       self.chip.write(*self.end, self.room, kernel, self.start)
       self.loaded[kernel], self.room = self.room, self.room + len(kernel)  # compile_kernel makes it a multiple of 16
@@ -639,16 +672,19 @@ class Runtime:
     n = min(units, len(self.cores))
     try: body = struct.pack(f"<{2 + len(args)}I", units, 0, *args)
     except struct.error: raise ValueError("launch arguments must be integers in [0, 2**32 - 1]") from None
-    if len(body) > ARGS_SIZE: raise ValueError(f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}")
+    if len(body) > ARGS_SIZE:
+      raise ValueError(f"{len(body)} bytes of arguments, and an argument buffer holds {ARGS_SIZE}")
     length = -(-(16 + len(body)) // 64) * 64
-    if length > len(self.ring): raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
+    if length > len(self.ring):
+      raise ValueError(f"a {length}-byte command does not fit in a {len(self.ring)}-byte ring")
     return struct.pack("<4I", length, self.load(kernel), len(body), n) + body.ljust(length - 16, b"\0"), n
 
   def bound(self, cmds, launches):
     """[(byte offset, argument)] for each Bound argument of launches in cmds, which block made from all of them."""
     found, at = [], 0
     for _, args, _, _ in launches:
-      found += [(at + 24 + 4 * j, v) for j, v in enumerate(args) if isinstance(v, Bound)]  # after the header, units and 0
+      # after the header, units and 0
+      found += [(at + 24 + 4 * j, v) for j, v in enumerate(args) if isinstance(v, Bound)]
       at += struct.unpack_from("<I", cmds, at)[0]
     return found
 
@@ -695,12 +731,14 @@ class Runtime:
     flits, including DRAM, other tiles' L1 and local copies. Bytes are None without NIU counters. Only the
     last TIMES launches are available."""
     self.wait()
-    if self.launches - since > TIMES: raise ValueError(f"{self.launches - since} launches to profile, but only the last {TIMES} are kept")
+    if self.launches - since > TIMES:
+      raise ValueError(f"{self.launches - since} launches to profile, but only the last {TIMES} are kept")
     totals = collections.defaultdict(lambda: [0, 0, 0])
     for n in range(since + 1, self.launches + 1):
       go, done, flits = struct.unpack_from("<3I", self.times, n % TIMES * 16)
       for i, v in enumerate((1, (done - go) % 2**32, 64 * flits)): totals[self.sent[n % TIMES][0]][i] += v
-    return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()), key=lambda r: -r[2])
+    return sorted(((name, n, cycles, read if self.counts else None) for name, (n, cycles, read) in totals.items()),
+                  key=lambda r: -r[2])
 
   def args(self):  # where the last launch's arguments are on each of its workers. some kernels write results there
     return ARGS + self.launches % 2 * ARGS_SIZE
@@ -722,7 +760,8 @@ class Runtime:
       if resources.active and (rt := resources.owner()) is not None and rt.freed:
         rt.wait()
         return self.dram_alloc(size, collect)
-    if collect:  # garbage can hold DRAM too: tensors in reference cycles, as a parameter is after backward(), and dropped runtimes
+    # garbage can hold DRAM too: tensors in reference cycles, as a parameter is after backward(), and dropped runtimes
+    if collect:
       _reap(self.chip, collect=True)
       return self.dram_alloc(size, False)
     raise MemoryError(f"no {size} bytes free in DRAM")
@@ -751,7 +790,8 @@ class Runtime:
           self.pinned_freed.remove(addr)
           self.dram_free(addr)
 
-  def finished(self): return self.launches - (self.launches - self.read_status(1)) % 2**32  # launches done, from the status
+  # launches done, from the status
+  def finished(self): return self.launches - (self.launches - self.read_status(1)) % 2**32
 
   def reclaim(self):  # freed DRAM that no unfinished launch can use goes back into the holes
     done, freed = self.finished(), False
@@ -774,15 +814,19 @@ class Runtime:
     """Poll completion status in host memory until launch number `launch` is done, by default the last one
     queued, then reclaim memory freed by completed launches. On timeout, report the current launch and its
     unfinished workers."""
-    if launch is not None and launch > self.launches: raise ValueError(f"launch {launch} was never queued; the last one queued is {self.launches}")
+    if launch is not None and launch > self.launches:
+      raise ValueError(f"launch {launch} was never queued; the last one queued is {self.launches}")
     launch = self.launches if launch is None else launch
     try: self.until(lambda: self.finished() >= launch, f"finish launch {launch}", timeout)
     except TimeoutError as e:
       current = (self.chip.read32(*self.dispatcher, OUTBOX + 20) + 1) % 2**32  # after the last it saw finish (OUT[5])
-      if current == (self.launches + 1) % 2**32: raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
+      if current == (self.launches + 1) % 2**32:
+        raise TimeoutError(f"{e}: all done, but the status never reached the host") from None
       n = next((n for launch, n in self.queued if launch % 2**32 == current), 0)
       stuck = [c for c in self.cores[:n] if self.chip.read32(*c, MAILBOX + 16) != current]
-      if not stuck: raise TimeoutError(f"{e}: the dispatcher is on launch {current}, whose workers all finished, so it missed a report") from None
+      if not stuck:
+        raise TimeoutError(f"{e}: the dispatcher is on launch {current}, whose workers all finished, "
+                           f"so it missed a report") from None
       reports = "".join(f"\n  {self.report(c, current)}" for c in stuck[:4])
       raise TimeoutError(f"{e}: the dispatcher is on launch {current}, still running on {stuck}{reports}") from None
     self.reclaim()
@@ -800,7 +844,8 @@ class Runtime:
     lines = [f"{core}: launch {launch} not finished by {', '.join(left) or 'none'}",
              "SYNC " + ", ".join(f"{name} {v}" for name, v in zip(SYNC_NAMES, sync)) + "; FLAGS set: "
              + (", ".join(f"{i}={v}" for i, v in enumerate(flags) if v) or "none"),
-             f"NoC requests in flight by id: {({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "
+             f"NoC requests in flight by id: "
+             f"{({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "
              f"write acknowledgements {niu(bh.NIU_REGS['WR_ACKS'])}, read responses {niu(bh.NIU_REGS['READS'])}"]
     if not isinstance(self.chip.pci, pci.Sim):  # ttsim doesn't model the pc snapshots, and reading one stops it
       lines.append("pc " + ", ".join(f"{name} {self.chip.read32(x, y, bh.PC_SNAPSHOT + 4 * i):#x}"
