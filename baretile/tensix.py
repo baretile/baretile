@@ -25,7 +25,8 @@ def slot_base(dtype): return DATA - tile_bytes(dtype)
 # Where a kernel packs its results when it packs in a different dtype than it computes in. There's a 4 KiB tile for
 # each of the two frames.
 OUTS = bh.L1_SIZE - 2 * 4096
-DST_HALF = 64  # Dst rows for an fp32 result. Kernels use two such halves, rows 0-127, so math fills one while pack drains the other
+# Dst rows for an fp32 result. Kernels use two such halves, rows 0-127, so math fills one while pack drains the other
+DST_HALF = 64
 # SEM_DST counts results in Dst waiting to be packed, SEM_PACKED outputs packed but not reported yet, and SEM_L1
 # intermediates packed into L1 that nobody has waited for yet.
 SEM_DST, SEM_PACKED, SEM_L1 = 1 << 0, 1 << 1, 1 << 2
@@ -70,16 +71,22 @@ def kernel_config(dtype="bf16", out="bf16", transposing=False):
   # The packer's own input format. Packing a block float from fp32 rounds each value once. From bfp8 it would round
   # twice.
   late = bh.FP32 if out in BFP else pack
-  return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF, pack_reads_per_xy_plane=16,
-                PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0, PCK0_Ystride_1=tile_bytes(out),
+  return config(Dstacc=late, Fp32_enabled=1, Zero_Flag_disabled_src=0, Read_32b_data=1, Edge_mask=0xFFFF,
+                pack_reads_per_xy_plane=16,
+                PCK0_Ystride=16 * ITEMSIZE["fp32" if late == bh.FP32 else out], PCK0_ZW=0,
+                PCK0_Ystride_1=tile_bytes(out),
                 PCK0_ZW_1=0, PCK0_Base_1=0, PCK_dest_offset=0, Pack_L1_Acc=0,
-                L1_Dest_addr=(slot_base(dtype) if out == dtype else OUTS) // 16 - 1, Disable_zero_compress=1, Pack_out_format=pack,
+                L1_Dest_addr=(slot_base(dtype) if out == dtype else OUTS) // 16 - 1, Disable_zero_compress=1,
+                Pack_out_format=pack,
                 Exp_section_size=4,  # the 64 exponents of a block float, in units of 16 bytes
                 Pack_in_format=late, UNP0_add_dest_addr_cntr=0, UNP0_Ystride_1=64, UNP0_ZW_1=0, UNP1_ZW_1=0,
-                SEC0_format=fmt, SEC0_x_dim=1024, SEC0_y_dim=1, SEC0_z_dim=1, SEC0_out_format=fmt, SEC0_uncompressed=1, SEC0_base=base,
+                SEC0_format=fmt, SEC0_x_dim=1024, SEC0_y_dim=1, SEC0_z_dim=1, SEC0_out_format=fmt, SEC0_uncompressed=1,
+                SEC0_base=base,
                 SEC0_dest_addr=64, SEC0_tile_x_dim=1024, SEC0_offset=0, SEC0_Haloize_mode=int(transposing),
-                SEC0_uncompressed_1=1, SEC0_to_dst_1=1, SEC0_base_1=base, SEC0_dest_addr_1=64, SEC0_tile_x_dim_1=1024, SEC0_offset_1=0,
-                SEC1_format=fmt, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=fmt, SEC1_uncompressed=1, SEC1_base=base)
+                SEC0_uncompressed_1=1, SEC0_to_dst_1=1, SEC0_base_1=base, SEC0_dest_addr_1=64, SEC0_tile_x_dim_1=1024,
+                SEC0_offset_1=0,
+                SEC1_format=fmt, SEC1_x_dim=1024, SEC1_y_dim=1, SEC1_z_dim=1, SEC1_out_format=fmt, SEC1_uncompressed=1,
+                SEC1_base=base)
 
 # Address modes of the math thread, as (SrcA step, SrcB step) and (Dst step, fidelity step). Modes 0-1 are for
 # elementwise ops, 2-3 for SFPU loads and stores (the store steps Dst by 2), and 4-7 for matmul. Each kind of op has its
@@ -124,26 +131,32 @@ def counters(mask, n):  # resets the address counters of these units to 0, with 
           ins("SETADCXX", cnt_set_mask=mask, x_end2=n - 1)]
 SETUP_UNPACK = [ins("SEMINIT", sem_sel=SEM_DST, max_value=2), ins("SEMINIT", sem_sel=SEM_PACKED, max_value=15),
                 ins("SEMINIT", sem_sel=SEM_L1, max_value=15), ins("SEMINIT", sem_sel=SEM_UNPACKED, max_value=15),
-                *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS], *counters(UNPACKERS, 1024)]
+                *[ins("SEMINIT", sem_sel=sem, init_value=1, max_value=1) for _, sem in ACCS],
+                *counters(UNPACKERS, 1024)]
 SETUP_PACK, PACK_RUNS = counters(bh.PACK, 16), record(PACRS, [ins("PACR") for _ in range(15)])  # 16 datums a Dst row
 # Puts v into the low field of word. v is a number, or a C expression whose value is added when the word is pushed at
 # run time.
 def field(word, v): return word + v if isinstance(v, int) else (word, v)
-def setadc(unpacker, slot): return field(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)  # Z is the slot
+# Z is the slot
+def setadc(unpacker, slot): return field(ins("SETADC", cnt_set_mask=unpacker, dimension_index=2, value=0), slot)
 def unpacr(b, z):  # unpacks a tile into SrcA, or SrcB with b, and hands the bank to the FPU. Then Z moves on by z
   return ins("UNPACR", last=1, set_dat_valid=1, ovrd_thread_id=1, unpack_block_selection=b, addr_mode=z)
-def unpack(a, b): return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), unpacr(0, 0), unpacr(1, 0)]  # slot a into SrcA, b into SrcB
+# slot a into SrcA, b into SrcB
+def unpack(a, b): return [setadc(bh.UNPACK0, a), setadc(bh.UNPACK1, b), unpacr(0, 0), unpacr(1, 0)]
 REPORT = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK), ins("SEMPOST", sem_sel=SEM_UNPACKED)]
 # Unpacks an fp32 tile from an L1 slot into Dst, from row `row` on, bypassing SrcA. The math thread does this, with
 # unpacker 0 in context 1.
 def fill(slot, row):
-  return [setadc(bh.UNPACK0, slot), field(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
+  return [setadc(bh.UNPACK0, slot),
+          field(ins("SETADC", cnt_set_mask=bh.UNPACK0, dimension_index=1, channel_index=1, value=0), row),
           ins("UNPACR", last=1, ovrd_thread_id=1)]
-FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]  # the SFPU and the sync unit wait for the fills
+# the SFPU and the sync unit wait for the fills
+FILLED = [ins("STALLWAIT", stall_res=bh.STALL_SFPU | bh.STALL_SYNC, wait_res=bh.WAIT_UNPACK0)]
 def reconfigure(**fields):  # rewrites config fields of the unpackers from thread 0, a byte at a time
   # RMWCIB keeps the rest of the word. The writes wait for unpacker 0 to finish its unpacks so far, or for both
   # unpackers when a field belongs to unpacker 1. The next unpack waits for the writes.
-  writes = [ins(f"RMWCIB{b}", cfg_reg_addr=word, data=v << first >> 8 * b & 255, mask=(1 << width) - 1 << first >> 8 * b & 255)
+  writes = [ins(f"RMWCIB{b}", cfg_reg_addr=word, data=v << first >> 8 * b & 255,
+                mask=(1 << width) - 1 << first >> 8 * b & 255)
             for (word, first, width), v in ((bh.TENSIX_CFG_FIELDS[k], v) for k, v in fields.items())
             for b in range(first // 8, (first + width + 7) // 8)]
   idle = bh.WAIT_UNPACK if any(k.startswith("SEC1") for k in fields) else bh.WAIT_UNPACK0
@@ -151,7 +164,8 @@ def reconfigure(**fields):  # rewrites config fields of the unpackers from threa
           [ins("STALLWAIT", stall_res=bh.STALL_UNPACK, wait_res=bh.WAIT_CFG)])
 def repack(old, new):  # switches the packer's config from old to new (both from kernel_config), from the pack thread
   # Only the bytes that differ get written. They wait for the packer to go idle, and its next pack waits for them.
-  writes = [ins(f"RMWCIB{b}", cfg_reg_addr=w, data=new[w] >> 8 * b & 255, mask=255) for w in sorted(new) for b in range(4)
+  writes = [ins(f"RMWCIB{b}", cfg_reg_addr=w, data=new[w] >> 8 * b & 255,
+                mask=255) for w in sorted(new) for b in range(4)
             if (old[w] ^ new[w]) >> 8 * b & 255]
   return ([ins("STALLWAIT", stall_res=bh.STALL_CFG, wait_res=bh.WAIT_PACK)] + writes +
           [ins("STALLWAIT", stall_res=bh.STALL_PACK, wait_res=bh.WAIT_CFG)])
@@ -186,12 +200,16 @@ def aim(row):
 DST_FREE = ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=2)  # waits until a Dst half is free
 # Waits for a free Dst half and aims the FPU at it. If the math accumulates, it also zeroes the half, 16 rows at a time.
 def math_begin(zero):
-  return [DST_FREE, *aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b), "h / 16") for b in range(4) if zero]
-MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU), ins("SEMPOST", sem_sel=SEM_DST)]
-def pack(row, slot, *done):  # packs 64 Dst rows from `row` into an L1 slot, then frees them and posts the semaphores in done
+  return [DST_FREE, *aim("h")] + [field(ins("ZEROACC", clear_mode=1, use_32_bit_mode=1, where=b),
+                                        "h / 16") for b in range(4) if zero]
+MATH_END = [ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_FPU | bh.WAIT_SFPU),
+            ins("SEMPOST", sem_sel=SEM_DST)]
+# packs 64 Dst rows from `row` into an L1 slot, then frees them and posts the semaphores in done
+def pack(row, slot, *done):
   return [ins("SEMWAIT", stall_res=bh.STALL_ALL, sem_sel=SEM_DST, wait_sem_cond=1),
           field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, value=0), row),  # channel 0 Y: Dst row
-          field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),  # channel 1 Y: L1 slot
+          # channel 1 Y: L1 slot
+          field(ins("SETADC", cnt_set_mask=bh.PACK, dimension_index=1, channel_index=1, value=0), slot),
           replay(PACRS, 15), ins("PACR", last=1),  # 16 PACRs, 4 Dst rows each through all four read ports
           ins("STALLWAIT", stall_res=bh.STALL_SYNC, wait_res=bh.WAIT_PACK), ins("SEMGET", sem_sel=SEM_DST)] + \
          [ins("SEMPOST", sem_sel=d) for d in done]
@@ -236,8 +254,10 @@ SFPU_START = [ins("STALLWAIT", stall_res=bh.STALL_SFPU, wait_res=bh.WAIT_FPU), i
 # SFPSTORE's INT32 mode stores the bits as they are. Its FP32 mode flushes denormals, and as int32 those are the small
 # positive integers.
 RAW = 4
-def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16), ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
-def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])  # a full fp32 constant into LReg r
+def sfp_bits(r, bits): return [ins("SFPLOADI", vd=r, mod0=8, imm16=bits >> 16),
+                               ins("SFPLOADI", vd=r, mod0=10, imm16=bits & 0xFFFF)]
+# a full fp32 constant into LReg r
+def sfp_const(r, x): return sfp_bits(r, struct.unpack("<I", struct.pack("<f", x))[0])
 def sfp_bf16(r, x):  # one word, for a constant that bf16 holds exactly
   assert from_bf16(to_bf16(x)) == x, f"{x} is not a bf16"
   return ins("SFPLOADI", vd=r, mod0=0, imm16=to_bf16(x))
@@ -245,14 +265,16 @@ def mad(d, a, b, c, neg=0): return ins("SFPMAD", vd=d, va=a, vb=b, vc=c, mod1=ne
 def mul(d, a, b): return ins("SFPMUL", vd=d, va=a, vb=b, vc=9)
 CONSTS = bh.LREG_CONSTS  # constant LRegs
 ZERO, ONE, MINUS_ONE = CONSTS[0.0], CONSTS[1.0], CONSTS[-1.0]
-CC_ON, CC_ALL, CC_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)  # lane flags: on, all set, off
+# lane flags: on, all set, off
+CC_ON, CC_ALL, CC_OFF = ins("SFPENCC", mod1=10, imm2=3), ins("SFPENCC", mod1=0), ins("SFPENCC", mod1=10, imm2=2)
 NAN, INF = 0x7FC00000, 0x7F800000
 def nans(x, t, inf):  # sets the lane flags where LReg x is NaN, using LRegs t and inf
   # x + 0 makes any NaN 0x7FC00000, even a negative one that SFPABS would leave at the bottom of SFPGT's order. A lane
   # is NaN where that is above the bits of inf (which LReg inf gets). An SFPMOV between CC_ON and CC_OFF can then give
   # those lanes NaN.
   return [mad(t, x, ONE, ZERO), *sfp_bits(inf, INF), ins("SFPGT", vd=t, vc=inf, mod1=1)]
-def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)  # with flags on, keeps lanes where int LReg e >= n
+# with flags on, keeps lanes where int LReg e >= n
+def at_least(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=9, imm12=-n & 0xFFF)
 def below(e, n, t): return ins("SFPIADD", vd=t, vc=e, mod1=1, imm12=-n & 0xFFF)  # or < n. both overwrite LReg t
 # LReg d = cs[0] + cs[1] x + ..., by Horner. Each coefficient goes into LReg temp when it's needed, except 0 and +-1,
 # which have LRegs of their own.
@@ -265,7 +287,8 @@ def poly(d, x, cs, temp):
 # within a step or two. They reduce x to a small range in exact steps, and a polynomial does the rest. The polynomials
 # are minimax fits, made offline.
 EXP_P = [1.0, 1.0, 0.49999991, 0.16666421, 0.041668355, 0.008374773, 0.001382954]  # e^r on [-ln2/2, ln2/2], 8e-8
-LOG2_Q = [1.442695, -0.72134733, 0.4809106, -0.36070517, 0.2879189, -0.23891294, 0.21565668, -0.20746617, 0.12623915]  # 1.3e-7
+# 1.3e-7
+LOG2_Q = [1.442695, -0.72134733, 0.4809106, -0.36070517, 0.2879189, -0.23891294, 0.21565668, -0.20746617, 0.12623915]
 SIN_P = [1.0, -0.16666658, 0.0083330506, -0.00019809045, 2.6051646e-06]  # sin(r) / r in r^2, r in [-pi/2, pi/2], 1.4e-7
 
 def exp(base2, nan=False):
@@ -280,14 +303,21 @@ def exp(base2, nan=False):
   nan is for fp32 kernels. It loads x from Dst again and puts the NaN back. In bf16 a NaN is already inf before the
   SFPU sees it."""
   (lim, t), ln2 = (150.0, 0) if base2 else (104.0, 5), math.log(2)
-  return (sfp_const(1, ln2) if base2 else sfp_const(1, 1 / ln2) + sfp_const(2, 0.693359375) + sfp_const(3, ln2 - 0.693359375),
-          [sfp_load(), sfp_bf16(4, -lim), ins("SFPSWAP", vd=4, vc=0, mod1=1), sfp_bf16(4, lim), ins("SFPSWAP", vd=0, vc=4, mod1=1),  # x within +-lim
-           *([] if base2 else [mul(5, 0, 1)]), sfp_bf16(6, 1.5 * 2**23), mad(4, t, ONE, 6), mad(7, 4, ONE, 6, neg=2),  # LReg 7: n
+  return (sfp_const(1, ln2) if base2 else
+          sfp_const(1, 1 / ln2) + sfp_const(2, 0.693359375) + sfp_const(3, ln2 - 0.693359375),
+          [sfp_load(), sfp_bf16(4, -lim), ins("SFPSWAP", vd=4, vc=0, mod1=1), sfp_bf16(4, lim),
+           ins("SFPSWAP", vd=0, vc=4, mod1=1),  # x within +-lim
+           # LReg 7: n
+           *([] if base2 else [mul(5, 0, 1)]), sfp_bf16(6, 1.5 * 2**23), mad(4, t, ONE, 6), mad(7, 4, ONE, 6, neg=2),
            ins("SFPIADD", vd=6, vc=4, mod1=6),  # LReg 6: n as an integer, bits(t + 1.5 2^23) - bits(1.5 2^23)
-           *([mad(5, 7, ONE, 0, neg=1), mul(5, 5, 1)] if base2 else [mad(5, 7, 2, 0, neg=1), mad(5, 7, 3, 5, neg=1)]),  # LReg 5: r
-           *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF), ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
-           ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),  # LReg 0, 6: floor(n/2) and ceil(n/2). then 2^ each, from its bits
-           *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127), ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
+           # LReg 5: r
+           *([mad(5, 7, ONE, 0, neg=1), mul(5, 5, 1)] if base2 else [mad(5, 7, 2, 0, neg=1), mad(5, 7, 3, 5, neg=1)]),
+           *poly(4, 5, EXP_P, 7), ins("SFPSHFT", vd=0, vc=6, mod1=7, imm12=-1 & 0xFFF),
+           ins("SFPIADD", vd=6, vc=6, mod1=5, imm12=1),
+           # LReg 0, 6: floor(n/2) and ceil(n/2). then 2^ each, from its bits
+           ins("SFPSHFT", vd=6, mod1=3, imm12=-1 & 0xFFF),
+           *[w for r in (0, 6) for w in (ins("SFPIADD", vd=r, vc=r, mod1=5, imm12=127),
+                                         ins("SFPSHFT", vd=r, mod1=1, imm12=23), mul(4, 4, r))],
            *([sfp_load(0), CC_ON, *nans(0, 6, 7), ins("SFPMOV", vd=4, vc=0), CC_OFF] if nan else []), sfp_store(4)])
 
 def recip(nan=False):
@@ -295,9 +325,10 @@ def recip(nan=False):
   for 0 and denormals and 0 for inf, where e is 0 * inf = NaN. The steps only run where the first e is below 1 in
   magnitude, which its exponent tells, so those lanes keep the estimate. So does an x past 2^126, whose estimate is
   the 0 that the steps would leave. With nan, for fp32, a NaN gets NaN back instead of its estimate of 0."""
-  return ([], [sfp_load(), ins("SFPARECIP", vd=1, vc=0), mad(2, 0, 1, ONE, neg=1), CC_ON, ins("SFPEXEXP", vd=3, vc=2, mod1=2),
-               mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
-               *([CC_ALL, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), CC_OFF, sfp_store(1)])
+  return ([],
+          [sfp_load(), ins("SFPARECIP", vd=1, vc=0), mad(2, 0, 1, ONE, neg=1), CC_ON,
+           ins("SFPEXEXP", vd=3, vc=2, mod1=2), mad(1, 1, 2, 1), mad(2, 0, 1, ONE, neg=1), mad(1, 1, 2, 1),
+           *([CC_ALL, *nans(0, 3, 2), ins("SFPMOV", vd=1, vc=0)] if nan else []), CC_OFF, sfp_store(1)])
 
 def sqrt():
   """sqrt(x) by Goldschmidt's iteration. y = 0x5F3759DF minus half the bits of x is 1/sqrt(x) within 3.5%, and g = x y
@@ -310,9 +341,11 @@ def sqrt():
   which is flushed to one. The result is x where x is above the largest float in SFPGT's order (inf and NaN), and NaN
   where it's below minus the largest denormal."""
   return (sfp_bits(4, 0x5F3759DF) + sfp_const(5, 0.5) + sfp_bits(6, 0x7F7FFFFF) + sfp_bits(7, 0x807FFFFF),
-          [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF), ins("SFPIADD", vd=1, vc=4, mod1=6),  # LReg 1: y
+          # LReg 1: y
+          [sfp_load(), ins("SFPSHFT", vd=1, vc=0, mod1=5, imm12=-1 & 0xFFF), ins("SFPIADD", vd=1, vc=4, mod1=6),
            mad(2, 0, 1, ZERO, neg=2), mul(1, 1, 5),  # LReg 2: g, 1: h
-           mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2), mad(1, 1, 3, 1), mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2),  # LReg 3: r
+           # LReg 3: r
+           mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2), mad(1, 1, 3, 1), mad(3, 2, 1, 5, neg=1), mad(2, 2, 3, 2),
            mad(3, 2, 1, ONE, neg=1), mad(1, 0, 1, ZERO, neg=2), mad(2, 2, 3, 1),  # g (1 - g h) + x h
            CC_ON, ins("SFPGT", vd=0, vc=6, mod1=1), ins("SFPMOV", vd=2, vc=0),
            CC_ALL, ins("SFPGT", vd=7, vc=0, mod1=1), *sfp_bits(2, NAN), CC_OFF, sfp_store(2)])
@@ -323,12 +356,14 @@ def log(scale):
   near 1, where u is small and exact. inf and NaN come back unchanged, and a negative number gives NaN. Zero gives
   -inf, and so does a denormal, since it gets flushed."""
   return (sfp_const(5, math.sqrt(2)) + (sfp_const(7, scale) if scale != 1 else []),
-          [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127),  # LReg 1: biased e, 2: m
-           CC_ON, ins("SFPGT", vd=2, vc=5, mod1=1), ins("SFPSETEXP", vd=2, vc=2, mod1=1, imm12=126), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=1),
-           CC_OFF, ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0), mad(1, 1, ONE, 6), mad(2, 2, ONE, MINUS_ONE),
-           *poly(3, 2, LOG2_Q, 6), mad(3, 3, 2, 1), *([mul(3, 3, 7)] if scale != 1 else []),
-           ins("SFPEXEXP", vd=1, vc=0, mod1=1), CC_ON, at_least(1, 255, 4), ins("SFPMOV", vd=3, vc=0), CC_ALL,
-           ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), CC_ALL, below(1, 1, 4), *sfp_bits(3, INF | 1 << 31), CC_OFF, sfp_store(3)])
+          # LReg 1: biased e, 2: m
+          [sfp_load(), ins("SFPEXEXP", vd=1, vc=0, mod1=1), ins("SFPSETEXP", vd=2, vc=0, mod1=1, imm12=127), CC_ON,
+           ins("SFPGT", vd=2, vc=5, mod1=1), ins("SFPSETEXP", vd=2, vc=2, mod1=1, imm12=126),
+           ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=1), CC_OFF, ins("SFPCAST", vd=1, vc=1), sfp_bf16(6, -127.0),
+           mad(1, 1, ONE, 6), mad(2, 2, ONE, MINUS_ONE), *poly(3, 2, LOG2_Q, 6), mad(3, 3, 2, 1),
+           *([mul(3, 3, 7)] if scale != 1 else []), ins("SFPEXEXP", vd=1, vc=0, mod1=1), CC_ON, at_least(1, 255, 4),
+           ins("SFPMOV", vd=3, vc=0), CC_ALL, ins("SFPSETCC", vc=0), *sfp_bits(3, NAN), CC_ALL, below(1, 1, 4),
+           *sfp_bits(3, INF | 1 << 31), CC_OFF, sfp_store(3)])
 
 def sin(phase):
   """sin(x + pi phase), with phase 0 or 0.5 for cosine, for finite |x| < 2^24.
@@ -347,12 +382,16 @@ def sin(phase):
                 *sfp_const(4, sign * (math.pi - whole)), mad(6, 6, ONE, 4, neg=2), ins("SFPXOR", vd=3, vc=5)]
   return (sfp_const(1, 1 / math.pi),
           [sfp_load(), ins("SFPABS", vd=0, vc=0, mod1=1), sfp_bf16(7, phase + 0.5), mad(6, 0, 1, 7),
-           ins("SFPEXEXP", vd=2, vc=6), ins("SFPEXMAN", vd=3, vc=6), ins("SFPIADD", vd=2, vc=2, mod1=5, imm12=-23 & 0xFFF),
+           ins("SFPEXEXP", vd=2, vc=6), ins("SFPEXMAN", vd=3, vc=6),
+           ins("SFPIADD", vd=2, vc=2, mod1=5, imm12=-23 & 0xFFF),
            ins("SFPSHFT", vd=3, vc=2), ins("SFPMOV", vd=4, vc=3), ins("SFPLOADI", vd=2, mod0=2, imm16=4095),
-           ins("SFPAND", vd=4, vc=2), ins("SFPSHFT", vd=5, vc=3, mod1=5, imm12=-12 & 0xFFF), ins("SFPSHFT", vd=5, mod1=1, imm12=12),
-           ins("SFPCAST", vd=4, vc=4), ins("SFPCAST", vd=5, vc=5), ins("SFPSHFT", vd=3, mod1=1, imm12=31), ins("SFPMOV", vd=6, vc=0),
+           ins("SFPAND", vd=4, vc=2), ins("SFPSHFT", vd=5, vc=3, mod1=5, imm12=-12 & 0xFFF),
+           ins("SFPSHFT", vd=5, mod1=1, imm12=12),
+           ins("SFPCAST", vd=4, vc=4), ins("SFPCAST", vd=5, vc=5), ins("SFPSHFT", vd=3, mod1=1, imm12=31),
+           ins("SFPMOV", vd=6, vc=0),
            *[w for p in pi for w in (*sfp_const(2, p), mad(6, 5, 2, 6, neg=1), mad(6, 4, 2, 6, neg=1))],
-           *([*sfp_const(2, half), mad(6, 6, ONE, 2), *sfp_const(2, math.pi / 2 - half), mad(6, 6, ONE, 2)] if phase else []),
+           *([*sfp_const(2, half), mad(6, 6, ONE, 2), *sfp_const(2, math.pi / 2 - half),
+              mad(6, 6, ONE, 2)] if phase else []),
            *sfp_bits(5, 0x80000000), CC_ON, *correct, CC_OFF,
            mul(7, 6, 6), *poly(4, 7, SIN_P, 2), mul(4, 4, 6), ins("SFPXOR", vd=4, vc=3),
            sfp_load(), ins("SFPEXEXP", vd=2, vc=0, mod1=1),
@@ -378,34 +417,48 @@ def binary(*body): return [sfp_load(0), sfp_load(1, 128), *body]
 # order. -(-(y + 0) - 0) then gives y + 0 back, but its NaN negated, at the bottom: an SFPMAD's NaN is always
 # 0x7FC00000, and subtracting 0 keeps a zero's sign. Where either is NaN, x > y holds and y > x doesn't, so one SFPGT
 # makes each comparison.
-UNORDERED = [mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), mad(1, 1, MINUS_ONE, ZERO, neg=2), ins("SFPMOV", vd=1, vc=1, mod1=1)]
+UNORDERED = [mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), mad(1, 1, MINUS_ONE, ZERO, neg=2),
+             ins("SFPMOV", vd=1, vc=1, mod1=1)]
 # Map two's complement to SFPGT's sign-magnitude order, including INT32_MIN: XOR a negative with its sign spread over
 # the magnitude bits, by an arithmetic shift right by 31 and then a logical one by 1. -1 becomes negative zero, below
 # positive zero. Applying the same map restores the input.
 def integer_order(*regs):
-  return [w for r in regs for w in (ins("SFPSHFT", vd=2, vc=r, mod1=7, imm12=-31 & 0xFFF), ins("SFPSHFT", vd=2, mod1=1, imm12=-1 & 0xFFF),
-                                    ins("SFPXOR", vd=r, vc=2))]
+  return [w for r in regs for w in (ins("SFPSHFT", vd=2, vc=r, mod1=7, imm12=-31 & 0xFFF),
+                                    ins("SFPSHFT", vd=2, mod1=1, imm12=-1 & 0xFFF), ins("SFPXOR", vd=r, vc=2))]
 BINARY = {"max", "cmplt", "cmple", "cmpne", "keep", "drop", "join"}
 # In an fp32 kernel the SFPU also does add, sub and mul, rounding once as fp32 does. There, exp, the reciprocal and
 # the comparisons handle NaN the IEEE way. The bf16 versions skip that work, since a bf16 NaN is already inf before the
 # SFPU sees it.
-FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip", "cmplt": "fcmplt",
-            "cmple": "fcmple", "cmpne": "fcmpne"}
-INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmple": "icmple", "cmpne": "icmpne",  # int32's own programs
+FP32_OPS = {"add": "fadd", "sub": "fsub", "mul": "fmul", "exp": "fexp", "exp2": "fexp2", "recip": "frecip",
+            "cmplt": "fcmplt", "cmple": "fcmple", "cmpne": "fcmpne"}
+# int32's own programs
+INT32_OPS = {"add": "iadd", "sub": "isub", "max": "imax", "cmplt": "icmplt", "cmple": "icmple", "cmpne": "icmpne",
              "keep": "keep", "drop": "drop", "join": "join"}
-CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}  # the SFPU program for a cast
+# the SFPU program for a cast
+CASTS = {("int32", "fp32"): "itof", ("int32", "bf16"): "itof", ("fp32", "int32"): "ftoi", ("bf16", "int32"): "ftoi"}
 SFPU |= {
   "max": ([], binary(ins("SFPSWAP", vd=1, vc=0, mod1=1), sfp_store(0))),
-  "cmplt": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "cmple": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0),
-                       ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
-  "cmpne": ([], binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
-                       ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmplt": ([],
+            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=1, vc=0, mod1=8),
+                   ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
+  "cmple": ([],
+            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPGT", vd=0, vc=1, mod1=8),
+                   ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
+  "cmpne": ([],
+            binary(mad(0, 0, ONE, ZERO), mad(1, 1, ONE, ZERO), ins("SFPMOV", vd=2, vc=0),
+                   ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
+                   ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
   "fcmplt": ([], binary(*UNORDERED, ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "fcmple": ([], binary(*UNORDERED, ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0), ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
-  "fcmpne": ([], binary(*UNORDERED, ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8),
-                        ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE), sfp_store(1))),
-  "keep": ([], binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
+  "fcmple": ([],
+             binary(*UNORDERED, ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPNOT", vd=0, vc=0),
+                    ins("SFPAND", vd=0, vc=ONE), sfp_store(0))),
+  "fcmpne": ([],
+             binary(*UNORDERED, ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8),
+                    ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2), ins("SFPAND", vd=1, vc=ONE),
+                    sfp_store(1))),
+  "keep": ([],
+           binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPAND", vd=1, vc=2),
+                  sfp_store(1, mod0=RAW))),
   "drop": ([], binary(ins("SFPABS", vd=2, vc=0), ins("SFPGT", vd=2, vc=ZERO, mod1=8), ins("SFPNOT", vd=2, vc=2),
                       ins("SFPAND", vd=1, vc=2), sfp_store(1, mod0=RAW))),
   # The two disjoint masks of where combine without arithmetic, preserving a selected negative zero.
@@ -416,22 +469,27 @@ SFPU |= {
   # 1.0: 0 minus SFPGT's all ones, or for <=, x > y's all ones plus 1.
   "iadd": ([], binary(ins("SFPIADD", vd=0, vc=1, mod1=4), sfp_store(0, mod0=RAW))),
   "isub": ([], binary(ins("SFPIADD", vd=1, vc=0, mod1=6), sfp_store(1, mod0=RAW))),
-  "imax": ([], binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0), sfp_store(0, mod0=RAW))),
+  "imax": ([],
+           binary(*integer_order(0, 1), ins("SFPSWAP", vd=1, vc=0, mod1=1), *integer_order(0), sfp_store(0, mod0=RAW))),
   "icmplt": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPIADD", vd=1, vc=ZERO, mod1=6),
                         sfp_store(1, mod0=RAW))),
-  "icmple": ([], binary(*integer_order(0, 1), ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPIADD", vd=0, vc=0, mod1=5, imm12=1),
-                        sfp_store(0, mod0=RAW))),
-  "icmpne": ([], binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8), ins("SFPOR", vd=1, vc=2),
-                        ins("SFPIADD", vd=1, vc=ZERO, mod1=6), sfp_store(1, mod0=RAW))),
+  "icmple": ([],
+             binary(*integer_order(0, 1), ins("SFPGT", vd=0, vc=1, mod1=8), ins("SFPIADD", vd=0, vc=0, mod1=5, imm12=1),
+                    sfp_store(0, mod0=RAW))),
+  "icmpne": ([],
+             binary(ins("SFPMOV", vd=2, vc=0), ins("SFPGT", vd=2, vc=1, mod1=8), ins("SFPGT", vd=1, vc=0, mod1=8),
+                    ins("SFPOR", vd=1, vc=2), ins("SFPIADD", vd=1, vc=ZERO, mod1=6), sfp_store(1, mod0=RAW))),
   # Casts. itof turns an integer into sign-magnitude, then into a float, rounding to nearest (exact below 2^24). ftoi
   # rounds a float toward 0 by shifting its mantissa, hidden bit included, by its exponent - 23. It gives 0 where the
   # exponent is negative, and negates the result for a negative float.
   "itof": ([], [sfp_load(), *sfp_bits(1, 0x80000000), ins("SFPXOR", vd=1, vc=0),
                 ins("SFPCAST", vd=0, vc=0, mod1=3), ins("SFPCAST", vd=0, vc=0),
                 CC_ON, ins("SFPSETCC", vc=1, mod1=6), *sfp_const(0, -2**31), CC_OFF, sfp_store(0)]),
-  "ftoi": ([], [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0), ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF),
-                ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4), ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0),
-                ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF, sfp_store(2, mod0=RAW)]),
+  "ftoi": ([],
+           [sfp_load(), ins("SFPEXEXP", vd=1, vc=0), ins("SFPEXMAN", vd=2, vc=0),
+            ins("SFPIADD", vd=1, vc=1, mod1=5, imm12=-23 & 0xFFF), ins("SFPSHFT", vd=2, vc=1), CC_ON, below(1, -23, 4),
+            ins("SFPMOV", vd=2, vc=ZERO), CC_ALL, ins("SFPSETCC", vc=0), ins("SFPIADD", vd=2, vc=ZERO, mod1=6), CC_OFF,
+            sfp_store(2, mod0=RAW)]),
   "one": ([], [sfp_store(ONE)]),  # 1.0 everywhere (a tile of ones)
   "none": (sfp_const(1, -math.inf), [sfp_store(1)]),  # -inf everywhere (a mask that hides all keys)
   # rounds an fp32 value to bf16 the way the packer does, half up: add 2^15 to the bits and clear the low 16. the
@@ -476,7 +534,8 @@ def across_cols(kind):
   8 positions."""
   p = list(SFPU_START)
   for half, odd in [(h, o) for h in (0, 16) for o in (0, 2)]:
-    at = [half + odd + base for base in (0, 4, 8, 12, 32, 36, 40, 44)]  # rows 0-15 of the top face, then the bottom face
+    # rows 0-15 of the top face, then the bottom face
+    at = [half + odd + base for base in (0, 4, 8, 12, 32, 36, 40, 44)]
     p += [sfp_load(0, at[0])]
     p += [w for a in at[1:] for w in (sfp_load(1, a), fold(kind, 0, 1))]
     p += [ins("SFPMOV", vd=r, vc=0) for r in (1, 2, 3)] + [ins("SFPTRANSP")] + [fold(kind, 0, r) for r in (1, 2, 3)]
@@ -495,7 +554,8 @@ def mask_columns(kind, n, d=0):
   for right, odd in [(r, o) for r in (0, 1) for o in (0, 1)]:
     t = max(0, min(8, -(-(n - 16 * right - odd) // 2)))  # the first of the 8 lanes at column n or more
     if t < 8:  # store to lanes t and up at the face's rows. a right face is 16 rows further on. stores keep the flags
-      p += [CC_ON, at_least(7, 2 * t, 6)] + [sfp_store(identity, at=d + b + 16 * right + 2 * odd, step=False) for b in (0, 4, 8, 12, 32, 36, 40, 44)]
+      p += [CC_ON, at_least(7, 2 * t, 6)] + [sfp_store(identity, at=d + b + 16 * right + 2 * odd, step=False)
+                                              for b in (0, 4, 8, 12, 32, 36, 40, 44)]
   return p + [CC_OFF]
 def mask_rows(kind, m, d=0):
   """Set rows m and up of the tile at Dst row d to the identity, past a tensor's last row. A store covers 4 rows, with
@@ -504,7 +564,8 @@ def mask_rows(kind, m, d=0):
   for r in range(0, 32, 4):  # rows r..r+3 start at Dst row (r // 16) * 32 + r % 16 in the left face, 16 on in the right
     k = max(0, m - r)
     if k < 4:
-      p += [CC_ON, at_least(15, 16 * k, 6)] + [sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False) for o in (0, 2, 16, 18)]
+      p += [CC_ON, at_least(15, 16 * k, 6)] + [sfp_store(identity, at=d + r // 16 * 32 + r % 16 + o, step=False)
+                                               for o in (0, 2, 16, 18)]
   return p + [CC_OFF]
 def mask_rows_at(m):
   """Generate mask_rows("sum", m) with m supplied as a C expression at run time. m is the number of valid rows
@@ -514,11 +575,14 @@ def mask_rows_at(m):
   cut, store = at_least(15, 0, 6), sfp_store(identity, step=False)
   imm12, imm10 = bh.TENSIX_OPS["SFPIADD"][1]["imm12"][0], bh.TENSIX_OPS["SFPSTORE"][1]["imm10"][0]
   return (f"{tt(p)} for (unsigned r = 0; r < 32; r += 4) if ({m} < r + 4) {{ unsigned k = {m} > r ? {m} - r : 0; "
-          f"push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); for (unsigned o = 0; o < 4; o++) "
+          f"push_word({CC_ON:#x}); push_word({cut:#x} | (-16 * k & 0xFFF) << {imm12}); for (unsigned o = 0; "
+          f"o < 4; o++) "
           f"push_word({store:#x} | (r / 16 * 32 + r % 16 + o % 2 * 2 + o / 2 * 16) << {imm10}); }} {tt([CC_OFF])}")
 MASK = {1: mask_rows, 2: mask_columns}  # masks the padding past the tensor's end, in its last tile along an axis
-MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]  # mode 1 steps the phase
-MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True), "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
+# mode 1 steps the phase
+MUL_PHASE = [ins("SETRWC", bit_mask=0b0111)] + [ins("ELWMUL", addr_mode=int(i == 7)) for i in range(8)]
+MATH_RUNS = {"mm": matmul_phase(), "mmT": matmul_phase(True),
+             "mul": MUL_PHASE} | {u: body for u, (_, body) in SFPU.items()} | COMBINE
 
 def allocate(names):
   """Assign runs to the math thread's replay buffer, as {name: (index, words recorded)}. Prioritize SFPU bodies
@@ -539,15 +603,18 @@ def run(slots, name, count=None):  # the first count words of a run: a REPLAY of
   if name not in slots: return words
   at, n = slots[name]
   return [replay(at, min(n, len(words)))] + words[n:]
-def runs(slots, name, times): return [Loop(times, run(slots, name))]  # a C loop is fine, since the math TRISC runs ahead of its pushes
-def math_runs(slots): return [w for name, (at, n) in slots.items() for w in record(at, MATH_RUNS[name][:n])]  # recorded at setup
+# a C loop is fine, since the math TRISC runs ahead of its pushes
+def runs(slots, name, times): return [Loop(times, run(slots, name))]
+# recorded at setup
+def math_runs(slots): return [w for name, (at, n) in slots.items() for w in record(at, MATH_RUNS[name][:n])]
 
 def release(word):  # the same ELW*/MVMUL with clear_dvalid set, so both Src banks go back to the unpackers
   first, width = bh.TENSIX_OPS["MVMUL"][1]["clear_dvalid"]
   return word | ((1 << width) - 1) << first
 def phased(slots, name, phases):  # a run of MATH_RUNS for each fidelity phase. its last word releases both Src banks
   words = MATH_RUNS[name]
-  return [ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1) + [release(words[-1])]
+  return ([ins("SETRWC", bit_mask=0b1111)] + run(slots, name) * (phases - 1) + run(slots, name, len(words) - 1)
+          + [release(words[-1])])
 # The address mode slots that the walk of a transposed B rewrites (see matmul_phase), as (SrcA step, SrcB step). The
 # rest of the time they hold what ADDR_MODES says.
 TRANSPOSED = {4: (32, 0), 5: (32, 8), 6: (48, 8), 2: (16, 8)}
@@ -585,7 +652,8 @@ def reduce_step(kind, slots, acc, first, edge=0, src=None):
   put = lambda d: fill(src, row + d) + FILLED if src is not None else elementwise("add", slots, dst=d)
   if first: return take(sem) + aim(row) + put(0) + mask(0)
   return aim(row) + put(128) + mask(128) + SFPU_START + runs(slots, kind, 32)
-def reduce_finish(kind, slots, acc, posts):  # folds across the tile and runs the SFPU ops on the result, before MATH_END
+# folds across the tile and runs the SFPU ops on the result, before MATH_END
+def reduce_finish(kind, slots, acc, posts):
   return [DST_FREE, *aim(ACCS[acc][0])] + ACROSS[FOLDS[kind]](kind) + sfpu(posts, slots)
 
 def sfpu(posts, slots):  # runs the SFPU ops in order, over the Dst half that the FPU has written
@@ -617,7 +685,8 @@ static void row_down(unsigned tile, unsigned item) {
   copy(tile, tile + 2 * face, 2 * face);
   noc_wait();
 }"""
-def tile_of(i, b, r, c, a="a"): return f"({b}) * {a}[{i} + 1] + ({r}) * {a}[{i} + 2] + ({c}) + {a}[{i} + 3]"  # tile (b, r, c) of the tensor at a[i]
+# tile (b, r, c) of the tensor at a[i]
+def tile_of(i, b, r, c, a="a"): return f"({b}) * {a}[{i} + 1] + ({r}) * {a}[{i} + 2] + ({c}) + {a}[{i} + 3]"
 
 def tt(words):
   """C for a TRISC that pushes words to its thread as .ttinsn instructions. Each word is rotated left by 2 and written
@@ -632,7 +701,8 @@ def tt(words):
     if pending: c.append(f'asm volatile(".word {", ".join(pending)}" ::: "memory");')
     pending = []
     if isinstance(w, tuple): c.append(f"push_word({w[0]:#x} + ({w[1]}));")
-    elif w is not None: c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
+    elif w is not None:
+      c.append(f'_Pragma("clang loop unroll(disable)") for (unsigned r_ = 0; r_ < {w.times}; r_++) {{ {tt(w)} }}')
   return " ".join(c)
 
 FLAGS_B = 16  # FLAGS has A's flags, for the workers in a grid row, then from here B's, for the workers in a grid column
@@ -682,7 +752,8 @@ static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} 
 KMAIN = "void kmain(volatile unsigned *args) {\n  const unsigned *a = (const unsigned *)args;"
 def _pushes(words): return " ".join(f"push_word({w:#x});" for w in words)  # unrolled, with no table to load from
 
-def brisc_program(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0, wt="bfp8", outs=OUTS, b8_at=None, near=False):
+def brisc_program(total, body, dtype="bf16", out="bf16", decls="", tail="", b8=0, wt="bfp8", outs=OUTS, b8_at=None,
+                  near=False):
   # BRISC reads inputs into L1 before unpacking and writes results to DRAM after packing.
   #   decls: statics and tables that the body needs. tail: the body's last words.
   #   b8: slots of block floats wt, a matmul's B, at b8_at (B8 by default).

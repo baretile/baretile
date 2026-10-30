@@ -39,7 +39,8 @@ class Chip:
     bad = [b for b, s in zip(self.banks, training()) if s != 1]
     if bad: raise RuntimeError(f"GDDR banks {bad} failed training (UMD retrains with ARC message 0xB6)")
 
-  def raw(self, x, y): return (x if y < 2 else self.noc_x[x]), self.noc_y[y]  # tile (x, y) on the raw NoC0 grid, for bh.hops
+  # tile (x, y) on the raw NoC0 grid, for bh.hops
+  def raw(self, x, y): return (x if y < 2 else self.noc_x[x]), self.noc_y[y]
 
   def map(self, x, y, addr, start=None, tlb=None):
     """Map the 2 MiB block containing (x, y, addr) and return its BAR0 offset. With start, writes multicast
@@ -51,7 +52,8 @@ class Chip:
         if (free := next(self.free_tlbs, None)) is None: raise RuntimeError(f"all {bh.TLB_COUNT} TLBs are taken")
         self.kept[x, y, base, start] = free
       tlb = self.kept[x, y, base, start]
-    mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
+    mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1,
+                                          vc_class=bh.MCAST_VC)
     if not 0 <= tlb < bh.TLB_COUNT: raise ValueError(f"TLB index must be in [0, {bh.TLB_COUNT})")
     self.pci.tlb(tlb, dict(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast))
     if tlb == 0: self.target = (x, y, base, start)
@@ -62,7 +64,8 @@ class Chip:
     if self.target != (x, y, base, start): self.map(x, y, base, start, 0)
     return addr - base
 
-  def chunks(self, x, y, addr, n, start=None):  # [addr, addr+n) as (BAR0 offset, size) pieces, split where the window moves
+  # [addr, addr+n) as (BAR0 offset, size) pieces, split where the window moves
+  def chunks(self, x, y, addr, n, start=None):
     if addr < 0 or n < 0: raise ValueError("addresses and transfer sizes must be nonnegative")
     while n:
       size = min(n, bh.TLB_WINDOW - addr % bh.TLB_WINDOW)
@@ -119,7 +122,8 @@ class Chip:
     vals = struct.unpack(f"<{n}I", self.read(x, y, values, 4 * n))
     return {t & 0xFFFF: vals[t >> 16] for t in tags}
 
-  def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)  # hold BRISC, NCRISC and the TRISCs in reset
+  # hold BRISC, NCRISC and the TRISCs in reset
+  def halt(self, x, y, start=None): self.write32(x, y, bh.SOFT_RESET, bh.ALL_CORES, start)
 
   def links(self):
     """Return (ASIC id, links), where links maps a channel to (peer ASIC id, peer channel). Include links that
@@ -137,22 +141,27 @@ class Chip:
     still be reading src when this returns. Leave src unchanged until the queue is free; the next send waits
     for it."""
     (x, y), reg = bh.ETH[ch], lambda name: bh.ETH_TXQ0 + bh.ETH_TXQ[name]
-    if not (min(src, dst) >= 0 and n > 0 and src % 16 == dst % 16 == n % 16 == 0 and max(src, dst) + n <= bh.ETH_FIRMWARE):
+    if not (min(src, dst) >= 0 and n > 0 and src % 16 == dst % 16 == n % 16 == 0
+            and max(src, dst) + n <= bh.ETH_FIRMWARE):
       raise ValueError("Ethernet addresses and size must be 16-byte aligned and stay below firmware L1")
-    def free():  # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)
+    # the busy bit of STATUS is wrong if polled too soon after a send, so read another register first (BH-55)
+    def free():
       self.read32(x, y, reg("CMD"))
       return not self.read32(x, y, reg("STATUS")) & bh.ETH_BUSY
     self.wait(free, f"free Ethernet channel {ch}'s TX queue", timeout)
-    for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)): self.write32(x, y, reg(name), v)
+    for name, v in (("START", src), ("SIZE", n), ("DEST", dst), ("CMD", bh.ETH_TT_L1_WRITE)):
+      self.write32(x, y, reg(name), v)
 
 def check():
   """Check what baretile needs, without opening the device: clang and lld to build kernels, NumPy for the models, and
   the simulator or a card, which pci.preflight checks. Return [(level, message)], where level is "ok", "warn" or
   "fail". baretile can't run after a fail."""
-  targets = subprocess.run(["clang", "--print-targets"], capture_output=True, text=True).stdout if shutil.which("clang") else ""
+  targets = subprocess.run(["clang", "--print-targets"], capture_output=True,
+                           text=True).stdout if shutil.which("clang") else ""
   found = [("ok", "clang builds for RISC-V") if "riscv32" in targets else
            ("fail", "baretile builds kernels with clang for riscv32. Install clang, with its RISC-V target"),
-           ("ok", "ld.lld links the kernels") if shutil.which("ld.lld") else ("fail", "ld.lld isn't on PATH. Install lld"),
+           ("ok", "ld.lld links the kernels") if shutil.which("ld.lld") else
+           ("fail", "ld.lld isn't on PATH. Install lld"),
            ("ok", "NumPy is there for baretile.models") if importlib.util.find_spec("numpy") else
            ("warn", "baretile.models needs NumPy: pip install 'baretile[models]'")]
   if path := pci.simulator():
@@ -171,7 +180,8 @@ def check():
 if __name__ == "__main__":
   import os, sys
   command = sys.argv[1] if len(sys.argv) > 1 else None
-  if command not in (None, "check", "ttsim", "release", "reset"): sys.exit("usage: python3 -m baretile.chip [check | ttsim | release | reset]")
+  if command not in (None, "check", "ttsim", "release", "reset"):
+    sys.exit("usage: python3 -m baretile.chip [check | ttsim | release | reset]")
   if command in ("release", "reset") and "TTSIM" in os.environ:
     sys.exit(f"{command} is for a card. ttsim has no driver, and a new process starts it fresh")
   if command == "ttsim":
@@ -192,6 +202,8 @@ if __name__ == "__main__":
   chip = Chip(dev, 300 if reset else 2)
   t = chip.telemetry()
   fw = ".".join(str(t.get(bh.TAG_FIRMWARE, 0) >> s & 255) for s in (24, 16, 8))
-  print(f"{getattr(dev, 'sys', 'ttsim')}: firmware bundle {fw}. ARC is up and Tensix is powered. The AI clock is {t.get(bh.TAG_AICLK, 0)} MHz. "
-        f"{len(chip.tensix)} Tensix tiles in raw columns {sorted({chip.raw(x, y)[0] for x, y in chip.tensix})}. DRAM banks {chip.banks} trained.")
+  print(f"{getattr(dev, 'sys', 'ttsim')}: firmware bundle {fw}. ARC is up and Tensix is powered. "
+        f"The AI clock is {t.get(bh.TAG_AICLK, 0)} MHz. "
+        f"{len(chip.tensix)} Tensix tiles in raw columns {sorted({chip.raw(x, y)[0] for x, y in chip.tensix})}. "
+        f"DRAM banks {chip.banks} trained.")
   print("telemetry:", " ".join(f"{tag}={value:#x}" for tag, value in sorted(t.items())))
