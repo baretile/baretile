@@ -41,6 +41,11 @@ hangs.
 - Docs that stay true. If your change alters how something works, update the page
   in [docs/](docs) that describes it. The tests run the README's Python examples
   and check the docs' links.
+- A pull request that says what you ran and what it printed.
+
+You're responsible for every line you send, however you wrote it. We close
+pull requests that weren't run, or that read as generated and unreviewed, even
+small ones. Before you start on something large, say so in its issue.
 
 ## How the code is organized
 
