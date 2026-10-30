@@ -1191,6 +1191,21 @@ def test_readme_examples():
   workers = lambda text: re.sub(r"^\d+ Tensix workers", "N Tensix workers", text.strip())
   assert out.returncode == 0 and workers(out.stdout) == workers(said), out.stdout + out.stderr
 
+def test_website_commands_match_readme():
+  # Commands shown on the homepage must also appear in the canonical README instructions.
+  root = pathlib.Path(__file__).parent.parent
+  homepage = (root / "website/public/index.html").read_text()
+  readme = (root / "README.md").read_text()
+  commands = [
+    "python3 -m baretile.chip ttsim",
+    "python3 -m baretile.chip check",
+    "python3 -m baretile.chip",
+    "python3 -m baretile.hello",
+    "python3 -m pip install 'baretile[models]'",
+  ]
+  missing = [command for command in commands if command not in homepage or command not in readme]
+  assert not missing, f"website and README differ on commands: {missing}"
+
 def test_doc_links():
   # Each link in the Markdown files to a file of the repository, by a relative path or on GitHub's main branch, finds
   # the file, and each #anchor in one finds a heading there, as GitHub makes them. Links in code blocks don't count.
