@@ -30,6 +30,8 @@
   #kernel h2 { font-size: 13px; margin: 0 0 4px; word-break: break-all; }
   #kernel p { margin: 0 0 4px; }
   #kernel pre { margin: 14px 0 0; white-space: pre-wrap; word-break: break-all; color: var(--dim); }
+  #kernel details { margin-top: 10px; } #kernel summary { cursor: pointer; color: var(--dim); }
+  #kernel details pre { margin-top: 6px; white-space: pre; word-break: normal; overflow-x: auto; color: var(--text); }
   svg { display: block; margin-top: 14px; }
   svg text { fill: var(--text); font: 12px ui-monospace, "SF Mono", Menlo, Consolas, monospace; text-anchor: middle; }
   svg text.dim { fill: var(--dim); }
@@ -77,6 +79,8 @@ function pick(i) {
     `${num(k.cycles)} cycles${k.bytes != null ? `, ${num(k.bytes)} bytes read` : ""}</p>`;
   if (k.graph) h += `<p class="dim">fused kernel: computes in ${k.dtype}${k.out != k.dtype ? `, writes ${k.out}` : ""}, ${k.units} work unit${k.units > 1 ? "s" : ""}</p>` + graph(k.graph);
   h += k.text ? `<pre>${esc(k.text)}</pre>` : `<p class="dim">No expression or cache key is available for this kernel.</p>`;
+  for (const [core, src] of k.programs || []) h += `<details><summary>${core.toUpperCase()} program</summary><pre>${esc(src)}</pre></details>`;
+  if (k.programs && !k.programs.length) h += `<p class="dim">This kernel's C programs weren't compiled in this process.</p>`;
   $("kernel").innerHTML = h;
   draw();
 }

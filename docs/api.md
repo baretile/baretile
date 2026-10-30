@@ -24,6 +24,7 @@ a P150a.
 | `chip.Chip`: `links`, `send` | Ethernet links to another chip | experimental |
 | `runtime.Runtime`: the constructor, `launch`, `wait`, `close`, `closed`, `profile`, `args`, `dram_alloc`, `dram_free` | Workers, launches and DRAM | stable |
 | `runtime.compile_kernel`, `runtime.compile_rv32`, and the C helpers in `runtime.DEVICE` | Building your own kernels | experimental |
+| `BARETILE_DUMP` and `runtime.PROGRAMS` | The C programs of each kernel, written to a folder or kept by image | experimental |
 | `tensor.Tensor`: its constructors, operations, movement, `cast`, `realize`, `assign`, `tolist`, `tobytes`, `backward` and `gradient` | Tensors | stable |
 | `Tensor.to`, `Tensor.columns`, `Tensor.run` | Moving to another chip, storage by tile columns, launching a kernel | experimental |
 | `tensor.jit` | Recording and replaying a function's launches | stable |

@@ -114,7 +114,7 @@ def test_gather_shared_indices(chip):
 def test_viz(chip, tmp_path):
   # viz.save records completed launches and compiler details. A shared subexpression gets one graph node,
   # even when a reduction recomputes it on several passes. Matmul's B node describes its read mode.
-  # A custom kernel absent from tensor.kernels has launch statistics but no expression graph.
+  # A custom kernel absent from tensor.kernels has launch statistics but no expression graph. Each kernel has its C programs.
   rt = Runtime(chip)
   x = Tensor.of(rt, [[float(c % 5) for c in range(64)] for _ in range(32)])
   since = rt.launches
@@ -132,6 +132,8 @@ def test_viz(chip, tmp_path):
                               ["recip", "", [4]], ["mul", "", [3, 5]]]
   assert matmul["graph"] == [["in 0", "1x32x64", []], ["read B", "transposed", [0]], ["matmul", "", [0, 1]]]
   assert "graph" not in empty and "text" not in empty and empty["launches"] == 1
+  assert [core for core, _ in softmax["programs"]] == ["brisc", "trisc0", "trisc1", "trisc2"]
+  assert empty["programs"] == [["brisc", "void kmain(volatile unsigned *a) {}"]], "each core's C, as compile_kernel was given it"
 
 @pytest.mark.skipif(pci.simulator() is None, reason="the script opens the device again, and a card can't be open in two processes")
 def test_viz_script(tmp_path):

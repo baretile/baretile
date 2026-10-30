@@ -1,7 +1,7 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
 import ast, collections, ctypes, gc, hashlib, io, math, mmap, os, pathlib, random, re, shutil, struct, subprocess, sys, threading, time, tokenize
 import weakref, pytest
-from baretile import bh, pci
+from baretile import bh, pci, runtime
 from baretile.chip import check
 from baretile.hello import hello
 from baretile.runtime import DATA, KERNELS, MAILBOX, MCAST_STATE, Runtime, compile_kernel
@@ -905,6 +905,26 @@ def test_runtime_inputs(chip):
   with pytest.raises(ValueError, match="command"): rt.launch(bytes(16), (0,) * 20)
   assert not rt.loaded and not rt.launches
   with pytest.raises(ValueError, match="never queued"): rt.wait(launch=1)
+
+def test_dump(chip, tmp_path, monkeypatch):
+  # With DUMP set, a runtime writes each kernel it launches once, a file for each core that has a program. With
+  # device.h in place of its first line, each file is what clang compiled for that core: compile_rv32 makes the program
+  # that sits at the core's entry in the image.
+  monkeypatch.setattr(runtime, "DUMP", str(tmp_path))
+  rt = Runtime(chip)
+  kernel = compile_kernel("void kmain(volatile unsigned *a) { *(volatile unsigned *)a[2] = 1; }", None, "void kmain(volatile unsigned *a) {}")
+  for _ in range(2): rt.launch(kernel, (DATA,), name="dump test")
+  rt.wait()
+  [at] = [d for d in tmp_path.iterdir() if d.is_dir()]
+  assert at.name == f"dump-test-{hashlib.sha256(kernel).hexdigest()[:8]}" and sorted(f.name for f in at.iterdir()) == ["brisc.c", "trisc1.c"]
+  device = (tmp_path / "device.h").read_text()
+  assert device.startswith(runtime.DEVICE)
+  entries = struct.unpack_from("<4I", kernel)
+  for core, entry in (("brisc", entries[0]), ("trisc1", entries[2])):
+    first, rest = (at / f"{core}.c").read_text().split("\n", 1)
+    assert first == '#include "../device.h"'
+    program = runtime.compile_rv32((device + rest).removeprefix(runtime.DEVICE))
+    assert kernel[entry:entry + len(program)] == program, core
 
 def test_hung_kernel_times_out(chip):
   # A timeout reports unfinished workers, active cores, synchronization counters and outstanding NoC requests.

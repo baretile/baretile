@@ -1,8 +1,8 @@
 # Testing and debugging
 
 Every part of baretile has a test that runs on ttsim. This page covers running
-the tests, the optional checks that need models or other packages, and what to
-do when a kernel hangs.
+the tests, the optional checks that need models or other packages, how to read
+the programs a kernel runs, and what to do when a kernel hangs.
 
 ## Running the tests
 
@@ -172,6 +172,26 @@ so this doesn't check the waits for them.
 The patch also implements the NIU counter for bytes received by reads.
 `pci.Sim.counts` detects the patched library. Released ttsim doesn't support that
 counter, so profiles from it report `None` for bytes.
+
+## Reading a kernel's programs
+
+A kernel is up to four C programs, one each for BRISC and the three TRISCs,
+which Python writes for each kernel it builds. To read the programs a script
+ran, set `BARETILE_DUMP` to a folder:
+
+```sh
+BARETILE_DUMP=kernels python3 ramps/1_tensors.py
+```
+
+Each kernel a runtime launches is written there once, in a folder named after
+the kernel and a hash of its image, such as `matmul-relu-1a2b3c4d/`. It has a
+`.c` file for each core with a program. Every file starts by including
+`device.h`, which holds the helpers that baretile puts before each program, so
+with `device.h` pasted in its place, a file is exactly what clang compiled.
+Diffing two dumps shows what a change did to the generated code.
+
+The [launch viewer](runtime.md#profiling) shows the same programs for the
+kernel you select.
 
 ## When a launch hangs
 
