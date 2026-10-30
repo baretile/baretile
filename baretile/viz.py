@@ -1,11 +1,11 @@
-# Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings and
-# graphs of fused expressions. It contains its own data and needs a browser with JavaScript enabled.
+# Run a script and write its completed launches to viz.html. The page shows a timeline, kernel timings, graphs of
+# fused expressions and each kernel's C programs. It contains its own data and needs a browser with JavaScript enabled.
 #   TTSIM=/path/to/libttsim.so python3 -m baretile.viz script.py [args], or -m module [args]
 # The page includes the runtimes still open when the script ends. Closing a runtime, or replacing it with an
 # overlapping one, discards its launch records.
 import json, pathlib, runpy, struct, sys
 from baretile import pci, tensor
-from baretile.runtime import TIMES, Runtime
+from baretile.runtime import CORES, PROGRAMS, TIMES, Runtime
 
 def save(path, *runtimes, since=0):
   """Write completed launches after since for each runtime, limited to its last TIMES launch records.
@@ -25,7 +25,9 @@ def _runtime(rt, since, made):
     last = go
     if image not in index:
       index[image] = len(kernels)
-      kernels.append(dict(name=name, launches=0, cycles=0, bytes=0 if rt.counts else None) | _kernel(*made.get(image, (None, None))))
+      programs = [[core, src] for core, src in zip(CORES, PROGRAMS.get(image, ())) if src]  # the C each core ran
+      kernels.append(dict(name=name, launches=0, cycles=0, bytes=0 if rt.counts else None, programs=programs) |
+                     _kernel(*made.get(image, (None, None))))
     k = kernels[index[image]]
     k["launches"], k["cycles"] = k["launches"] + 1, k["cycles"] + (end - go) % 2**32
     if rt.counts: k["bytes"] += 64 * flits

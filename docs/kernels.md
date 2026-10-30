@@ -68,3 +68,5 @@ fusion of many operations, reductions over several passes, matmuls that stream
 B, and block floats. `transpose_kernel` is the closest to this one.
 [Compiler](compiler.md) explains the counters and semaphores they use, and
 `tensix.py` has the instructions.
+To read the C that `kernels.py` generates for an operation, run it with
+[`BARETILE_DUMP`](testing.md#reading-a-kernels-programs) set.

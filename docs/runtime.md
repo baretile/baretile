@@ -210,7 +210,9 @@ distinct subexpression appears once in the graph. Reductions can still compute
 that subexpression on several passes. Comparing graphs can reveal repeated
 matmuls, but the page doesn't track shared tensors between kernels. A kernel
 made by `Tensor.run` shows its cache key. A kernel absent from the tensor cache,
-such as a custom C kernel, shows only its launch statistics.
+such as a custom C kernel, has no expression or key to show. Every kernel compiled
+in the same process also shows its C programs, one per core, as
+[`BARETILE_DUMP`](testing.md#reading-a-kernels-programs) writes them.
 
 The runtime keeps the last 1,024 launch records. The page includes the completed
 launches still in that history. Launch arguments are plain numbers, so the

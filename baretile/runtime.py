@@ -186,19 +186,45 @@ __attribute__((section(".start"))) void kentry(volatile unsigned *args) {
 }
 """
 
+CORES = ("brisc", "trisc0", "trisc1", "trisc2")  # a kernel's programs, in the order compile_kernel takes them
+PROGRAMS = {}  # each image that compile_kernel built in this process: its four programs, None for an idle core
+
 def compile_kernel(*programs):
   """Build an image from C programs for BRISC and TRISC0-2, in that order. Each program defines void
   kmain(volatile unsigned *args). Omitted or None programs leave that core idle. The header gives four entry
   offsets, with 0 for an absent program, followed by the programs. The image can run at any load address;
-  absolute address initializers are rejected during compilation."""
+  absolute address initializers are rejected during compilation. PROGRAMS keeps the programs by image."""
   if len(programs) > 4: raise ValueError("a kernel has at most four programs: BRISC and TRISC0-2")
-  image, entry = b"", []
-  for src in programs + (None,) * (4 - len(programs)):
-    entry.append(16 + len(image) if src else 0)
+  programs, body, entry = programs + (None,) * (4 - len(programs)), b"", []
+  for src in programs:
+    entry.append(16 + len(body) if src else 0)
     if src:
       program = compile_rv32(KENTRY + src)
-      image += program.ljust(-(-len(program) // 16) * 16, b"\0")
-  return struct.pack("<4I", *entry) + image
+      body += program.ljust(-(-len(program) // 16) * 16, b"\0")
+  image = struct.pack("<4I", *entry) + body
+  PROGRAMS[image] = programs
+  return image
+
+# With BARETILE_DUMP set to a folder, a runtime writes each kernel it launches there once, as <name>-<hash>/ with a
+# .c file for each core that has a program. Each file includes ../device.h, which holds DEVICE and KENTRY, so with
+# device.h in place of its first line, a file is exactly what clang compiled for that core.
+DUMP = os.environ.get("BARETILE_DUMP")
+_dumped = set()  # (folder, image) pairs written in this process
+
+def dump(folder, kernel, name):
+  """Write kernel's programs into folder, named by name and a hash of the image, unless this process already
+  has. An image that compile_kernel didn't build in this process has no programs to write."""
+  if (folder, kernel) in _dumped or kernel not in PROGRAMS: return
+  root = pathlib.Path(folder)
+  if not any(f == folder for f, _ in _dumped):  # once per process, so the helpers are this baretile's
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "device.h").write_text(DEVICE + KENTRY)
+  label = "".join(c if c.isalnum() or c in "._" else "-" for c in name or "kernel")[:60]
+  at = root / f"{label}-{hashlib.sha256(kernel).hexdigest()[:8]}"
+  at.mkdir(exist_ok=True)
+  for core, src in zip(CORES, PROGRAMS[kernel]):
+    if src: (at / f"{core}.c").write_text('#include "../device.h"\n' + src)
+  _dumped.add((folder, kernel))
 
 # the first words of firmware. BRISC starts at 0, and TRISC i at its reset PC, 4 + 4i
 def jumps(brisc, trisc0, trisc1, trisc2):
@@ -602,6 +628,7 @@ class Runtime:
       if cmds and self.evicts(kernel): self.send(b"".join(cmds), sent); cmds, sent = [], []
       cmd, n = self.command(kernel, args, units)
       cmds.append(cmd); sent.append((name, n, kernel))
+      if DUMP: dump(DUMP, kernel, name)
     return b"".join(cmds), sent
 
   def command(self, kernel, args, units):  # a launch as the ring holds it: its bytes, and how many workers it takes
