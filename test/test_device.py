@@ -1,5 +1,6 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
-import ast, collections, ctypes, gc, hashlib, mmap, os, pathlib, random, shutil, struct, subprocess, sys, threading, time, weakref, pytest
+import ast, collections, ctypes, gc, hashlib, io, math, mmap, os, pathlib, random, re, shutil, struct, subprocess, sys, threading, time, tokenize
+import weakref, pytest
 from baretile import bh, pci
 from baretile.chip import check
 from baretile.hello import hello
@@ -38,6 +39,28 @@ def test_layers():
   for p in trees:
     theirs = {name for q in trees if q != p for name in defined[q] if private(name)} - defined[p]
     assert not used[p] & theirs, f"{p.name} uses another file's private {sorted(used[p] & theirs)}"
+
+CORE, BUDGET, WIDTH = ("bh", "pci", "chip", "runtime", "tensix", "kernels", "tensor"), 4500, 120  # layers 0 to 3
+
+def code_lines(text, width=WIDTH):
+  """Count the lines of code in Python source: not its comments, blank lines or docstrings. A line counts once for
+  each width characters it takes, so making lines longer doesn't make the count smaller. C in a string is code."""
+  docs = {i for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)) and ast.get_docstring(n) is not None
+          for i in range(n.body[0].lineno, n.body[0].end_lineno + 1)}
+  comments = {t.start[0]: t.start[1] for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type == tokenize.COMMENT}
+  return sum(math.ceil(len(code) / width) for i, line in enumerate(text.splitlines(), 1)
+             if i not in docs and (code := line[:comments.get(i, len(line))].rstrip()))
+
+def test_size():
+  # The core, from the PCIe driver to Tensor, stays under its budget, and the README says what that is. Long lines and
+  # comments can't move the count: lines count by width, and comments and docstrings don't count.
+  root = pathlib.Path(__file__).parent.parent
+  sample = ["x = 1  # a comment", "", "def f():", "  'what f does'", "  s = '#define ONE 1'  # C in a string is code",
+            "  return " + " + ".join("1" * 60)]
+  assert code_lines("\n".join(sample)) == 1 + 1 + 1 + 3, "the return takes 246 columns, so three lines"
+  lines = sum(code_lines((root / "baretile" / f"{m}.py").read_text()) for m in CORE)
+  assert lines <= BUDGET, f"the core is {lines:,} lines at {WIDTH} columns, over its budget of {BUDGET:,}. Remove or reuse something first"
+  assert re.search(rf"under {BUDGET:,} lines of code at {WIDTH} columns", (root / "README.md").read_text()), "the README states the budget"
 
 def test_open_device(chip):
   # A device has one opener at a time, since two Chips on one chip would hand out the same TLBs and DRAM.

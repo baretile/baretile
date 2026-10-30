@@ -52,6 +52,15 @@ If only one workload uses a kernel, that kernel lives in layer 4 next to the
 workload. It moves down when a second workload needs it. No file uses another
 file's private names.
 
+The models are the core's first users, so they show whether it's good to build
+on. They use only what [the public API](docs/api.md) lists. When a model needs
+something else, the core gains a public name for it, or the code stays with the
+model.
+
+Layers 0 to 3 stay under 4,500 lines of code at 120 columns, not counting
+comments and docstrings, and `test_size` checks it. A line counts once for each
+120 characters it takes, so a longer line doesn't make the count smaller.
+
 ## Style
 
 - Layers 0 to 3 use only the standard library. Layer 4 and the tests can use
