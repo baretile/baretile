@@ -56,7 +56,8 @@ python3 -m baretile.hello</code></pre>
 <pre tabindex="0" aria-label="Output"><code>119 Tensix workers computed fib(30) = {832040}, and one tile dispatched the work</code></pre>
 
 <p>With no card on the PCI bus, baretile uses the simulator.
-On a machine with a Blackhole, it opens the card, which needs root and takes the card away from its kernel driver.
+On a machine with a Blackhole, it opens the card through tt-kmd, Tenstorrent's kernel driver, without root.
+Without tt-kmd, it opens the card through sysfs, which needs root.
 Read <a href="https://github.com/baretile/baretile/blob/main/docs/bring-up.md">bring-up</a> before running on a card.</p>
 
 <h2>Tensors</h2>
