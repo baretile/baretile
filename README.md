@@ -13,6 +13,11 @@ in userspace, and baretile loads its own firmware onto the workers. It needs
 Tenstorrent's board firmware for ARC and Ethernet. There's no dependency on
 tt-metal, tt-umd or LLK.
 
+The core, from the PCIe driver to the tensors, is small enough for one person to
+read: under 4,500 lines of code at 120 columns, not counting comments and
+docstrings. `test_size` keeps it there, and the models, the server and the
+commands are on top of it.
+
 ## Try it
 
 You'll need Linux, Python 3.12 or later, and clang with a RISC-V target and lld.
