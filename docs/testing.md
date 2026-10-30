@@ -200,6 +200,13 @@ default. Its report identifies the current launch and unfinished workers. For
 up to four workers, it prints core status, synchronization counters, flags and
 outstanding NoC requests. On a card it also reads the program counters.
 
+The 60 seconds are wall time, on ttsim too, where a launch takes as long as the
+simulator needs to run it. A large launch, such as a big model's output layer,
+or a machine that's busy with other simulators, can make a launch take longer
+without hanging. A real hang shows the same counters in reports a minute apart.
+For long checks, run one simulator at a time, or pass a longer timeout to
+`wait()`.
+
 If a worker never received `go`, check dispatch and multicast first. If the
 workers finished but the host is still waiting, check their atomic reports and
 the status write to host memory. A read ID that's still outstanding means a
