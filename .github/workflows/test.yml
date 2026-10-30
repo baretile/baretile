@@ -1,9 +1,16 @@
-# For every push and pull request: build and check the wheel on Python 3.12 to 3.14, run ruff and the test suite on
-# ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. The suite on ttsim includes the
-# adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or tiktoken
-# skip themselves here.
+# For every pull request and every push to main: build and check the wheel on Python 3.12 to 3.14, run ruff and the
+# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. The suite on ttsim
+# includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or
+# tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a newer push to it cancels
+# the run still going.
 name: test
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
