@@ -317,7 +317,9 @@ Settings go after the files as `key=value`. Run the command with no arguments to
 list them. Every 250 steps it reports the validation loss over the same 20
 sequences of the second file, and `log` writes each step's numbers as a line of
 JSON. On ttsim, try a small model, such as `layers=2 dim=64 heads=2 ctx=32
-accum=2 steps=10`.
+accum=2 steps=10 warmup=2`, with a short warmup so the rate rises within its
+steps. A step of that model takes about half a minute on ttsim v1.11.5, most of
+it the output layer over the 50,304-token vocabulary.
 
 `test_train_gpt2` trains a small GPT-2 this way on a counting sequence. At each
 step, the loss and gradients must match PyTorch's on the same weights and
