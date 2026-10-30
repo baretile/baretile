@@ -1,5 +1,5 @@
 # Device and runtime tests (layers 0 and 1), plus import and layer checks. See conftest.py for simulator setup.
-import ast, collections, ctypes, gc, hashlib, mmap, os, pathlib, random, shutil, struct, sys, threading, time, weakref, pytest
+import ast, collections, ctypes, gc, hashlib, mmap, os, pathlib, random, shutil, struct, subprocess, sys, threading, time, weakref, pytest
 from baretile import bh, pci
 from baretile.chip import check
 from baretile.hello import hello
@@ -252,30 +252,126 @@ def test_card_sysfs(tmp_path, monkeypatch):
   assert (dev / "remove").read_text() == "1" and (tmp_path / "rescan").read_text() == "1"
 
 def test_preflight(tmp_path, monkeypatch):
-  # preflight reads what Card needs from a fake sysfs: root, an IOMMU that passes addresses through, a free hugepage,
-  # the PCIe link at the card's best, and who drives the card, with tt-kmd's firmware version. Each problem shows.
+  # preflight reads what opening a card needs from a fake sysfs. With tt-kmd driving it, that's its device file, which
+  # this user can open, and memory to pin for DMA: an IOMMU that translates, or a hugepage. Without tt-kmd, it's root,
+  # an IOMMU that passes addresses through, and a free hugepage. Both check the PCIe link, and each problem shows.
   bdf = "0000:01:00.0"
-  dev, kmd, pages = tmp_path / "devices" / bdf, tmp_path / "drivers" / pci.DRIVER, tmp_path / "hugepages"
-  for d in (dev / "iommu_group", dev / "tenstorrent" / "tenstorrent!0", kmd, pages): d.mkdir(parents=True)
-  (dev / "driver").symlink_to(kmd)
+  dev, pages, module, files = tmp_path / "devices" / bdf, tmp_path / "hugepages", tmp_path / "module", tmp_path / "dev"
+  for d in (dev / "iommu_group", dev / "tenstorrent" / "tenstorrent!0", pages, module, files): d.mkdir(parents=True)
   for name, text in (("iommu_group/type", "identity\n"), ("current_link_speed", "32.0 GT/s PCIe\n"), ("current_link_width", "16\n"),
                      ("max_link_speed", "32.0 GT/s PCIe\n"), ("max_link_width", "16\n"),
                      ("tenstorrent/tenstorrent!0/tt_fw_bundle_ver", "18.12.0.0\n")):
     (dev / name).write_text(text)
   (pages / "free_hugepages").write_text("4\n")
-  monkeypatch.setattr(pci, "SYS", str(tmp_path))
-  monkeypatch.setattr(pci, "HUGEPAGES", str(pages))
-  monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
+  (module / "version").write_text("2.11.0\n")
+  (files / "0").write_text("")
+  for name, value in (("SYS", str(tmp_path)), ("HUGEPAGES", str(pages)), ("MODULE", str(module)), ("DEV", str(files))):
+    monkeypatch.setattr(pci, name, value)
+  monkeypatch.setattr(pci.os, "geteuid", lambda: 1000)
+  assert pci.kmd_device(bdf) == f"{files}/0"
   found = pci.preflight(bdf)
   assert {level for level, _ in found} == {"ok"}, found
   text = " ".join(message for _, message in found)
-  assert all(s in text for s in ("4 free", "32.0 GT/s PCIe x16", "tenstorrent drives", "18.12.0.0")), text
+  assert all(s in text for s in ("tt-kmd 2.11.0", "without root", "4 free", "32.0 GT/s PCIe x16", "18.12.0.0")), text
+  (pages / "free_hugepages").write_text("0\n")
+  assert [level for level, _ in pci.preflight(bdf)].count("fail") == 1, "no IOMMU translating and no hugepage to pin"
+  (dev / "iommu_group/type").write_text("DMA\n")
+  monkeypatch.setattr(pci.os, "access", lambda path, mode: False)
+  levels = collections.Counter(level for level, _ in pci.preflight(bdf))
+  assert levels == {"fail": 1, "ok": 4}, levels  # the IOMMU maps the pinned memory, but the device file is out of reach
+  # Without tt-kmd, through sysfs as root
+  monkeypatch.undo()
+  for name, value in (("SYS", str(tmp_path)), ("HUGEPAGES", str(pages))): monkeypatch.setattr(pci, name, value)
+  shutil.rmtree(dev / "tenstorrent")
+  (tmp_path / "drivers" / "vfio-pci").mkdir(parents=True)
+  (dev / "driver").symlink_to(tmp_path / "drivers" / "vfio-pci")
+  (dev / "iommu_group/type").write_text("identity\n")
+  (pages / "free_hugepages").write_text("4\n")
+  monkeypatch.setattr(pci.os, "geteuid", lambda: 0)
+  assert pci.kmd_device(bdf) is None
+  found = pci.preflight(bdf)
+  assert {level for level, _ in found} == {"ok"}, found
+  assert "vfio-pci has the card" in " ".join(message for _, message in found)
   (dev / "current_link_width").write_text("8\n")
   (dev / "iommu_group/type").write_text("DMA\n")
   (pages / "free_hugepages").write_text("0\n")
   monkeypatch.setattr(pci.os, "geteuid", lambda: 1000)
   levels = collections.Counter(level for level, _ in pci.preflight(bdf))
-  assert levels == {"fail": 3, "warn": 1, "ok": 2}, levels
+  assert levels == {"fail": 3, "warn": 1, "ok": 1}, levels
+
+class FakeKmd:
+  """tt-kmd as Kmd sees it: a file for the device, BAR0 at its start and TLB windows after it, and ioctls that answer as
+  kmd's do. CONFIGURE_TLB writes the registers as kmd's blackhole.c does, without the static VC class."""
+  def __init__(self, tmp_path):
+    self.fd = os.memfd_create("tenstorrent")
+    os.ftruncate(self.fd, 1 << 30)  # BAR0's 512 MiB, then room for the windows; sparse, so nothing is written yet
+    self.path, self.tlbs, self.unpinned, self.polls = f"/proc/self/fd/{self.fd}", 0, [], 0
+  def ioctl(self, fd, request, buf):
+    name = {0xFA << 8 | n: name for name, n in pci.KMD.items()}[request]
+    if name == "QUERY_MAPPINGS": struct.pack_into("<IIQQ", buf, 8, pci.KMD_MAPPING_BAR0, 0, 0, 512 << 20)
+    elif name == "ALLOCATE_TLB":
+      self.tlbs += 1
+      struct.pack_into("<IIQQQ", buf, 16, self.tlbs, 0, (512 << 20) + self.tlbs * bh.TLB_WINDOW, 0, 0)
+    elif name == "CONFIGURE_TLB":
+      id, _, addr, x_end, y_end, x_start, y_start, noc, mcast, ordering, linked, static_vc = struct.unpack_from("<IIQ4H5B", buf)
+      reg = (addr >> 21 | x_end << 43 | y_end << 49 | x_start << 55 | y_start << 61 | noc << 67 | mcast << 69 | ordering << 70
+             | linked << 72 | static_vc << 73)
+      os.pwrite(self.fd, reg.to_bytes(12, "little"), bh.TLB_CONFIG + 12 * id)
+    elif name == "PIN_PAGES": struct.pack_into("<QQ", buf, 24, 0x1234000, 1 << 60 | 0x1234000)
+    elif name == "UNPIN_PAGES": self.unpinned.append(struct.unpack_from("<QQ", buf))
+    elif name == "SMC_MSG" and struct.unpack_from("<I", buf, 4)[0] == pci.KMD_SMC_POLL:
+      self.polls += 1
+      if self.polls == 1: raise BlockingIOError(11, "the message is still pending")
+      struct.pack_into("<8I", buf, 16, *range(8))
+    return 0
+
+def test_kmd(tmp_path, monkeypatch):
+  # Kmd maps BAR0 and the TLB windows kmd gives it, and reads and writes go to the right one. A window kmd configures has
+  # the 96 bits that Card writes, including the static VC class that CONFIGURE_TLB leaves out. Pinned DMA memory goes
+  # back when its memoryview does, and an ARC message waits for kmd's answer. One Kmd has a device at a time.
+  kmd = FakeKmd(tmp_path)
+  monkeypatch.setattr(pci.fcntl, "ioctl", kmd.ioctl)
+  card = pci.Kmd("0000:01:00.0", kmd.path)
+  with pytest.raises(RuntimeError, match="already open"): pci.Kmd("0000:01:00.0", kmd.path)
+  read_reg = lambda id: int.from_bytes(os.pread(kmd.fd, 12, bh.TLB_CONFIG + 12 * id), "little")
+  unicast = dict(addr=5, x_end=3, y_end=4, ordering=bh.STRICT)
+  multicast = unicast | dict(x_start=1, y_start=2, mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
+  card.tlb(7, unicast)
+  assert read_reg(1) == pci.tlb_config(**unicast)
+  card.tlb(9, multicast)
+  assert read_reg(2) == pci.tlb_config(**multicast), "the class bits that CONFIGURE_TLB leaves out"
+  card.tlb(7, multicast)
+  assert kmd.tlbs == 2 and read_reg(1) == pci.tlb_config(**multicast), "an index keeps its window"
+  card.write(9 * bh.TLB_WINDOW + 16, b"window 9")
+  assert os.pread(kmd.fd, 8, (512 << 20) + 2 * bh.TLB_WINDOW + 16) == b"window 9" and card.read(9 * bh.TLB_WINDOW + 16, 8) == b"window 9"
+  assert card.read(bh.TLB_CONFIG + 24, 12) == pci.tlb_config(**multicast).to_bytes(12, "little"), "registers above the windows"
+  with pytest.raises(ValueError, match="does not fit"): card.tlb(7, unicast | dict(x_end=64))
+  buf, address = card.alloc(64)
+  assert len(buf) == 64 and address == 1 << 60 | 0x1234000, "the NoC address kmd returns"
+  del buf
+  gc.collect()
+  assert len(kmd.unpinned) == 1 and kmd.unpinned[0][1] == 1 << 21
+  assert card.message(0x90) == tuple(range(8)) and kmd.polls == 2
+
+@pytest.mark.skipif("KMD_IOCTL" not in os.environ, reason="set KMD_IOCTL to tt-kmd's ioctl.h")
+def test_kmd_layouts(tmp_path):
+  # Each ioctl number and each member's offset in pci.KMD_ARGS match tt-kmd's ioctl.h, compiled by clang for this host,
+  # and each argument has the size that kmd expects.
+  lines = ["#include <stddef.h>", "#include <stdio.h>", f'#include "{os.environ["KMD_IOCTL"]}"', "int main(void) {"]
+  for name, (ctype, members) in pci.KMD_ARGS.items():
+    lines.append(f"  {{ typedef {ctype} T; printf(\"{name} %zu\\n\", sizeof(T));")
+    lines += [f'    printf("{name}.{member} %zu\\n", offsetof(T, {member}));' for member, _ in members]
+    lines.append("  }")
+  lines += [f'  printf("{name} = %u\\n", TENSTORRENT_IOCTL_{name});' for name in pci.KMD] + ["}"]
+  (tmp_path / "layouts.c").write_text("\n".join(lines))
+  subprocess.run(["clang", "-o", tmp_path / "layouts", tmp_path / "layouts.c"], check=True)
+  got = subprocess.run([tmp_path / "layouts"], capture_output=True, text=True, check=True).stdout.splitlines()
+  want = []
+  for name, (_, members) in pci.KMD_ARGS.items():
+    want.append(f"{name} {struct.calcsize(''.join(['<'] + [code for _, code in members]))}")
+    want += [f"{name}.{member} {struct.calcsize(''.join(['<'] + [code for _, code in members[:i]]))}" for i, (member, _) in enumerate(members)]
+  want += [f"{name} = {0xFA << 8 | n}" for name, n in pci.KMD.items()]
+  assert got == want, [(g, w) for g, w in zip(got, want) if g != w]
 
 def test_fetch_ttsim(tmp_path, monkeypatch):
   # fetch_ttsim downloads the simulator once, and only with the expected SHA-256. A server in a thread stands in for

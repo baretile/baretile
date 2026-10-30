@@ -775,7 +775,7 @@ class Runtime:
              + (", ".join(f"{i}={v}" for i, v in enumerate(flags) if v) or "none"),
              f"NoC requests in flight by id: {({i: n for i in range(16) if (n := niu(bh.NIU_REGS['OUTSTANDING'] + 4 * i))}) or 'none'}; "
              f"write acknowledgements {niu(bh.NIU_REGS['WR_ACKS'])}, read responses {niu(bh.NIU_REGS['READS'])}"]
-    if isinstance(self.chip.pci, pci.Card):  # ttsim doesn't model the pc snapshots, and reading one stops it
+    if not isinstance(self.chip.pci, pci.Sim):  # ttsim doesn't model the pc snapshots, and reading one stops it
       lines.append("pc " + ", ".join(f"{name} {self.chip.read32(x, y, bh.PC_SNAPSHOT + 4 * i):#x}"
                                      for i, name in enumerate(("BRISC", "NCRISC", "TRISC0", "TRISC1", "TRISC2"))))
     return "\n    ".join(lines)

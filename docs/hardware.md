@@ -23,12 +23,21 @@ the ISA, see the simulator's `pcie.cpp` and kmd.
 | BAR2 | 1 MiB | PCIe controller, including eDMA and outbound iATU |
 | BAR4 | 32 GiB | Eight windows of 4 GiB |
 
-`pci.Card` maps BAR0 through sysfs. It unbinds an existing kernel driver, enables
-memory access and bus mastering, and sets the maximum read request size to
-4 KiB. `Card` copies registers a word at a time, since `memcpy` could split a
-register access into separate byte transactions. TLB 201 is reserved for
-tt-kmd. `pci.preflight` checks what `Card` needs without opening the card, and
-`pci.release` binds tt-kmd's `tenstorrent` driver again afterwards.
+baretile reaches a card in one of two ways. `pci.Kmd` goes through tt-kmd's
+device file. It maps BAR0's registers, takes TLB windows from kmd with
+`ALLOCATE_TLB`, and configures them with `CONFIGURE_TLB`. kmd has already enabled
+memory access and bus mastering. `pci.Card` maps BAR0 through sysfs instead. It
+unbinds an existing kernel driver, enables memory access and bus mastering, and
+sets the maximum read request size to 4 KiB, as kmd does. Both copy registers a
+word at a time, since `memcpy` could split a register access into separate byte
+transactions. TLB 201 is reserved for tt-kmd. `pci.preflight` checks what either
+needs without opening the card, and `pci.release` binds tt-kmd's `tenstorrent`
+driver again after `Card`.
+
+`CONFIGURE_TLB` has no field for the static VC class, and a multicast must use
+class 2, so `Kmd` sets bits 76 and 77 in the window's registers after kmd writes
+them. kmd's `TLB_2M_REG` names bits 75 to 77 `static_vc`, and the ISA has the
+buddy bit at 75 and the class at 76 and 77.
 
 A TLB maps a BAR window to a tile and address on the NoC. The configuration
 starts at BAR0 `0x1FC00000`, with three 32-bit words per entry. Write those words
@@ -92,16 +101,22 @@ Telemetry reports enabled banks and training status. `Chip` waits up to
 
 ## Host memory and ARC
 
-The card backend uses locked 2 MiB hugepages for DMA. It reads physical addresses
-from `/proc/self/pagemap` and passes them to the device. You'll need root for
-this. The IOMMU must be disabled or in passthrough mode so the card can use
-those addresses without translation.
-
 Host memory is reached through the PCIe tile. Addresses below `2**58` use the
 direct bus-address path. Bit 60 selects the outbound iATU path used by kmd and
-UMD. baretile uses the direct path and doesn't program iATU windows. We still
-need to check whether firmware sets that up after boot. The dispatcher's command
-reads, readback and uploads all depend on it.
+UMD. The dispatcher's command reads, readback and uploads all depend on one of
+them.
+
+`Kmd` asks kmd to pin 2 MiB with `PIN_PAGES` and its `NOC_DMA` flag. kmd maps the
+memory through the IOMMU when it translates, programs an iATU window for it, and
+returns the NoC address the card uses, on the iATU path. Without an IOMMU
+translating, the pages must be physically contiguous, so `Kmd` pins a hugepage.
+
+`Card` uses locked 2 MiB hugepages. It reads their physical addresses from
+`/proc/self/pagemap` and passes them to the device on the direct path, without
+programming iATU windows. You'll need root for this, and the IOMMU must be
+disabled or in passthrough mode so the card can use those addresses without
+translation. We still need to check whether firmware enables the direct path
+after boot.
 
 If it doesn't, we'll need to program the iATU. The definitions are in kmd's
 `blackhole.c`. Region r starts at BAR2 `0x1000 + 0x200*r`: base at `+0x08/0x0C`,

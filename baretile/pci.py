@@ -1,6 +1,6 @@
-# PCIe access through ttsim (Sim) or Linux sysfs (Card). Both backends expose config space,
-# BAR0 and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
-import array, ctypes, fcntl, gc, hashlib, mmap, os, pathlib, time, urllib.request, weakref
+# PCIe access through ttsim (Sim), tt-kmd's device file (Kmd) or Linux sysfs (Card). Each backend exposes config space,
+# BAR0, TLB windows and memory that the device can reach by DMA. reset() resets a card whose NoC or firmware has hung.
+import array, ctypes, fcntl, gc, hashlib, mmap, os, pathlib, struct, time, urllib.request, weakref
 from baretile import bh
 
 CACHE = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"), "baretile")  # what baretile builds and downloads
@@ -11,8 +11,23 @@ TTSIM_SHA256 = "9471430de59a0316facdf7716c2e526727a9d0ee397c204cc8eece85b6a52432
 TTSIM_PATH = CACHE / "ttsim" / "v1.11.5" / "libttsim_bh.so"
 
 SYS = "/sys/bus/pci"  # sysfs PCI device directory; tests replace it with a temporary directory
+DEV = "/dev/tenstorrent"  # tt-kmd's device files, one for each card it drives; tests replace it too
+MODULE = "/sys/module/tenstorrent"  # tt-kmd's module, with its version; tests replace it too
 HUGEPAGES = "/sys/kernel/mm/hugepages/hugepages-2048kB"  # the kernel's pool of 2 MiB pages; tests replace it too
 DRIVER = "tenstorrent"  # tt-kmd's PCI driver, which Card unbinds and release binds again
+
+def tlb_config(**fields):
+  """A 2 MiB TLB's 96-bit config from its fields (bh.TLB_FIELDS)."""
+  cfg = 0
+  for name, val in fields.items():
+    first, width = bh.TLB_FIELDS[name]
+    if not (0 <= val < 1 << width): raise ValueError(f"TLB {name}={val:#x} does not fit in {width} bits")
+    cfg |= val << first
+  return cfg
+
+def _write_tlb(dev, index, fields):  # write TLB index's config registers through BAR0, as Sim and Card do
+  cfg = tlb_config(**fields)
+  for i in range(3): dev.write(bh.TLB_CONFIG + 12 * index + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
 
 class Sim:
   """A Blackhole in libttsim.so. bdf selects the PCI device in builds with several chips. Sim instances share
@@ -81,6 +96,7 @@ class Sim:
     self.lib.libttsim_clock(self.TICK)
     Sim.clocks += self.TICK
   def now(self): return Sim.clocks / bh.AICLK  # seconds of chip time by ttsim's clock, which doesn't match silicon
+  def tlb(self, index, fields): _write_tlb(self, index, fields)  # point TLB window index at fields (bh.TLB_FIELDS)
 
 class Card:
   """Access a card through sysfs, using locked hugepages for DMA. Requires root and the IOMMU disabled or in
@@ -139,7 +155,146 @@ class Card:
     if not pfn: raise PermissionError("pagemap hides physical addresses without CAP_SYS_ADMIN")
     return memoryview(buf)[:size], pfn * mmap.PAGESIZE
 
+  def tlb(self, index, fields): _write_tlb(self, index, fields)  # point TLB window index at fields (bh.TLB_FIELDS)
   def tick(self): pass  # a card runs without being ticked
+  def now(self): return time.monotonic()
+
+# tt-kmd's ioctls, _IO(0xFA, n) in its ioctl.h, and their arguments as (C type, [(member, struct code)]), with the
+# padding the C compiler adds. PIN_PAGES asks for the extended output, which carries the NoC address. test_kmd_layouts
+# checks each member's offset against the header.
+KMD = {"GET_DEVICE_INFO": 0, "QUERY_MAPPINGS": 2, "PIN_PAGES": 7, "UNPIN_PAGES": 10, "ALLOCATE_TLB": 11, "FREE_TLB": 12,
+       "CONFIGURE_TLB": 13, "SMC_MSG": 17}
+KMD_ARGS = {
+  "GET_DEVICE_INFO": ("struct tenstorrent_get_device_info", [("in.output_size_bytes", "I"), ("out.output_size_bytes", "I"), ("out.vendor_id", "H"),
+                      ("out.device_id", "H"), ("out.subsystem_vendor_id", "H"), ("out.subsystem_id", "H"), ("out.bus_dev_fn", "H"),
+                      ("out.max_dma_buf_size_log2", "H"), ("out.pci_domain", "H"), ("out.reserved", "H")]),
+  "QUERY_MAPPINGS": ("struct tenstorrent_query_mappings", [("in.output_mapping_count", "I"), ("in.reserved", "I")]),
+  "MAPPING": ("struct tenstorrent_mapping", [("mapping_id", "I"), ("reserved", "I"), ("mapping_base", "Q"), ("mapping_size", "Q")]),
+  "PIN_PAGES": ("struct { struct tenstorrent_pin_pages_in in; struct tenstorrent_pin_pages_out_extended out; }",
+                [("in.output_size_bytes", "I"), ("in.flags", "I"), ("in.virtual_address", "Q"), ("in.size", "Q"), ("out.physical_address", "Q"),
+                 ("out.noc_address", "Q")]),
+  "UNPIN_PAGES": ("struct tenstorrent_unpin_pages", [("in.virtual_address", "Q"), ("in.size", "Q"), ("in.reserved", "Q")]),
+  "ALLOCATE_TLB": ("struct tenstorrent_allocate_tlb", [("in.size", "Q"), ("in.reserved", "Q"), ("out.id", "I"), ("out.reserved0", "I"),
+                   ("out.mmap_offset_uc", "Q"), ("out.mmap_offset_wc", "Q"), ("out.reserved1", "Q")]),
+  "FREE_TLB": ("struct tenstorrent_free_tlb", [("in.id", "I")]),
+  "CONFIGURE_TLB": ("struct tenstorrent_configure_tlb", [("in.id", "I"), ("in.reserved", "I"), ("in.config.addr", "Q"), ("in.config.x_end", "H"),
+                    ("in.config.y_end", "H"), ("in.config.x_start", "H"), ("in.config.y_start", "H"), ("in.config.noc", "B"),
+                    ("in.config.mcast", "B"), ("in.config.ordering", "B"), ("in.config.linked", "B"), ("in.config.static_vc", "B"),
+                    ("in.config.reserved0", "3s"), ("in.config.reserved1", "8s"), ("out.reserved", "Q")]),
+  "SMC_MSG": ("struct tenstorrent_smc_msg", [("argsz", "I"), ("flags", "I"), ("queue_index", "I"), ("reserved0", "I"), ("message", "8I")]),
+}
+KMD_MAPPING_BAR0 = 1  # TENSTORRENT_MAPPING_RESOURCE0_UC: BAR0, uncached
+KMD_PIN_CONTIGUOUS, KMD_PIN_NOC_DMA = 1, 2  # the pages are physically contiguous; the card reaches them through the NoC
+KMD_SMC_POST, KMD_SMC_POLL = 1, 2
+
+def _kmd_layout(name): return "<" + "".join(code for _, code in KMD_ARGS[name][1])
+
+class Kmd:
+  """A card through tt-kmd's device file, /dev/tenstorrent/N, which any user can open. kmd maps DMA memory for the
+  card, through the IOMMU when it translates, and hands out TLB windows, so this needs neither root nor iommu=pt, and
+  tt-smi can use the card at the same time. Opening the file without O_APPEND has kmd power the chip up for us.
+  Needs tt-kmd 2.0 or later, and 2.11 for arc_msg."""
+  counts = True  # see Sim
+  def __init__(self, bdf, path):
+    self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+    try:
+      _claim(lambda: _flock(self.fd), path)  # one baretile opener at a time, as for Card. Other kmd clients don't take it
+      self.sys = f"{SYS}/devices/{bdf}"
+      bar0 = next((m for m in self.mappings() if m["mapping_id"] == KMD_MAPPING_BAR0), None)
+      if bar0 is None: raise RuntimeError(f"tt-kmd offers no BAR0 mapping for {bdf}")
+      self.map = mmap.mmap(self.fd, bar0["mapping_size"], offset=bar0["mapping_base"])
+    except BaseException:
+      os.close(self.fd)
+      raise
+    self.bar0 = ctypes.addressof(ctypes.c_char.from_buffer(self.map))
+    self.windows = {}  # baretile's TLB index: (kmd's id for it, its mapping, the mapping's address)
+
+  def call(self, name, **values):
+    """Run tt-kmd's ioctl name with its argument's members set from values, the rest zero, and return the
+    members as kmd left them."""
+    members, args = KMD_ARGS[name][1], []
+    for member, code in members:
+      value = values.get(member)
+      if code.endswith("s"): args.append(value or b"")
+      elif code[0].isdigit(): args.extend(value or (0,) * int(code[:-1]))
+      else: args.append(value or 0)
+    buf = bytearray(struct.pack(_kmd_layout(name), *args))
+    fcntl.ioctl(self.fd, 0xFA << 8 | KMD[name], buf)
+    out, at = {}, 0
+    for member, code in members:
+      field = struct.unpack_from("<" + code, buf, at)
+      out[member], at = field if code[0].isdigit() and not code.endswith("s") else field[0], at + struct.calcsize("<" + code)
+    return out
+
+  def mappings(self):  # what this device file can map: [{mapping_id, mapping_base, mapping_size}]
+    n, size = 8, struct.calcsize(_kmd_layout("MAPPING"))
+    buf = bytearray(struct.pack(_kmd_layout("QUERY_MAPPINGS"), n, 0) + bytes(n * size))
+    fcntl.ioctl(self.fd, 0xFA << 8 | KMD["QUERY_MAPPINGS"], buf)
+    names = [m for m, _ in KMD_ARGS["MAPPING"][1]]
+    found = [dict(zip(names, struct.unpack_from(_kmd_layout("MAPPING"), buf, 8 + i * size))) for i in range(n)]
+    return [m for m in found if m["mapping_id"]]
+
+  def cfg_read(self, off):  # the standard header of config space, which sysfs lets any user read
+    with open(f"{self.sys}/config", "rb") as f: return int.from_bytes(os.pread(f.fileno(), 4, off), "little")
+
+  def _at(self, off):  # the address of BAR0 offset off: in a TLB window that kmd gave us, or among the registers above them
+    if off >= bh.TLB_COUNT * bh.TLB_WINDOW: return self.bar0 + off
+    return self.windows[off // bh.TLB_WINDOW][2] + off % bh.TLB_WINDOW
+  def read(self, off, n): return _load(self._at(off), n)
+  def write(self, off, data): _store(self._at(off), data)
+
+  def tlb(self, index, fields):
+    """Point TLB window index at fields (bh.TLB_FIELDS). kmd gives each index a window of its own on first use, and
+    the window's BAR0 offset becomes index's. CONFIGURE_TLB has no field for the static VC class, which a multicast
+    must set to bh.MCAST_VC, so we set those two bits in the window's registers after kmd writes them."""
+    if index not in self.windows:
+      got = self.call("ALLOCATE_TLB", **{"in.size": bh.TLB_WINDOW})
+      window = mmap.mmap(self.fd, bh.TLB_WINDOW, offset=got["out.mmap_offset_uc"])
+      self.windows[index] = got["out.id"], window, ctypes.addressof(ctypes.c_char.from_buffer(window))
+    tlb_config(**fields)  # the same checks as Card's
+    id = self.windows[index][0]
+    config = {f"in.config.{k}": fields.get(k, 0) for k in ("x_end", "y_end", "x_start", "y_start", "mcast", "ordering", "static_vc")}
+    self.call("CONFIGURE_TLB", **{"in.id": id, "in.config.addr": fields.get("addr", 0) << 21}, **config)
+    if id < 32: _store(self.bar0 + bh.TLB_STRIDED + 4 * id, bytes(4))  # skip no tiles of a multicast, as Card leaves them
+    if fields.get("vc_class"):
+      first, width = bh.TLB_FIELDS["vc_class"]
+      at = self.bar0 + bh.TLB_CONFIG + 12 * id + 8  # the high word holds bits 64 to 95
+      word = int.from_bytes(_load(at, 4), "little") & ~((1 << width) - 1 << first - 64) | fields["vc_class"] << first - 64
+      _store(at, word.to_bytes(4, "little"))
+
+  def alloc(self, size):
+    """Allocate 2 MiB that the card can reach and return (memoryview, the address the card uses on the NoC). kmd pins
+    a hugepage, physically contiguous, or with the IOMMU translating, ordinary pages, which it maps contiguously. The
+    pages go back when the memoryview is no longer referenced."""
+    if size > 1 << 21: raise ValueError("Kmd.alloc gives at most 2 MiB")
+    MAP_HUGETLB, MAP_HUGE_2MB = 0x40000, 21 << 26
+    flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap.MAP_POPULATE
+    try: buf, pin = mmap.mmap(-1, 1 << 21, flags | MAP_HUGETLB | MAP_HUGE_2MB), KMD_PIN_CONTIGUOUS | KMD_PIN_NOC_DMA
+    except OSError: buf, pin = mmap.mmap(-1, 1 << 21, flags), KMD_PIN_NOC_DMA  # contiguous only if the IOMMU translates
+    va = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    try: got = self.call("PIN_PAGES", **{"in.output_size_bytes": 16, "in.flags": pin, "in.virtual_address": va, "in.size": 1 << 21})
+    except OSError as e:
+      raise MemoryError(f"tt-kmd couldn't pin 2 MiB for DMA ({e.strerror}). Without an IOMMU translating, reserve a hugepage: "
+                        "echo 4 > /proc/sys/vm/nr_hugepages") from None
+    fd = self.fd
+    def unpin():
+      try: fcntl.ioctl(fd, 0xFA << 8 | KMD["UNPIN_PAGES"], struct.pack(_kmd_layout("UNPIN_PAGES"), va, 1 << 21, 0))
+      except OSError: pass  # the device file closed first, and kmd unpinned everything then
+    weakref.finalize(buf, unpin)
+    return memoryview(buf)[:size], got["out.noc_address"]
+
+  def message(self, header):
+    """Send ARC a message through kmd, which shares ARC's queue among its clients, and return the 8-word response."""
+    try: self.call("SMC_MSG", argsz=48, flags=KMD_SMC_POST, message=(header, *[0] * 7))
+    except OSError as e: raise RuntimeError(f"ARC messages through tt-kmd need tt-kmd 2.11 or later ({e.strerror})") from None
+    deadline = time.monotonic() + 1.0
+    while True:
+      try: return self.call("SMC_MSG", argsz=48, flags=KMD_SMC_POLL)["message"]
+      except BlockingIOError:
+        if time.monotonic() > deadline: raise TimeoutError(f"ARC did not answer message {header & 0xFF:#x} within 1.0s") from None
+        time.sleep(0.001)
+
+  def tick(self): pass
   def now(self): return time.monotonic()
 
 # A BAR is mapped uncached, where libc's memcpy may copy a byte at a time (rep movsb), and each byte is its own PCIe
@@ -168,6 +323,12 @@ def _claim(take, name):  # take() claims a device for one opener, or returns Fal
   if take(): return
   gc.collect()  # a Chip dropped in this process may still hold the device from a reference cycle
   if not take(): raise RuntimeError(f"{name} is already open, in this process or another. Share its Chip, or close its runtimes and drop it")
+
+def kmd_device(bdf):
+  """tt-kmd's device file for card bdf, such as /dev/tenstorrent/0, or None when tt-kmd doesn't drive the card.
+  sysfs names the device under the card's PCI device, with ! for the slash."""
+  found = sorted(pathlib.Path(SYS, "devices", bdf).glob("tenstorrent/tenstorrent!*"))
+  return f"{DEV}/{found[0].name.split('!', 1)[1]}" if found else None
 
 def find_cards():
   """List the Blackholes on the PCI bus by their sysfs names (domain:bus:device.function)."""
@@ -199,26 +360,37 @@ def simulator():
   return None
 
 def preflight(bdf):
-  """Check what Card needs, from sysfs, without touching the card. Return [(level, message)], where level is "ok",
-  "warn" or "fail". Card can't run after a fail."""
+  """Check what opening card bdf needs, from sysfs, without touching the card. Return [(level, message)], where level
+  is "ok", "warn" or "fail". open_device can't open the card after a fail. Through tt-kmd (Kmd) that's access to its
+  device file, and the memory kmd pins for DMA; through sysfs (Card), root, the IOMMU passing addresses through, and
+  a hugepage."""
   dev, found = pathlib.Path(SYS, "devices", bdf), []
   read = lambda path: path.read_text().strip() if path.exists() else None
-  found.append(("ok", "running as root") if os.geteuid() == 0 else
-               ("fail", "Card needs root for config space, the BARs and physical addresses for DMA"))
-  kind = read(dev / "iommu_group/type")
-  found.append(("ok", "the IOMMU passes DMA addresses through" if kind else "no IOMMU group") if kind in (None, "identity") else
-               ("fail", f"the IOMMU translates DMA addresses ({kind}), but Card gives the card physical ones. Boot with iommu=pt"))
-  free = int(read(pathlib.Path(HUGEPAGES, "free_hugepages")) or 0)
-  found.append(("ok", f"{free} free 2 MiB hugepages; a Runtime takes one") if free else
-               ("fail", "no free 2 MiB hugepage for DMA memory. Try: echo 4 > /proc/sys/vm/nr_hugepages"))
+  kind, free = read(dev / "iommu_group/type"), int(read(pathlib.Path(HUGEPAGES, "free_hugepages")) or 0)
+  if path := kmd_device(bdf):
+    version = read(pathlib.Path(MODULE, "version"))
+    found.append(("ok", f"tt-kmd {version or '(version unknown)'} drives the card, and baretile opens it through {path}, without root"))
+    found.append(("ok", f"this user can open {path}") if os.access(path, os.R_OK | os.W_OK) else
+                 ("fail", f"this user can't open {path}. tt-kmd's udev rule makes it 0666: reinstall tt-kmd, or check /etc/udev/rules.d"))
+    if kind not in (None, "identity"): found.append(("ok", "the IOMMU maps the memory that tt-kmd pins for DMA"))
+    else: found.append(("ok", f"{free} free 2 MiB hugepages; a Runtime pins one") if free else
+                       ("fail", "without an IOMMU translating, tt-kmd needs a hugepage to pin for DMA. Try: echo 4 > /proc/sys/vm/nr_hugepages"))
+  else:
+    found.append(("ok", "running as root") if os.geteuid() == 0 else
+                 ("fail", "tt-kmd doesn't drive the card, and opening it through sysfs needs root. Install tt-kmd, or run as root"))
+    found.append(("ok", "the IOMMU passes DMA addresses through" if kind else "no IOMMU group") if kind in (None, "identity") else
+                 ("fail", f"the IOMMU translates DMA addresses ({kind}), but Card gives the card physical ones. Boot with iommu=pt"))
+    found.append(("ok", f"{free} free 2 MiB hugepages; a Runtime takes one") if free else
+                 ("fail", "no free 2 MiB hugepage for DMA memory. Try: echo 4 > /proc/sys/vm/nr_hugepages"))
   link = [read(dev / f) for f in ("current_link_speed", "current_link_width", "max_link_speed", "max_link_width")]
   if None in link: found.append(("warn", "sysfs doesn't say how fast the PCIe link is"))
   else: found.append(("ok", f"PCIe link at {link[0]} x{link[1]}") if link[:2] == link[2:] else
                      ("warn", f"the PCIe link runs at {link[0]} x{link[1]}, below the card's {link[2]} x{link[3]}. Check the slot"))
+  if fw := next(dev.glob("tenstorrent/*/tt_fw_bundle_ver"), None): found.append(("ok", f"firmware bundle {read(fw)}, as tt-kmd reads it"))
+  if path: return found
   if (dev / "driver").exists():
-    name, fw = pathlib.Path(os.path.realpath(dev / "driver")).name, next(dev.glob("tenstorrent/*/tt_fw_bundle_ver"), None)
-    found.append(("ok", f"{name} drives the card now. Card unbinds it, and `python3 -m baretile.chip release` binds {DRIVER} again"))
-    if fw: found.append(("ok", f"firmware bundle {read(fw)}, as tt-kmd reads it"))
+    found.append(("ok", f"{pathlib.Path(os.path.realpath(dev / 'driver')).name} has the card. Card unbinds it, "
+                        f"and `python3 -m baretile.chip release` binds {DRIVER} again"))
   else: found.append(("ok", "no driver has the card"))
   return found
 
@@ -234,12 +406,14 @@ def release(bdf):
 
 def open_device(n=0):
   """Open chip n. With TTSIM=/path/to/libttsim.so that's chip n of the simulator, which has several in a multi-chip
-  build. Otherwise it's the n-th Blackhole on the PCI bus, or with none there, the simulator that fetch_ttsim
-  downloaded. Only one Chip at a time may have a device open."""
+  build. Otherwise it's the n-th Blackhole on the PCI bus, through tt-kmd when it drives the card (Kmd) and through
+  sysfs as root when it doesn't (Card), or with no card there, the simulator that fetch_ttsim downloaded. Only one
+  Chip at a time may have a device open."""
   sim = simulator()
   found = Sim.chips(sim) if sim else find_cards()
   if not 0 <= n < len(found): raise ValueError(f"open_device({n}): there are {len(found)} chips")
-  return Sim(sim, found[n]) if sim else Card(found[n])
+  if sim: return Sim(sim, found[n])
+  return Kmd(found[n], path) if (path := kmd_device(found[n])) else Card(found[n])
 
 def reset(bdf, timeout=10.0):
   """Reset a card whose NoC or firmware has hung, following tt-kmd's ASIC reset. Close all processes using the
