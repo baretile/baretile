@@ -7,20 +7,31 @@ failure, since the later tests need the earlier ones to work.
 ## Before you start
 
 Check that the card appears in `lspci -d 1e52:b140`, has the required power,
-and has working board firmware. Check firmware with Tenstorrent's tools before
-opening baretile, because `pci.Card` unbinds tt-kmd. Then check what baretile
-needs:
+and has working board firmware. Install tt-kmd, Tenstorrent's kernel driver, and
+check the firmware with Tenstorrent's tools. Then check what baretile needs:
 
 ```sh
 python3 -m baretile.chip check
 ```
 
-It reads sysfs without touching the card, so it runs without root too. It
-checks clang and lld, then reports whether you're root, whether the IOMMU passes
-DMA addresses through, how many 2 MiB hugepages are free, whether the PCIe link
-runs at the card's best speed and width, and which driver has the card, with
-tt-kmd's firmware version. It exits with an error if anything would stop baretile. Configure the
-IOMMU for passthrough (`iommu=pt`) or disable it, and reserve a few hugepages as
+It reads sysfs without touching the card, so it runs without root. It checks
+clang and lld, then how baretile will open the card. It exits with an error if
+anything would stop baretile.
+
+With tt-kmd driving the card, baretile opens its device file,
+`/dev/tenstorrent/0`, as `pci.Kmd`, which needs no root. The check reports
+tt-kmd's version and whether you can open the file. kmd pins the memory that the
+card reaches by DMA. With an IOMMU translating, that's ordinary memory;
+otherwise it's a hugepage, so the check also counts the free ones. tt-smi can
+use the card at the same time.
+
+Without tt-kmd, baretile opens the card through sysfs as `pci.Card`, which
+unbinds any other driver. The check reports whether you're root, whether the
+IOMMU passes DMA addresses through, and how many hugepages are free. Configure
+the IOMMU for passthrough (`iommu=pt`) or disable it.
+
+Either way, it reports whether the PCIe link runs at the card's best speed and
+width, and the firmware version that tt-kmd reads. To reserve hugepages, as
 root:
 
 ```sh
@@ -29,8 +40,8 @@ echo 4 > /proc/sys/vm/nr_hugepages
 
 ## Steps
 
-Run bring-up as root from the checkout, with `TTSIM` unset, in the Python
-environment that has the test dependencies:
+Run bring-up from the checkout, with `TTSIM` unset, in the Python environment
+that has the test dependencies. Through sysfs, run it as root:
 
 ```sh
 python3 test/bringup.py record
@@ -80,15 +91,17 @@ card, run `python3 -m baretile.bench`, and pass `probe=record/probe.json` to
 
 ## Giving the card back
 
-Once no baretile process is running, give the card back to tt-kmd so that
-tt-smi and TT-NN can use it:
+Through tt-kmd, baretile never takes the card away, and TT-NN can use it once no
+baretile process has it open. Through sysfs, `pci.Card` unbound tt-kmd, so once no
+baretile process is running, give the card back to it so that tt-smi and TT-NN can
+use it:
 
 ```sh
 python3 -m baretile.chip release
 ```
 
-`test/benchmark.py` runs both stacks on the same card, so its TT-NN runs need
-this first.
+`test/benchmark.py` runs both stacks on the same card, so through sysfs, its
+TT-NN runs need this first.
 
 ## When a card hangs
 

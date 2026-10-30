@@ -68,6 +68,9 @@ jobs:
           git init -q "$RUNNER_TEMP/tinygrad"
           git -C "$RUNNER_TEMP/tinygrad" fetch -q --depth 1 https://github.com/tinygrad/tinygrad 002630241913a57abccf646b092878ec8a9b882f
           git -C "$RUNNER_TEMP/tinygrad" checkout -q FETCH_HEAD
+      # test_kmd_layouts checks pci.Kmd's ioctl arguments against tt-kmd's header, from the 2.11.0 release
+      - name: Download tt-kmd's ioctl.h
+        run: curl --fail --location --silent --output "$RUNNER_TEMP/ioctl.h" https://raw.githubusercontent.com/tenstorrent/tt-kmd/c05f22460985960905928cf48b3fbde602d9ea37/ioctl.h
       # Compiled kernels are cached by their source, so a cache from an older commit only saves time.
       - uses: actions/cache@v4
         with:
@@ -81,6 +84,7 @@ jobs:
         env:
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
           TINYGRAD: ${{ runner.temp }}/tinygrad
+          KMD_IOCTL: ${{ runner.temp }}/ioctl.h
   # The comparisons with transformers, PyTorch, tiktoken and safetensors skip in the test job, which doesn't install
   # them. This job installs pinned versions and runs those tests, and SKIPS=fail turns a skip into a failure, so a
   # missing package can't pass for a green run. The PyTorch frontend also needs the pinned tinygrad.

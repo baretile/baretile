@@ -56,7 +56,8 @@ To use another ttsim build, such as
 [ttsim-chaos](https://github.com/baretile/baretile/blob/main/docs/testing.md#ttsim-chaos),
 set `TTSIM=/absolute/path/to/libttsim.so`. It comes before a card and before the
 downloaded release. On a machine with a Blackhole and no `TTSIM`, baretile opens
-the card, which needs root and takes the card away from its kernel driver. See
+the card through tt-kmd, Tenstorrent's kernel driver, without root. Without
+tt-kmd, it opens the card through sysfs, which needs root. See
 [bring-up](https://github.com/baretile/baretile/blob/main/docs/bring-up.md)
 before running on a card.
 

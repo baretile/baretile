@@ -74,6 +74,9 @@ random expressions in the kernel fuzz test instead of 30, when n is more.
 `TTSIM2=/path/to/libttsim.so` enables the two-chip test. ttsim's releases include
 that library as `libttsim_bh_x2.so`, or you can build ttsim's `release_bh_x2`
 target.
+`KMD_IOCTL=/path/to/ioctl.h` checks the arguments of the ioctls that `pci.Kmd`
+sends against tt-kmd's header, compiled by clang for this host. CI uses the
+header from tt-kmd 2.11.0.
 
 `llama.accuracy` compares generated choices with Tenstorrent reference tokens:
 

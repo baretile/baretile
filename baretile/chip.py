@@ -2,14 +2,7 @@
 # resets Tensix cores, and transfers data through Ethernet links.
 import hashlib, importlib.util, pathlib, shutil, struct, subprocess, time
 from baretile import bh, pci
-
-def tlb_config(**fields):
-  cfg = 0
-  for name, val in fields.items():
-    first, width = bh.TLB_FIELDS[name]
-    if not (0 <= val < 1 << width): raise ValueError(f"TLB {name}={val:#x} does not fit in {width} bits")
-    cfg |= val << first
-  return cfg
+from baretile.pci import Kmd
 
 class Chip:
   # boot is how long to wait for ARC firmware, in seconds. After a reset it takes minutes, and umd allows 300.
@@ -22,12 +15,13 @@ class Chip:
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_BOOT_STATUS) & 7 == bh.ARC_READY, "report ARC firmware ready", boot)
     if not (int.from_bytes(pci.read(bh.NIU_CFG_0, 4), "little") & bh.NOC_TRANSLATED):
       raise RuntimeError("NoC coordinate translation is off, but bh.py assumes it")
-    self.arc_msg(bh.ASIC_STATE0)  # leave the state that tt-kmd puts the chip in when it lets go of it
-    self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
+    kmd = isinstance(pci, Kmd)  # through tt-kmd, which powers the chip up for its clients and shares ARC with them
+    if not kmd: self.arc_msg(bh.ASIC_STATE0)  # leave the state that tt-kmd puts the chip in when it lets go of it
+    if not kmd: self.arc_msg(bh.POWER_ON)  # tt-kmd clock-gates Tensix whenever nobody has the card open
     self.wait(lambda: self.read32(*bh.ARC, bh.ARC_TELEMETRY[0]), "publish its telemetry", boot)
     # Ask for the busy AI clock and, like UMD, wait up to 0.2 s for it to come within 5% of bh.AICLK. If it doesn't,
     # we use the clock it reports. ttsim reports 1000 MHz.
-    self.arc_msg(bh.AICLK_GO_BUSY)
+    if not kmd: self.arc_msg(bh.AICLK_GO_BUSY)
     busy, end = bh.AICLK / 1e6, time.monotonic() + 0.2
     while abs(self.telemetry().get(bh.TAG_AICLK, 0) - busy) > 0.05 * busy and time.monotonic() < end: self.pci.tick()
     t = self.telemetry()
@@ -58,9 +52,8 @@ class Chip:
         self.kept[x, y, base, start] = free
       tlb = self.kept[x, y, base, start]
     mcast = {} if start is None else dict(x_start=start[0], y_start=start[1], mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
-    cfg = tlb_config(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast)
     if not 0 <= tlb < bh.TLB_COUNT: raise ValueError(f"TLB index must be in [0, {bh.TLB_COUNT})")
-    for i in range(3): self.pci.write(bh.TLB_CONFIG + 12 * tlb + 4 * i, (cfg >> 32 * i & 0xFFFFFFFF).to_bytes(4, "little"))
+    self.pci.tlb(tlb, dict(addr=base >> 21, x_end=x, y_end=y, ordering=bh.STRICT, **mcast))
     if tlb == 0: self.target = (x, y, base, start)
     return tlb * bh.TLB_WINDOW + addr - base
 
@@ -93,7 +86,13 @@ class Chip:
       self.pci.tick()
 
   def arc_msg(self, header):
-    """Send ARC a message and return the 8-word response. The low byte of header is the message code."""
+    """Send ARC a message and return the 8-word response. The low byte of header is the message code. Through
+    tt-kmd, kmd sends it, since its other clients share ARC's queue."""
+    resp = self.pci.message(header) if isinstance(self.pci, Kmd) else self._queue(header)
+    if resp[0] & 0xFF >= bh.ARC_FAILED: raise RuntimeError(f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}")
+    return resp
+
+  def _queue(self, header):  # put a message in ARC's application queue and wait for the response
     (x, y), entry = bh.ARC, bh.ARC_QUEUE_ENTRY
     qcb = self.read32(x, y, bh.ARC_QUEUES)
     base, n = self.read32(x, y, qcb), self.read32(x, y, qcb + 4) & 0xFF
@@ -109,7 +108,6 @@ class Chip:
     self.wait(lambda: self.read32(x, y, resp_w) != rptr, f"answer ARC message {header & 0xFF:#x}", 1.0)
     resp = struct.unpack("<8I", self.read(x, y, q + entry * (1 + n + rptr % n), entry))
     self.write32(x, y, resp_r, (rptr + 1) % (2 * n))
-    if resp[0] & 0xFF >= bh.ARC_FAILED: raise RuntimeError(f"ARC message {header & 0xFF:#x} failed: {resp[0]:#x}")
     return resp
 
   def telemetry(self):
