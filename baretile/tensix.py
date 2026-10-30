@@ -222,8 +222,8 @@ def matmul_phase(transposed=False):
 
   MVMUL does Dst[8x16] += SrcB[8x16] @ SrcA[16x16]. Output face (i, j) adds A face (i, k) times B face (k, j) for
   k = 0, 1, in two MVMULs of 8 rows each (h). In the order below, SrcA steps by 16, -16, 16 and 16 rows, then again,
-  and SrcB by 0, 8, 0 and 8 rows, so four address modes (4-7) cover it. The last one wraps both back to row 0, since the counters
-  wrap at 64, and moves on to the next fidelity phase.
+  and SrcB by 0, 8, 0 and 8 rows, so four address modes (4-7) cover it. The last one wraps both back to row 0, since the
+  counters wrap at 64, and moves on to the next fidelity phase.
 
   With transposed, B came in as it lies and unpacker 0 transposed each face (haloize). Face (k, j) of B^T is then face
   2j + k of SrcA. SrcA steps by 32 for the next j or h, by -16 for the next k and by 16 for the next i. That takes five
@@ -662,8 +662,10 @@ def sfpu(posts, slots):  # runs the SFPU ops in order, over the Dst half that th
 def table(name, words): return f"static const unsigned {name}[] = {{{', '.join(f'{w:#x}' for w in words)}}};"
 BANKS = table("bank", [bh.noc_xy(x, y) for x, y in bh.DRAM]) + f"""
 #define BANK(t) bank[(t) % {len(bh.DRAM)}] & 63, bank[(t) % {len(bh.DRAM)}] >> 6  // x, y of the bank that holds tile t
-#define AT(base, t, size) ((base) + (t) / {len(bh.DRAM)} * (size))  // tile t's address in that bank, for tiles of size bytes
-static inline unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}  // datum (r, c) in a tile"""
+// tile t's address in that bank, for tiles of size bytes
+#define AT(base, t, size) ((base) + (t) / {len(bh.DRAM)} * (size))
+// datum (r, c) in a tile
+static inline unsigned at(unsigned r, unsigned c) {{ return (r / 16 * 2 + c / 16) * 256 + r % 16 * 16 + c % 16; }}"""
 # Runtime.readers gives some workers a DRAM bank and a port to read it through. NEAR makes BANK use a copy of the bank
 # table, and the kernel first points the entry for the worker's bank at that port.
 NEAR = f"""static unsigned near[{len(bh.DRAM)}];
@@ -681,7 +683,11 @@ static void copy(unsigned from, unsigned to, unsigned n) {
 static void row_down(unsigned tile, unsigned item) {
   unsigned face = 256 * item;
   l1_settle(tile);
-  for (unsigned n = 16 * item; n < face; n *= 2) { copy(tile, tile + n, n); copy(tile + face, tile + face + n, n); noc_wait(); }
+  for (unsigned n = 16 * item; n < face; n *= 2) {
+    copy(tile, tile + n, n);
+    copy(tile + face, tile + face + n, n);
+    noc_wait();
+  }
   copy(tile, tile + 2 * face, 2 * face);
   noc_wait();
 }"""
@@ -736,15 +742,18 @@ B8_SLOTS = bh.BFP_FIRST_DATUM // 1024
 SYNC_WORDS = f"""
 enum {{ {", ".join(name.upper() for name in SYNC_NAMES)}, RING = 8 }};
 #define SYNC ((volatile unsigned *){SYNC:#x})
-static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return SYNC[i]; }}  // fenced: L0 cache doesn't see other cores' writes
+// fenced: L0 cache doesn't see other cores' writes
+static unsigned peek(unsigned i) {{ asm volatile("fence" ::: "memory"); return SYNC[i]; }}
 """
 TRISC = SYNC_WORDS + f"""
-#define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])  // load: its value. store 0: post, 1: take one
+// load: its value. store 0: post, 1: take one
+#define SEM(s) (((volatile unsigned *){bh.TENSIX_SEM:#x})[__builtin_ctz(s)])
 // Words that REPLAY records go through stores, since fused .ttinsn instructions can corrupt a recording. Words worked
 // out at run time go through stores too.
 static inline void push_word(unsigned w) {{ *(volatile unsigned *){bh.TENSIX_PUSH:#x} = w; }}
 static unsigned posted, drained;  // intermediates that pack will post to L1, and those waited for
-static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}  // waits for everything packed so far to land
+// waits for everything packed so far to land
+static void drain(void) {{ for (; drained < posted; drained++) {{ {tt(TAKE_L1)} }} }}
 """
 # The programs of a Tensix kernel read their arguments through a pointer that isn't volatile. The arguments are fixed
 # for the launch, and this core sees them once the firmware has fenced, so the compiler can keep them in registers and
@@ -770,7 +779,8 @@ static void get(unsigned base, unsigned t, unsigned slot) {{ noc_get(BANK(t), AT
 // the same, with its two off-diagonal faces swapped. that's half of a transpose, and unpacker 0 does the rest
 static void flipped(unsigned base, unsigned t, unsigned slot) {{
   for (unsigned f = 0; f < 4; f++)
-    noc_get(BANK(t), AT(base, t, {tb}) + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4}, {tb // 4});
+    noc_get(BANK(t), AT(base, t, {tb}) + f * {tb // 4}, SLOT(slot) + (f == 1 ? 2 : f == 2 ? 1 : f) * {tb // 4},
+            {tb // 4});
 }}
 static void ready(void) {{ noc_wait(); SYNC[FETCHED] = ++fetched; }}
 static void send(void) {{  // write completed results to DRAM in pack order
@@ -786,7 +796,8 @@ static void reached(unsigned n) {{ while (peek(UNPACKED) < n) send(); }}
 // Fetches block-float tile t into slot s past B8, which is slot s % b8 of region s / b8. Its 64 exponents go among the
 // region's exponents, and its values among their values.
 static void getb(unsigned base, unsigned t, unsigned s) {{
-  unsigned at = AT(base, t, {tile_bytes(wt)}), r = {b8_at or B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes(wt)}, z = s % {max(b8, 1)};
+  unsigned at = AT(base, t, {tile_bytes(wt)}), r = {b8_at or B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes(wt)},
+           z = s % {max(b8, 1)};
   noc_get(BANK(t), at, r + 64 * z, 64);
   noc_get(BANK(t), at + 64, r + {64 * b8} + {BFP[wt]} * z, {BFP[wt]});
 }}
@@ -797,8 +808,11 @@ static void getb(unsigned base, unsigned t, unsigned s) {{
 // with that id to land, so up to DEPTH steps can have reads in flight. A frame's reads carry id 0.
 #define KEPT 0xFFFFFFFF
 static unsigned read_id;  // the transaction id that initiator 1 puts on reads
-static void tagged(unsigned id) {{ if (id != read_id) {{ while (NIU1(CMD) & 1) {{}} NIU1(PACKET_TAG) = (read_id = id) << 10; }} }}
-static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
+static void tagged(unsigned id) {{
+  if (id != read_id) {{ while (NIU1(CMD) & 1) {{}} NIU1(PACKET_TAG) = (read_id = id) << 10; }}
+}}
+static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, unsigned a, unsigned a_tile,
+                 unsigned a_slot) {{
   unsigned s = steps % {DEPTH};
   reached(stream_done[s]);  // waits until the step that last used slot s has been unpacked
   tagged(s + 1);
@@ -815,14 +829,17 @@ static void step(unsigned bfp, unsigned b, unsigned b_tile, unsigned b_slot, uns
 static void noc_gets(unsigned x, unsigned y, unsigned addr, unsigned l1, unsigned n) {{
   for (unsigned k; n; addr += k, l1 += k, n -= k) noc_get(x, y, addr, l1, k = n < MAX_PACKET ? n : MAX_PACKET);
 }}
-static void getc(unsigned j, unsigned run, unsigned k, unsigned slot, unsigned n) {{ noc_gets(BANK(j), run + k * {tb}, SLOT(slot), n * {tb}); }}
+static void getc(unsigned j, unsigned run, unsigned k, unsigned slot, unsigned n) {{
+  noc_gets(BANK(j), run + k * {tb}, SLOT(slot), n * {tb});
+}}
 static void getbc(unsigned j, unsigned run, unsigned len, unsigned k, unsigned s, unsigned n) {{
   unsigned r = {b8_at or B8:#x} + s / {max(b8, 1)} * {b8 * tile_bytes(wt)}, z = s % {max(b8, 1)};
   noc_gets(BANK(j), run + 64 * k, r + 64 * z, 64 * n);
   noc_gets(BANK(j), run + 64 * len + {BFP[wt]} * k, r + {64 * b8} + {BFP[wt]} * z, {BFP[wt]} * n);
 }}
 // step, with its B tile from a B by columns
-static void stepc(unsigned bfp, unsigned j, unsigned run, unsigned len, unsigned k, unsigned b_slot, unsigned a, unsigned a_tile, unsigned a_slot) {{
+static void stepc(unsigned bfp, unsigned j, unsigned run, unsigned len, unsigned k, unsigned b_slot, unsigned a,
+                  unsigned a_tile, unsigned a_slot) {{
   if (b_slot != KEPT) {{
     reached(stream_done[steps % {DEPTH}]);  // like step: wait for the slot and set the step's id before its reads
     tagged(steps % {DEPTH} + 1);
@@ -853,7 +870,8 @@ static void kept_step(void) {{ SYNC[ISSUED] = ++steps; ++events; }}  // a matmul
 // (unflag). By then all the flags of the launch have arrived, and nobody writes one again before the next go.
 #define FLAGS ((volatile unsigned *){FLAGS:#x})
 static unsigned col_end[3];  // events at the end of the last column in each B buffer
-static void await(unsigned i, unsigned n, unsigned v) {{  // wait for flags i..i+n-1 to reach v while writing results to DRAM
+// wait for flags i..i+n-1 to reach v while writing results to DRAM
+static void await(unsigned i, unsigned n, unsigned v) {{
   for (unsigned k = i; k < i + n; k++)
     for (;;) {{ asm volatile("fence" ::: "memory"); if (FLAGS[k] >= v) break; send(); }}
 }}
@@ -873,8 +891,8 @@ static void mcast(unsigned l1, unsigned n, unsigned rect, unsigned tiles) {{
   mcast_done(acks);
 }}
 // Sends this worker's part of what a row or column of the grid shares: n bytes at l1, already read in. They go to the
-// same address in the other `tiles` workers in rect, and then flag, set to v, goes the same way. With no other workers, it
-// waits for the reads and sets the flag.
+// same address in the other `tiles` workers in rect, and then flag, set to v, goes the same way. With no other workers,
+// it waits for the reads and sets the flag.
 static void share(unsigned l1, unsigned n, unsigned rect, unsigned tiles, unsigned flag, unsigned v) {{
   if (tiles && n) mcast(l1, n, rect, tiles);
   else noc_wait();
@@ -895,8 +913,10 @@ def unpack_program(body, cfg, decls=""):
   return TRISC + decls + f"""
 #define CFG ((volatile unsigned *){bh.TENSIX_CFG:#x})
 static unsigned needed, relayed, stepped;
-static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}  // hands unpack reports to BRISC
-static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}  // waits for BRISC to fetch the next frame
+// hands unpack reports to BRISC
+static void relay(void) {{ for (; SEM({SEM_UNPACKED}); SYNC[UNPACKED] = ++relayed) SEM({SEM_UNPACKED}) = 1; }}
+// waits for BRISC to fetch the next frame
+static void fetched(void) {{ needed++; do relay(); while (peek(FETCHED) < needed); }}
 // Waits until the next matmul step's tiles are in, and returns its stream slot. BRISC must have issued the step's
 // reads, and the reads with its transaction id must have landed. Also, at most 15 reports, the most that SEM_UNPACKED
 // holds, may be pushed but not relayed. A step kept in L1 waits for no fetch, so thread 0 could fall further behind,
@@ -919,7 +939,8 @@ static unsigned landed_chunk(unsigned m, unsigned n) {{
 }}
 {KMAIN}
   {" ".join(f"CFG[{i}] = {v:#x};" for i, v in cfg.items())}
-  l1_settle((unsigned)&CFG[{next(iter(cfg))}]);  // the config writes are in, so no instruction pushed below sees them stale
+  // the config writes are in, so no instruction pushed below sees them stale
+  l1_settle((unsigned)&CFG[{next(iter(cfg))}]);
   {tt(thread() + SETUP_UNPACK)}
   tensix_idle();  // the semaphores are set before the other threads can touch them
   SYNC[READY] = 1;
@@ -932,7 +953,8 @@ static unsigned landed_chunk(unsigned m, unsigned n) {{
 def math_program(slots, body, dst=False, decls=""):
   return TRISC + decls + f"""
 static unsigned needed;
-static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  // waits for BRISC to fetch the next tiles
+// waits for BRISC to fetch the next tiles
+static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}
 {KMAIN}
   {tt(thread(dst) + (counters(bh.UNPACK0, 1024) if dst else []) + [CC_OFF])} {_pushes(math_runs(slots))}
   while (!peek(READY)) {{}}  // waits for TRISC0 to set up the backend config and the semaphores
@@ -944,9 +966,11 @@ static void fetched(void) {{ needed++; while (peek(FETCHED) < needed) {{}} }}  /
 def pack_program(body, slots=2, decls=""):
   return TRISC + decls + f"""
 static unsigned outputs, relayed, used[{slots}];
-static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}  // hands packed results to BRISC
-// Queue the result that the caller packs next into L1 slot, tracked as output slot s, for DRAM tile t. Frames may share an output slot.
-// Wait until BRISC has written the previous result from this slot and RING has space, then queue the next result.
+// hands packed results to BRISC
+static void relay(void) {{ for (; SEM({SEM_PACKED}); SYNC[PACKED] = ++relayed) SEM({SEM_PACKED}) = 1; }}
+// Queue the result that the caller packs next into L1 slot, tracked as output slot s, for DRAM tile t. Frames may share
+// an output slot. Wait until BRISC has written the previous result from this slot and RING has space, then queue the
+// next result.
 // RING holds at most four results awaiting transfer.
 static void output(unsigned s, unsigned slot, unsigned t) {{
   while (peek(SENT) < used[s] || peek(SENT) + 4 <= outputs) relay();

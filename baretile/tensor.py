@@ -500,7 +500,8 @@ class Tensor:
   def columns(self):
     """Store each tile column of B together so matmul can read several tiles along K per request.
     Tile column j goes to bank j % 8, with block-float exponents before values. The result supports
-    readback and use as matmul's B, including indexed selection and splits along K. Cast to bf16 for ordinary operations."""
+    readback and use as matmul's B, including indexed selection and splits along K. Cast to bf16 for ordinary
+    operations."""
     if self.dtype not in ("bf16", *BFP):
       raise ValueError(f"columns lays out a matmul's B, which is bf16 or a block float, not {self.dtype}")
     x, tr, tc = _plain(self.realize()), -(-self.rows // 32), -(-self.cols // 32)

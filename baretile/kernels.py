@@ -630,7 +630,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
             f"z = (jj - g * {group}) * {bp} + ii"
             if parts else "")
       tiles_c = f"""for (unsigned {cols}; jj++) for (unsigned ii = 0; ii < {bp}; ii++) {{
-      unsigned i_ = i0 + ii, j = {f"j0 + {len(bh.DRAM)} * (reader[unit] >> 24) * jj" if local else "j0 + jj"}, k = 0{sz};
+      unsigned i_ = i0 + ii, j = {f"j0 + {len(bh.DRAM)} * (reader[unit] >> 24) * jj" if local else "j0 + jj"},
+               k = 0{sz};
       if (i_ >= {rt} || j >= {w}) continue;
       {tile_c(passes[0][1])}
     }}"""
@@ -653,7 +654,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
       return f"""  unsigned unit = a[0], b = unit / {br * bc}, i0 = unit % {br * bc} / {bc} * {bp}, j0 = {col0};
   for (unsigned u = 0; u < a[1]; u++, unit++) {{
     {tiles_c}
-    if ((j0 += {bq}) == {bc * bq}) {{ j0 = 0; if ((i0 += {bp}) == {br * bp}) {{ i0 = 0; b++; }} }}  // the next unit, without dividing
+    // the next unit, without dividing
+    if ((j0 += {bq}) == {bc * bq}) {{ j0 = 0; if ((i0 += {bp}) == {br * bp}) {{ i0 = 0; b++; }} }}
   }}"""
     index = ("b", "i_", "j")  # a tile's position: matrix, row, column. A unit fixes the two the sweep doesn't walk
     (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
@@ -777,8 +779,9 @@ def attention_plan(ht, ra, entries, wt, kt, workers, parts=None):
 def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=False):
   """Compute weighted sums and normalizers for softmax(q k^T + mask) v, keeping scores on the chip.
 
-  q is (E, rows, 32 ht), in ra tile rows. k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV cache, and each of
-  their matrices serves rep heads of q. places is (E or 1, rows, 1) int32 and holds the last key that each row sees.
+  q is (E, rows, 32 ht), in ra tile rows. k and v are (E / rep, 32 kt, 32 ht), in bf16 or the block float wt as a KV
+  cache, and each of their matrices serves rep heads of q. places is (E or 1, rows, 1) int32 and holds the last key that
+  each row sees.
   With a window, the first key it sees is window - 1 before that. The mask hides all other keys with -inf.
 
   The kernel's arguments:
@@ -840,7 +843,8 @@ def attention_kernel(ht, ra, R, rep, wt=None, phases=4, window=0, parts=1, keep=
   read = (f"asm volatile(\"fence\" ::: \"memory\"); volatile unsigned *g = {rng}; "
           f"unsigned k0 = g[0], k1 = g[1], f0 = g[2], f1 = g[3], empty = g[4];")
   units = lambda start, pass0, between, pass1, end: f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned w_ = (a[0] + u) / {parts}, part = (a[0] + u) % {parts}, e = w_ / {per}, i0 = w_ % {per} * {R}, nr = {ra} - i0 < {R} ? {ra} - i0 : {R};
+    unsigned w_ = (a[0] + u) / {parts}, part = (a[0] + u) % {parts}, e = w_ / {per}, i0 = w_ % {per} * {R},
+             nr = {ra} - i0 < {R} ? {ra} - i0 : {R};
     {start}
     for (unsigned kt = k0; kt <= k1; kt++) {{ unsigned fr = tiles++ & 1; {pass0} }}
     {between}
@@ -1001,15 +1005,19 @@ def gather_kernel(dtype):
 #define IDS {DATA + tb:#x}
 #define BLOCKS {DATA + tb + 4096:#x}
 {ROWS}
-static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // index r of this tile's 32, in row 0
-static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * {item}; }}  // row n's run in face f, in its tile, in bytes
+// index r of this tile's 32, in row 0
+static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}
+// row n's run in face f, in its tile, in bytes
+static unsigned run_of(unsigned n, unsigned f) {{ return at(n % 32, 16 * f) * {item}; }}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0, held = ~0u; u < a[1]; u++) {{
-    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;  // it: the indices' tile
+    // it: the indices' tile
+    unsigned t = a[0] + u, i = t / a[6], j = t % a[6], rows = a[7] - i * 32 < 32 ? a[7] - i * 32 : 32, it = a[9] + i;
     if (it != held) noc_get(BANK(it), AT(a[8], it, {tile_bytes("int32")}), IDS, {tile_bytes("int32")}), held = it;
     if (rows < 32) copy({ZEROS:#x}, SLOT, {tb});  // full tiles overwrite every row; partial tiles keep zero padding
     noc_wait();
-    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{  // row r's run in face f, through block 2 r + f of BLOCKS
+    // row r's run in face f, through block 2 r + f of BLOCKS
+    for (unsigned r = 0; r < rows; r++) for (unsigned f = 0; f < 2; f++) {{
       unsigned n = id(r), from = n / 32 * a[4] + j + a[5];
       noc_get(BANK(from), AT(a[3], from, {tb}) + run_of(n, f) / 64 * 64, BLOCKS + (2 * r + f) * 64, 64);
     }}
@@ -1051,7 +1059,8 @@ void kmain(volatile unsigned *a) {{
 NIBBLE = """
 // The sign and the 3 bits of bf16 b below exponent top, rounded to the nearest.
 static unsigned nibble(unsigned b, unsigned top) {
-  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0), q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
+  unsigned e = b >> 7 & 255, shift = top - e, m = (b & 127) | (e ? 128 : 0),
+           q = shift < 4 ? (m + (16u << shift)) >> (shift + 5) : 0;
   if (q > 7) q = 7;
   return q ? (b >> 15 & 1) << 3 | q : 0;  // no sign on a zero: the unpacker reads -0 as -inf
 }"""
@@ -1099,7 +1108,8 @@ def put_kernel(dtype):
 #define PLACES {DATA + 12288:#x}
 {BANKS}
 static unsigned id(unsigned r) {{ return ((volatile unsigned *)IDS)[at(0, r)]; }}  // place r of the 32, in row 0
-static unsigned run_of(unsigned r, unsigned f) {{ return at(r % 32, 16 * f) * {ITEMSIZE[xd]}; }}  // row r's run in face f, in x, in bytes
+// row r's run in face f, in x, in bytes
+static unsigned run_of(unsigned r, unsigned f) {{ return at(r % 32, 16 * f) * {ITEMSIZE[xd]}; }}
 {NIBBLE}
 // Pack the 16 bf16 values at src into row r's run in face f of the block-float tile: its exponent, then its values.
 static void pack(unsigned src, unsigned tile, unsigned r, unsigned f) {{
@@ -1158,9 +1168,9 @@ def topk_kernel(k, cols, dtype="bf16", parts=1, labels=False):
   which is the bf16 or fp32 bits as an unsigned integer, with negatives flipped and -0 as 0. Once the worst kept value
   has no sign bit, a compare of the raw bits as signed integers is enough. At the end the heap is sorted, best first.
 
-  parts cuts each row into that many parts of cols columns. A split row needs k and cols to be multiples of 32. The parts'
-  k best go side by side in the results, which are (batch, rows, parts k). Indices count columns across the row, not
-  within the part. With labels, an index is read from an int32 tensor of x's shape at the picked column, as the 64
+  parts cuts each row into that many parts of cols columns. A split row needs k and cols to be multiples of 32. The
+  parts' k best go side by side in the results, which are (batch, rows, parts k). Indices count columns across the row,
+  not within the part. With labels, an index is read from an int32 tensor of x's shape at the picked column, as the 64
   bytes around it. Labels are for a topk over the best indices of the parts.
 
   Units write their row of each result tile, in both faces, with zeros past the k columns and past x's rows. Values are
@@ -1213,7 +1223,8 @@ void kmain(volatile unsigned *a) {{
     // row r of tile row i of x, in part p of matrix b. first is the part's first tile
     unsigned t = (a[0] + u) / 32, r = (a[0] + u) % 32, i = t % tr, p = t / tr % {parts}, b = t / tr / {parts};
     unsigned first = b * a[5] + i * a[6] + p * {ct} + a[7];
-    unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;  // x's rows here, and the row r holds
+    // x's rows here, and the row r holds
+    unsigned n = rows == 1 ? 1 : rows - i * 32 < 32 ? rows - i * 32 : 32, s = rows == 1 ? 0 : r;
     unsigned face = at(r, 0);  // the row's run in the left face
     if (rows == 1 && r) continue;  // with one row of x, the tile row's first unit writes all its copies
     if (s < n) {{
@@ -1245,13 +1256,16 @@ void kmain(volatile unsigned *a) {{
           if (kept == {k} && (raw >= 0 ? d <= raw : key((datum)d) <= last)) continue;  // no better than the worst kept
           unsigned v = key((datum)d), i;
           if (kept < {k}) {{  // it moves up while it's worse than its parent
-            for (top[i = kept++] = v, col[i] = c; i && WORSE(top[i], col[i], top[(i - 1) / 2], col[(i - 1) / 2]); i = (i - 1) / 2)
+            for (top[i = kept++] = v, col[i] = c; i && WORSE(top[i], col[i], top[(i - 1) / 2], col[(i - 1) / 2]);
+                 i = (i - 1) / 2)
               swap(top, col, i, (i - 1) / 2);
           }} else top[0] = v, col[0] = c, down(top, col, 0, {k});  // it replaces the worst
-          if (kept == {k}) last = top[0], raw = last >= {1 << (bits - 1):#x}u ? (int)(last & {(1 << (bits - 1)) - 1:#x}) : -1;
+          if (kept == {k})
+            last = top[0], raw = last >= {1 << (bits - 1):#x}u ? (int)(last & {(1 << (bits - 1)) - 1:#x}) : -1;
         }}
       }}
-      for (unsigned n = kept; n > 1; n--) swap(top, col, 0, n - 1), down(top, col, 0, n - 1);  // the worst goes to the end in turn: best first
+      // the worst goes to the end in turn: best first
+      for (unsigned n = kept; n > 1; n--) swap(top, col, 0, n - 1), down(top, col, 0, n - 1);
       {f"""for (unsigned j = 0; j < {k}; j++) {{  // each pick's label: the 64 bytes around it
         unsigned c = col[j], lt = b * a[10] + i * a[11] + c / 32 + a[12], o = at(s, c % 32) * 4;
         noc_get(BANK(lt), AT(a[9], lt, 4096) + o / 64 * 64, LABELS + j * 64, 64);
@@ -1511,7 +1525,8 @@ def bfp4_kernel():
 {NIBBLE}
 void kmain(volatile unsigned *a) {{
   for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b * a[4] + i * a[5] + j + a[6], tops = 0;
+    unsigned t = a[0] + u, b = t / a[8], i = t % a[8] / a[7], j = t % a[7], from = b * a[4] + i * a[5] + j + a[6],
+             tops = 0;
     noc_get(BANK(from), AT(a[3], from, {tile_bytes("bf16")}), IN, {tile_bytes("bf16")});
     noc_wait();
     for (unsigned r = 0; r < 64; r++) {{  // a run: 8 words of 2 values, its largest exponent, then 2 words of 8 nibbles
@@ -1526,7 +1541,8 @@ void kmain(volatile unsigned *a) {{
       if (r % 4 == 3) {{ ((volatile unsigned *)OUT)[r / 4] = tops; tops = 0; }}
       for (unsigned w = 0; w < 2; w++) {{
         unsigned word = 0;
-        for (unsigned k = 0; k < 4; k++) word |= (nibble(v[4 * w + k], top) | nibble(v[4 * w + k] >> 16, top) << 4) << 8 * k;
+        for (unsigned k = 0; k < 4; k++)
+          word |= (nibble(v[4 * w + k], top) | nibble(v[4 * w + k] >> 16, top) << 4) << 8 * k;
         ((volatile unsigned *)(OUT + 64 + 8 * r))[w] = word;
       }}
     }}
@@ -1626,7 +1642,8 @@ void kmain(volatile unsigned *a) {{
   unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
   launch++;
   unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
-  int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18], hi_r = a[19], hi_c = a[20];
+  int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18],
+      hi_r = a[19], hi_c = a[20];
   // The datums go in lines along the result's rows, or down its columns. Down is for when the columns lie in x as runs
   // (along a row of x, or down a column) and the rows don't or are shorter, and always for a single column. step is
   // the step along a line, in x's elements, split into x's matrices, rows and columns so stepping needs no division.
@@ -1634,17 +1651,21 @@ void kmain(volatile unsigned *a) {{
   int down = rows > 1 && (cols == 1 || run_down && (!run_along || (rows < 32 ? rows : 32) > (cols < 32 ? cols : 32)));
   int step = down ? sr : cols == 1 ? 0 : sc;
   unsigned sq = step >= 0 ? step / xc : 0, sm = step >= 0 ? step % xc : 0, qb = sq / xr, qi = sq % xr;
-  unsigned whole = rows > 1 && cols > 1 && sc == 1 && sr == (int)xc, turned = rows > 1 && cols > 1 && sr == 1 && sc == (int)xc;
+  unsigned whole = rows > 1 && cols > 1 && sc == 1 && sr == (int)xc,
+           turned = rows > 1 && cols > 1 && sr == 1 && sc == (int)xc;
   volatile datum *out = (volatile datum *)OUT, *tile = 0;
   unsigned held_t = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
     int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
-    int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c), c1 = to(j, cols, lo_c, hi_c);
+    int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c),
+        c1 = to(j, cols, lo_c, hi_c);
     // where the tile starts in x
-    unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr, col = e % xc;
+    unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr,
+             col = e % xc;
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
-    if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32 && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
+    if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32
+        && row % 32 == 0 && row + 32 <= xr && col % 32 == 0 && col + 32 <= xc) {{
       if (whole) {{ noc_get(BANK(src), AT(base, src, {tb}), OUT, {tb}); noc_wait(); }}  // x's tile src as it is
       else {{  // x's tile src transposed: face (fr, fc) is its face (fc, fr) transposed
         tile = fetch(base, src);  // keep held_t in step with tile, as the lines below expect
@@ -1658,16 +1679,19 @@ void kmain(volatile unsigned *a) {{
         for (unsigned c = 0; c < 16; c++) out[c] = 0, out[256 + c] = 0;
         r1 = 1;
       }} else {{ copy({ZEROS:#x}, OUT, {tb}); noc_wait(); }}  // padding and what lies outside the bounds stay 0
-      int lines0 = down ? c0 : r0, lines1 = down ? (cols == 1 && c1 ? 1 : c1) : r1, k0 = down ? r0 : c0, k1 = down ? r1 : c1;
+      int lines0 = down ? c0 : r0, lines1 = down ? (cols == 1 && c1 ? 1 : c1) : r1, k0 = down ? r0 : c0,
+          k1 = down ? r1 : c1;
       for (int line = lines0; line < lines1; line++) {{
         int r = down ? k0 : line, c = down ? line : k0;
-        unsigned e_line = (unsigned)e0 + (unsigned)b * sb + (rows == 1 ? 0u : i * 32u + r) * sr + (cols == 1 ? 0u : j * 32u + c) * sc;
+        unsigned e_line = (unsigned)e0 + (unsigned)b * sb + (rows == 1 ? 0u : i * 32u + r) * sr
+                          + (cols == 1 ? 0u : j * 32u + c) * sc;
         unsigned xrow = e_line / xc, xb = xrow / xr, xi = xrow % xr, xj = e_line % xc;
         for (int k = k0; k < k1;) {{
           unsigned xt = xb * bstride + xi / 32 * stride + xj / 32 + offset;
           if (xt != held_t) {{ tile = fetch(base, xt); held_t = xt; }}
           if (step == 1 || step == (int)xc) {{  // a run along a row or column of x, to the end of a face's line or of x
-            unsigned in_row = step == 1, n = k1 - k, m = 16 - k % 16, f = 16 - (in_row ? xj : xi) % 16, left = in_row ? xc - xj : xr - xi;
+            unsigned in_row = step == 1, n = k1 - k, m = 16 - k % 16, f = 16 - (in_row ? xj : xi) % 16,
+                     left = in_row ? xc - xj : xr - xi;
             n = n < m ? n : m; n = n < f ? n : f; n = n < left ? n : left;
             run(out + at(r, c), tile + at(xi % 32, xj % 32), n, down ? 16 : 1, in_row ? 1 : 16);
             k += n;
