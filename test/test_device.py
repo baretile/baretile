@@ -351,11 +351,14 @@ class FakeKmd:
 def test_kmd(tmp_path, monkeypatch):
   # Kmd maps BAR0 and the TLB windows kmd gives it, and reads and writes go to the right one. A window kmd configures has
   # the 96 bits that Card writes, including the static VC class that CONFIGURE_TLB leaves out. Pinned DMA memory goes
-  # back when its memoryview does, and an ARC message waits for kmd's answer. One Kmd has a device at a time.
+  # back when its memoryview does, and an ARC message waits for kmd's answer. One Kmd has a device at a time, and a
+  # dropped one lets the next one open it.
   kmd = FakeKmd(tmp_path)
   monkeypatch.setattr(pci.fcntl, "ioctl", kmd.ioctl)
   card = pci.Kmd("0000:01:00.0", kmd.path)
   with pytest.raises(RuntimeError, match="already open"): pci.Kmd("0000:01:00.0", kmd.path)
+  del card
+  card = pci.Kmd("0000:01:00.0", kmd.path)  # the dropped one closed its file, and its lock with it
   read_reg = lambda id: int.from_bytes(os.pread(kmd.fd, 12, bh.TLB_CONFIG + 12 * id), "little")
   unicast = dict(addr=5, x_end=3, y_end=4, ordering=bh.STRICT)
   multicast = unicast | dict(x_start=1, y_start=2, mcast=1, static_vc=1, vc_class=bh.MCAST_VC)
