@@ -87,7 +87,8 @@ The matmul and ReLU run when you call `tolist()`. Until then, they're an
 expression waiting to be compiled. They run in one kernel here: the ReLU works on
 the matmul's result in the math unit's registers, before it's written out.
 
-Tensors support broadcasting, reductions, views and autograd. Storage formats are
+Tensors have up to five dimensions, with the last two stored as tiles, and
+support broadcasting, reductions, views and autograd. Storage formats are
 bf16, fp32, int32, bfp8 and bfp4. The
 [compiler docs](https://github.com/baretile/baretile/blob/main/docs/compiler.md)
 explain the layout and precision limits.
@@ -176,6 +177,8 @@ python3 -m pip install numpy pytest
 python3 -m pytest -s test
 ```
 
+With pytest-xdist installed, `python3 -m pytest -n auto test` runs them in a
+process for each CPU, as CI does. On GitHub's four-CPU runner, that halves the time.
 Tests that need checkpoint files are opt-in, and
 [testing](https://github.com/baretile/baretile/blob/main/docs/testing.md#optional-checks)
 lists them.
