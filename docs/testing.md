@@ -161,11 +161,14 @@ model-specific DeltaNet and MoE kernel checks (`test_delta_step`,
 `test_delta_pieces` and `test_moe`). The device tests cover the runtime's
 takeover, cancellation, shutdown and host memory, where timing bugs hide. None of
 them depends on exact simulated timing. CI also runs the whole suite with
-`TTSIM_CHAOS_UNHARVESTED=1`. Each job runs a process for each CPU, and with
-`PART=i/n` a process runs every nth test from the ith. A process's noise follows
-from the seed and the tests it runs, in order. So `TTSIM_CHAOS_SEED=s PART=i/n`,
-with the job's settings and tests, repeats a failed part, and the log shows all
-of them.
+`TTSIM_CHAOS_UNHARVESTED=1`, beside the released ttsim's.
+
+CI splits its runs across runners with `PART=i/n`, which runs every nth test from
+the ith. The suite on each ttsim runs as three jobs, each in a pytest-xdist
+worker for each CPU. The noise runs as two jobs, each a process for each CPU on
+its own part. A process's noise follows from the seed and the tests it runs, in
+order, so `TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests,
+repeats a failed part, and the log shows all of them.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
