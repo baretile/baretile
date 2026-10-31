@@ -403,7 +403,7 @@ def test_tensor_inputs(chip):
   assert x[-1].tolist() == [[3, 4]]
   for index in (-3, 2):
     with pytest.raises(IndexError, match="batch"): x[index]
-  for shape in ((), (1, 1, 2, 2)):
+  for shape in ((), (1, 1, 1, 1, 2, 2)):
     with pytest.raises(ValueError, match="dimensions"): x.reshape(*shape)
     with pytest.raises(ValueError, match="dimensions"): x.expand(*shape)
   for axis in (-4, 3):
@@ -1546,6 +1546,58 @@ def test_movement(chip):
     for _ in range(3):
       t, a = move(t, a)
       assert value(t).tolist() == a.reshape(t.shape).tolist(), a.shape
+
+def test_leading_dimensions(chip):
+  # A tensor takes up to five dimensions, and the leading ones fold into the batch in row-major order, so (2, 3, 5, 40)
+  # is stored as (6, 5, 40). A reshape of the leading sizes alone is then a view, with no launch, and an unrealized one
+  # fuses into the kernel that reads it. Elementwise ops, reductions, matmuls, transposes and slices of the first
+  # leading dimension keep the leading shape, an operand whose leading sizes are all 1 broadcasts, and a gradient
+  # comes back through the views to each input's shape.
+  rng, rt = np.random.default_rng(38), Runtime(chip)
+  x, y = (bf16(rng.uniform(-2, 2, (2, 3, 5, 40))) for _ in range(2))
+  tx, ty = Tensor.of(rt, x.tolist()), Tensor.of(rt, y.tolist())
+  assert tx.shape == (2, 3, 5, 40) and tx.batch == 6 and tx.tolist() == x.tolist(), "nested as numpy nests it"
+  launches, flat = rt.launches, tx.reshape(6, 5, 40)
+  assert flat.shape == (6, 5, 40) and flat.addr == tx.addr and rt.launches == launches, "a view of the same matrices"
+  five = flat.reshape(3, 1, 2, 5, 40)
+  assert five.shape == (3, 1, 2, 5, 40) and five.tolist() == x.reshape(3, 1, 2, 5, 40).tolist()
+  assert value(Tensor.of(rt, x.reshape(1, 2, 3, 5, 40).tolist())).tolist() == x.reshape(1, 2, 3, 5, 40).tolist()
+  launches, t = rt.launches, ((tx + ty).reshape(6, 5, 40) * 2).realize()
+  assert kernels(rt, launches) == 1 and t.shape == (6, 5, 40), "the reshape reads through to the sum, in one kernel"
+  close(t, ((x + y) * 2).reshape(6, 5, 40), 2**-5)
+  row, matrix = bf16(rng.uniform(-2, 2, (2, 3, 1, 40))), bf16(rng.uniform(-2, 2, (5, 40)))
+  close(tx * ty - Tensor.of(rt, row.tolist()), x * y - row, 2**-5)
+  close((tx + Tensor.of(rt, matrix.tolist())).exp(), np.exp(x + matrix), 2**-5)
+  close(tx.sum(-1), x.sum(-1, keepdims=True), 2**-6)
+  close(tx.max(-2), x.max(-2, keepdims=True), 0)
+  close(tx.softmax(-1), np.exp(x) / np.exp(x).sum(-1, keepdims=True), 2**-6)
+  close(tx[1:2, :, :, :].sum(1), x[1:2].sum(1, keepdims=True), 2**-6)
+  w, v = bf16(rng.uniform(-1, 1, (2, 3, 40, 8))), bf16(rng.uniform(-1, 1, (40, 8)))
+  close(tx @ Tensor.of(rt, w.tolist()), x @ w, 2**-6)
+  close(tx @ Tensor.of(rt, v.tolist()), x @ v, 2**-6)
+  column = x.reshape(6, 1, 5, 40)  # a leading size of 6 over sizes of 1, which a slice can step through
+  for t, want in [(tx[1], x[1]), (tx[-2:-1, :, :, :], x[-2:-1]), (tx.reshape(6, 1, 5, 40)[::2, :, :, :], column[::2]),
+                  (tx[1:2, :, 1:4, 8:40], x[1:2, :, 1:4, 8:40]), (tx.T, x.transpose(0, 1, 3, 2)),
+                  (tx.reshape(3, 2, 8, 25), x.reshape(3, 2, 8, 25))]:
+    assert t.shape == want.shape and value(t).tolist() == want.tolist(), (t.shape, want.shape)
+  with pytest.raises(ValueError, match="dimensions"): tx.reshape(1, 2, 1, 3, 5, 40)
+  with pytest.raises(ValueError, match="broadcasting"): tx + Tensor.of(rt, x[:1].tolist())
+  with pytest.raises(ValueError, match="leading"): tx.sum(1)
+  with pytest.raises(ValueError, match="leading"): tx[:, 1:2, :, :]
+  with pytest.raises(ValueError, match="matmul"): tx @ Tensor.of(rt, w[:1].tolist())
+  with pytest.raises(ValueError, match="three dimensions"): tx.split(2)
+  out = Tensor.zeros(rt, 8, 25, 6).reshape(2, 3, 8, 25)
+  assert value(out.assign(tx.reshape(2, 3, 8, 25))).tolist() == x.reshape(2, 3, 8, 25).tolist()
+  double = tensor.jit(lambda t: t * 2)  # run, recorded, then replayed, each with the leading shape
+  for t, want in ((tx, x), (ty, y), (tx, x)): assert value(double(t)).tolist() == (2 * want).tolist()
+  a = Tensor.of(rt, x.tolist(), "fp32").requires_grad_()
+  b = Tensor.of(rt, matrix.tolist(), "fp32").requires_grad_()
+  close(a.sum(), x.sum(keepdims=True), 1e-5)
+  assert bool(a.sum()) and not Tensor.of(rt, [[[[0.0]]]])
+  assert value(a.sum().gradient(a)[0]).tolist() == np.ones_like(x).tolist()
+  ga, gb = (a * a * b).sum().gradient(a, b)  # b is one matrix for all six, so its gradient sums over them
+  assert ga.shape == x.shape and value(ga).tolist() == (2 * x * matrix).tolist()
+  close(gb, (x * x).sum((0, 1)), 1e-5)
 
 def test_fp32(chip):
   # fp32 tensors have 4 KiB tiles. The math thread unpacks them into Dst, bypassing SrcA and SrcB, and the SFPU does
