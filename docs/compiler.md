@@ -19,6 +19,23 @@ are ordered by row. Element `(r, c)` has this offset within a tile:
 Ordinary storage assigns tile `i` to bank `i % 8`. Tensor dimensions are padded
 to tiles. A dimension of one is repeated across its tile for broadcasting.
 Other padding is zeroed.
+
+A tensor's leading dimensions fold into the batch in row-major order, so
+`(2, 3, rows, cols)` is stored as `(6, rows, cols)`, and kernels see three
+dimensions. Only the last two are tiles, so each matrix pads to whole tiles: a
+`(N, C, 7, 7)` tensor uses 49 of each tile's 1,024 values. Keep the last two
+dimensions large, and merge small ones into them. A reshape that changes only
+the leading sizes is a view, and so is a slice that picks evenly spaced
+matrices, as any slice of the first leading dimension does. Other movement over
+leading dimensions is one launch of the move kernel, which maps up to five axes.
+
+An operand whose leading sizes are one run of the result's, like `(2, 1)` or
+`(1, 3)` in `(2, 3)`, is read in place: for the result's matrix `b`, a kernel
+reads its matrix `(b / rep) % n`, as it reads `b / rep` of a repeat. Other
+patterns, like `(2, 1, 2)` in `(2, 3, 2)`, are expanded by a move first. A
+reduction over a leading dimension sweeps each result tile's line through the
+batch, from the first matrix that folds into it and a step of the dimensions
+after it at a time.
 Tensor dimensions must be positive integers. `Tensor.of` accepts rectangular
 matrices of the same shape, and `Tensor.frombytes` checks the byte count before
 allocating memory. Operations require operands from the same runtime; use
