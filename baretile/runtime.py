@@ -207,10 +207,11 @@ def compile_rv32(src):
   return image
 
 # Kernel programs start here. A kernel stays loaded between launches, so kentry zeroes its .bss at the start of a
-# launch. Statics with any other starting value must be const.
+# launch. Statics with any other starting value must be const. kmain isn't static, so inlined into kentry it would
+# be in the image twice: kentry calls it.
 KENTRY = """
 extern unsigned __bss_start[], __bss_end[];
-void kmain(volatile unsigned *args);
+__attribute__((noinline)) void kmain(volatile unsigned *args);
 __attribute__((section(".start"))) void kentry(volatile unsigned *args) {
   for (volatile unsigned *p = __bss_start; p < __bss_end; p++) *p = 0;
   kmain(args);
