@@ -295,7 +295,15 @@ BINARY = {Ops.ADD: lambda a, b: a + b, Ops.SUB: lambda a, b: a - b, Ops.MUL: lam
           Ops.MAX: lambda a, b: a.maximum(b) if is_tensor(a) else b.maximum(a), Ops.CMPNE: lambda a, b: a.ne(b) if is_tensor(a) else b.ne(a),
           Ops.CMPEQ: lambda a, b: a.eq(b) if is_tensor(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if is_tensor(b) else a / b,
           Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if is_tensor(a) else b.maximum(a)}  # AND and OR of bools only
-ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST}
+ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST, Ops.POW}
+def power(x, e):
+  """x ** e as tinygrad's POW, for a number e: products for a whole e up to 4, so a negative x keeps its sign, and
+  exp2(e log2 x) for a fraction, which is NaN for a negative x, as pow is. None otherwise, for the host."""
+  if e == int(e) and 0 < abs(e) <= 4:
+    p = x
+    for _ in range(int(abs(e)) - 1): p = p * x
+    return p if e > 0 else p.reciprocal()
+  return (x.log2() * e).exp2() if e != int(e) else None
 EMPTIABLE = GroupOp.Elementwise | GroupOp.Movement | {Ops.REDUCE, Ops.COPY}  # ops whose result can be empty
 
 def spread_to(v, shape):  # broadcast an operand of a binary op: a view on the chip, tinygrad's expand on the host
@@ -334,9 +342,15 @@ class Evaluator:
     whole = lambda t: Value(spread(as_u(t), shape, groups), View(shape), u.dtype)
     if u.op in UNARY: return whole(UNARY[u.op](self.operand(srcs[0], shape, groups)))
     if u.op in BINARY: return whole(BINARY[u.op](*(self.operand(s, shape, groups) for s in srcs)))
+    if u.op is Ops.POW:  # a tensor to a number's power, like an MSE loss's square, and its gradient's
+      x, e = (self.operand(s, shape, groups) for s in srcs)
+      return whole(p) if is_tensor(x) and not is_tensor(e) and (p := power(x, e)) is not None else None
     if u.op is Ops.WHERE:
       c, x, y = (self.operand(s, shape, groups) for s in srcs)
-      if not is_tensor(c): return None
+      if not is_tensor(c):  # a constant condition picks a side, as pow's gradient's check of its exponent does
+        pick, other = (x, y) if c else (y, x)
+        if not is_tensor(pick): pick = other.number(pick, DTYPES[u.dtype]) if is_tensor(other) and DTYPES.get(u.dtype) else None
+        return None if pick is None else whole(pick)
       return whole(c.where(x, y))
     # a cast of a view that covers its tensor, like a transposed weight, casts the tensor and keeps the view, so a
     # matmul can read the cast's source in place
