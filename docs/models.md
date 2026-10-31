@@ -72,6 +72,13 @@ reads it rounded to bf16. In bf16, a large activation that a later block cancels
 would lose the low bits of what's left: SmolLM-135M has one of about 31,000,
 which a bf16 copy holds only to within 128. GPT-2's stream is still bf16.
 
+Qwen3 and Qwen3.5 RMS-norm each head of q and k before RoPE. The norm reads the
+qkv matmul's fp32 sum, runs in fp32 and rounds once to bf16 for RoPE. In bf16,
+the norm's scale would round once for a whole head, and a score doesn't average
+that error out over its products, as it does the roundings of single values.
+Qwen3-0.6B's norm weights make scores near 48, where a rounding of 2^-8 is 0.19
+([#70](https://github.com/baretile/baretile/issues/70)).
+
 The loader fuses q, k and v projections, and gate and up projections, where
 appropriate. Matmul weights are stored by tile columns. The KV cache is
 allocated once and zeroed on the chip, and each token writes its keys and values

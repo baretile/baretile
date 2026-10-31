@@ -2312,8 +2312,10 @@ def test_serve_sessions(chip, tmp_path, kv):
 def test_serve_speculative(chip, tmp_path):
   # The serve.py engine drafts with the multi-token prediction layer of the small Qwen3.5. An oracle's drafts are nearly
   # all accepted, and the random layer's are nearly all rejected. Either way the tokens must agree with numpy, and a
-  # next turn resumes from the session with the states from before any rejected draft.
-  rt, rng = Runtime(chip), np.random.default_rng(31)
+  # next turn resumes from the session with the states from before any rejected draft. In bf16, the chip's largest
+  # error over these seven requests is 3.0%, and 2.9% with the q and k norm in bf16, so the bound is 4%, as in
+  # test_serve_sessions' bfp8.
+  rt, rng, tol = Runtime(chip), np.random.default_rng(31), 0.04
   c, weights = qwen35(rng)
   w, tok, t = llama.arrays(weights), bytes_tokenizer(tmp_path), llama.upload(rt, weights)
   class Oracle(serve.Engine):
@@ -2326,13 +2328,13 @@ def test_serve_speculative(chip, tmp_path):
     threading.Thread(target=engine.run, daemon=True).start()
     together = [Kept(tok, p, 8, 0) for p in prompts]
     served(engine, together)
-    for r in together: agrees(r, w, c)
+    for r in together: agrees(r, w, c, tol)
     assert engine.spec and (engine.agreed >= 0.8 * engine.drafted if kind is Oracle
                             else engine.agreed <= 0.2 * engine.drafted), (engine.agreed, engine.drafted)
   first = together[0]
   before, r = engine.prefilled, Kept(tok, first.ids + first.made + [9, 8], 4, 0)
   served(engine, r)
-  agrees(r, w, c)
+  agrees(r, w, c, tol)
   assert engine.prefilled - before == 3, engine.prefilled - before
 
 def test_session_snapshot_without_device_space(chip):
