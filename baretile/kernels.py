@@ -58,7 +58,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   shapes lists (batch, rows, columns) per input; dimensions of size 1 broadcast. dtype sets the input
   and computation format. out sets the final storage format, allowing a cast or an fp32 matmul result.
   grid and readers come from Runtime: grid enables multicast sharing, and readers assigns DRAM banks
-  and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep.
+  and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep. An input
+  spread over the result's leading dimensions has (rep, n) there, and matrix b reads (b // rep) % n.
 
   Kernel arguments:
   - a[0:2]: first work unit and unit count.
@@ -347,9 +348,13 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
     return FRAMES + 2 * frame + r[1]
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
-  def which(r):  # the matrix of r that goes with matrix b of the result: b, b / rep for a repeat, or 0 for a batch of 1
+  # the matrix of r that goes with matrix b of the result: b, b / rep for a repeat, (b / rep) % n for an input spread
+  # over the result's leading dimensions, or 0 for a batch of 1
+  def which(r):
     if size(r)[0] == 1: return "0"
-    return f"b / {reps[r]}" if reps and isinstance(r, int) and reps[r] > 1 else "b"
+    rep, n = (reps[r] if isinstance(reps[r], tuple) else (reps[r], 0)) if reps and isinstance(r, int) else (1, 0)
+    if n: return f"(b / {rep}) % {n}" if rep > 1 else f"b % {n}"
+    return f"b / {rep}" if rep > 1 else "b"
   def matrix(r, base):  # the batch term of r's tile number
     return "" if size(r)[0] == 1 else f"{which(r)} * a[{base + 1}] + "
   # The tile of r that goes with b, i_ and j. r is an input or the result, its [address, strides, offset] at a[base].

@@ -1578,6 +1578,29 @@ def test_leading_movement(chip):
   with pytest.raises(ValueError, match="permute"): tx.permute(0, 1, 2)
   with pytest.raises(ValueError, match="move"): tx.move((1, 1, 1, 1, 1, 1), 0, (0,) * 6)
 
+def test_leading_broadcast(chip):
+  # numpy's broadcasting over leading dimensions. An operand whose leading sizes are one run of the result's, like
+  # (2, 1) or (1, 3) in (2, 3), is read in place, in the kernel that reads it: for the result's matrix b, its matrix
+  # (b / rep) % n. Others, like (2, 1, 2) in (2, 3, 2), are expanded by a move first. matmul broadcasts the same way.
+  rng, rt = np.random.default_rng(40), Runtime(chip)
+  x, z = bf16(rng.uniform(-2, 2, (2, 3, 5, 40))), bf16(rng.uniform(-2, 2, (2, 3, 2, 5, 40)))
+  tx, tz = Tensor.of(rt, x.tolist()), Tensor.of(rt, z.tolist())
+  for big, t, lead, copied in [(x, tx, (2, 1), False), (x, tx, (1, 3), False), (x, tx, (3,), False), (x, tx, (1, 1), False),
+                               (z, tz, (2, 1, 1), False), (z, tz, (1, 3, 2), False), (z, tz, (1, 1, 2), False),
+                               (z, tz, (2, 3, 1), False), (z, tz, (1, 3, 1), False), (z, tz, (2, 1, 2), True)]:
+    y = bf16(rng.uniform(-2, 2, (*lead, 5, 40)))
+    ty = Tensor.of(rt, y.tolist())
+    launches, got = rt.launches, (t * ty).realize()
+    assert kernels(rt, launches) == 1 + copied, (lead, "read in place" if not copied else "expanded first")
+    close(got, big * y, 2**-6)
+    close(ty - t * ty, y - big * y, 2**-5)
+  row = bf16(rng.uniform(-2, 2, (2, 1, 1, 40)))  # broadcast along the rows too
+  close(tx * Tensor.of(rt, row.tolist()), x * row, 2**-6)
+  w, v = bf16(rng.uniform(-1, 1, (2, 3, 40, 8))), bf16(rng.uniform(-1, 1, (2, 1, 5, 40)))
+  for b in (w[:, :1], w[:1], w[0]):
+    close(tx @ Tensor.of(rt, b.tolist()), x @ b, 2**-6)
+  close(Tensor.of(rt, v.tolist()) @ Tensor.of(rt, w.tolist()), v @ w, 2**-6)
+
 def test_leading_dimensions(chip):
   # A tensor takes up to five dimensions, and the leading ones fold into the batch in row-major order, so (2, 3, 5, 40)
   # is stored as (6, 5, 40). A reshape of the leading sizes alone is then a view, with no launch, and an unrealized one
@@ -1592,7 +1615,7 @@ def test_leading_dimensions(chip):
   assert flat.shape == (6, 5, 40) and flat.addr == tx.addr and rt.launches == launches, "a view of the same matrices"
   five = flat.reshape(3, 1, 2, 5, 40)
   assert five.shape == (3, 1, 2, 5, 40) and five.tolist() == x.reshape(3, 1, 2, 5, 40).tolist()
-  assert value(Tensor.of(rt, x.reshape(1, 2, 3, 5, 40).tolist())).tolist() == x.reshape(1, 2, 3, 5, 40).tolist()
+  assert value(Tensor.of(rt, x.reshape(2, 3, 1, 5, 40).tolist())).tolist() == x.reshape(2, 3, 1, 5, 40).tolist()
   launches, t = rt.launches, ((tx + ty).reshape(6, 5, 40) * 2).realize()
   assert kernels(rt, launches) == 1 and t.shape == (6, 5, 40), "the reshape reads through to the sum, in one kernel"
   close(t, ((x + y) * 2).reshape(6, 5, 40), 2**-5)
@@ -1612,9 +1635,8 @@ def test_leading_dimensions(chip):
                   (tx.reshape(3, 2, 8, 25), x.reshape(3, 2, 8, 25))]:
     assert t.shape == want.shape and value(t).tolist() == want.tolist(), (t.shape, want.shape)
   with pytest.raises(ValueError, match="dimensions"): tx.reshape(1, 2, 1, 3, 5, 40)
-  with pytest.raises(ValueError, match="broadcasting"): tx + Tensor.of(rt, x[:1].tolist())
   with pytest.raises(ValueError, match="leading"): tx.sum(1)
-  with pytest.raises(ValueError, match="matmul"): tx @ Tensor.of(rt, w[:1].tolist())
+  with pytest.raises(ValueError, match="matmul"): tx @ Tensor.of(rt, w[:, :2].tolist())
   with pytest.raises(ValueError, match="three dimensions"): tx.split(2)
   out = Tensor.zeros(rt, 8, 25, 6).reshape(2, 3, 8, 25)
   assert value(out.assign(tx.reshape(2, 3, 8, 25))).tolist() == x.reshape(2, 3, 8, 25).tolist()

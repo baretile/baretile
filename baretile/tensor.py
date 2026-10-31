@@ -46,7 +46,7 @@ class Tensor:
     self.tiles, self.bstride, self.stride, self.offset, self.owner, self.rep = batch * tr * tc, tr * tc, tc, 0, None, 1
     # by columns: (runs a batch entry moves on in each bank, tiles a run, tiles a batch entry moves along its runs).
     # columns gives (runs a matrix, tiles a run, 0), and split, cutting K, gives (0, tiles a run, K tiles a part)
-    self.runs = None
+    self.runs, self.cyc = None, 0  # cyc, if not 0: kernels read stored matrix (b / rep) % cyc, as a spread's view has
     self.addr = None if op else self._alloc()
     self.requires_grad, self.grad, self._ctx = False, None, None
     if op not in (None, "move", "view"): self._track(op, srcs)  # moves and views are tracked by their callers
@@ -93,7 +93,7 @@ class Tensor:
     while isinstance(data[0][0], (list, tuple)) and len(data[0][0]) and isinstance(data[0][0][0], (list, tuple)):
       if len(lead) == DIMS - 3 or any(not isinstance(d, (list, tuple)) or len(d) != len(data[0]) for d in data):
         raise ValueError(f"tensor data must be rectangular, with at most {DIMS} dimensions")
-      lead, data = lead + [len(data)], [m for d in data for m in d]
+      lead, data = lead + [len(data) // math.prod(lead)], [m for d in data for m in d]  # an entry per index along lead
     matrices = data if isinstance(data[0][0], (list, tuple)) else [data]
     rows, cols = len(matrices[0]), len(matrices[0][0])
     if not cols or any(len(m) != rows or any(len(row) != cols for row in m) for m in matrices):
@@ -260,6 +260,20 @@ class Tensor:
     if self.op is None: t = self._view(*self.shape[-2:], self.batch, 0, self.bstride, self.runs)._track("lead", (self,))
     else: t = Tensor(self.rt, self.rows, self.cols, "lead", (self,), self.batch, self.dtype)
     t.lead = lead
+    return t
+
+  def _spread(self, lead):
+    """These matrices broadcast over the leading dimensions lead, where this tensor has some of lead's sizes and 1 for
+    the rest. When its sizes are one run of lead's, like (A, 1) or (1, B) in (A, B), a kernel reads its matrix
+    (b / rep) % n for matrix b of the result, without a copy. Others, like (A, 1, C) in (A, B, C), expand by a move."""
+    mine, big = (1,) * (len(lead) - len(self.lead)) + self.lead, [k for k, n in enumerate(lead) if n > 1]
+    run = [k for k in big if mine[k] > 1]  # the dimensions this tensor's matrices step through, of those b does
+    at = big.index(run[0])
+    if run != big[at:at + len(run)]: return self.expand(*lead, self.rows, self.cols)
+    t = Tensor(self.rt, self.rows, self.cols, "spread", (self,), math.prod(lead), self.dtype)
+    # rep of the result's matrices in a row read each of these. Past n of them it starts over, unless the run is first
+    t.lead, t.view = tuple(lead), None
+    t.spread = (math.prod(lead[k] for k in big[at + len(run):]), self.batch if at else 0)
     return t
 
   def __getitem__(self, key):
@@ -459,11 +473,12 @@ class Tensor:
                          "assign copies a realized one")
       _writes(into)
     if self.op is None: return self
-    if self.op == "lead":  # its source's matrices, so it becomes a view of them, and needs no launch of its own
-      x, to = self.srcs[0], None if into is None else into._relabel(self.srcs[0].lead)
+    if self.op in ("lead", "spread"):  # a view of its source's matrices, with no launch, or a spread copied out
+      x = self.srcs[0] if self.op == "lead" else self + 0
+      to = None if into is None else into._relabel(x.lead)
       x = x.realize() if to is None else to.assign(x)
-      self.op, self.srcs, self.addr, self.owner = None, (), x.addr, _root(x)
-      self.offset, self.bstride, self.stride, self.rep, self.runs = x.offset, x.bstride, x.stride, x.rep, x.runs
+      self._alias(x)
+      self.op, self.srcs, self.rep, self.runs = None, (), x.rep, x.runs
       return self
     if self.op in ("T", "move"):  # data movement, into a tensor of its own
       if into is not None: raise ValueError("a transpose or a move writes a tensor of its own")
@@ -492,7 +507,8 @@ class Tensor:
     shapes = tuple(u._dims for u in inputs)
     # when only the result's rows matter, round the inputs' rows up to tiles, so the same kernel serves any row count
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
-    key = (e, shapes, dtype, self.dtype, self.rt.grid, tuple(u.rep for u in inputs), self.rt.readers)
+    reps = tuple((u.rep, u.cyc) if u.cyc else u.rep for u in inputs)
+    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into is not None: self._alias(into)
     else: self.addr = self._alloc()
@@ -554,10 +570,9 @@ class Tensor:
     a, b = (x, self) if reverse else (self, x)
     if a.dtype != b.dtype or (a.dtype == "int32" and op not in INT32_OPS): a, b = a.float(), b.float()
     if (shape := _broadcast(a.shape, b.shape)) is None: raise ValueError(f"cannot broadcast {a.shape} with {b.shape}")
-    batch = math.prod(shape[:-2])
-    if a.batch not in (1, batch) or b.batch not in (1, batch):  # a kernel reads an operand's matrix b, or its only one
-      raise ValueError(f"broadcasting {a.shape} with {b.shape} needs leading sizes all 1 or all the result's")
-    return _lead(Tensor(self.rt, *shape[-2:], op, (a, b), batch, a.dtype), shape[:-2])
+    batch, lead = math.prod(shape[:-2]), shape[:-2]
+    a, b = (u if u.batch in (1, batch) else u._spread(lead) for u in (a, b))  # with some of the leading sizes
+    return _lead(Tensor(self.rt, *shape[-2:], op, (a, b), batch, a.dtype), lead)
   def cast(self, dtype):  # bfp4 isn't lazy: bfp4_kernel makes it now from the bf16 value, and says why
     if dtype not in (*ITEMSIZE, *BFP): raise ValueError(f"unknown tensor dtype: {dtype}")
     if dtype == self.dtype and not self.runs: return self
@@ -727,9 +742,10 @@ class Tensor:
     without reading a matrix. A matmul by index has no gradient."""
     self._same_runtime(x, *((index,) if index is not None else ()))
     if len(self.shape) > 3 or len(x.shape) > 3:  # the leading dimensions broadcast, and the batches multiply
-      if (lead := _broadcast(self.lead, x.lead)) is None or {self.batch, x.batch} - {1, math.prod(lead)}:
-        raise ValueError(f"matmul needs leading sizes that match, or are all 1 on one side: {self.shape} @ {x.shape}")
-      return self._relabel((self.batch,)).matmul(x._relabel((x.batch,)), dtype, fidelity, index)._relabel(lead)
+      if (lead := _broadcast(self.lead, x.lead)) is None:
+        raise ValueError(f"matmul needs leading sizes that broadcast: {self.shape} @ {x.shape}")
+      a, b = (u if u.batch in (1, math.prod(lead)) else u._spread(lead) for u in (self, x))
+      return a._relabel((a.batch,)).matmul(b._relabel((b.batch,)), dtype, fidelity, index)._relabel(lead)
     if dtype == "int32": return self.matmul(x, "fp32", fidelity, index).cast("int32")
     fidelity = FIDELITY if fidelity is None else operator.index(fidelity)
     if not 1 <= fidelity <= 4: raise ValueError("matmul fidelity must be between one and four phases")
@@ -905,7 +921,7 @@ def _lead(t, lead):  # t, a tensor this call made, with leading dimensions lead
 def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for ops that can't take g broadcast
 def _strides(shape): return tuple(math.prod(shape[k + 1:]) for k in range(len(shape)))  # in row-major order
 def _split(values, n): return values[:n], values[n:2 * n], values[2 * n:]  # a move's strides, lo and hi
-def _layout(t): return t._dims, t.bstride, t.stride, t.offset, t.rep, t.runs
+def _layout(t): return t._dims, t.bstride, t.stride, t.offset, t.rep, t.cyc, t.runs
 
 def _graph(t):  # autograd's operands before their users, without recursion through long histories
   order, seen, stack = [], set(), [(t, False)]
@@ -941,6 +957,7 @@ def _backward(t, g):
            "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
            "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g}
   if op in unary: return (unary[op](),)
+  if op == "spread": return (_unbroadcast(g, x.shape),)  # each matrix's copies add their gradients up
   if op == "lead":  # the same matrices. a gradient that's one matrix for all of them, as a sum's is, stays one
     g = g if g.batch in (1, t.batch) else _full(g, t.shape)
     return (g._relabel(x.lead if g.batch == t.batch else (1,) * len(x.lead)),)
@@ -1041,8 +1058,8 @@ def _inside(o, s, lo, hi, n):  # the e in [0, n) with lo <= o + s e < hi, as (fi
 
 WHOLE = ("matmul", "T", "move", "cast")  # ops whose operands are realized first, not fused into the same kernel
 # what a kernel for t computes with it: not the operands of a WHOLE op, unless it's a cast at the root
-def _below(t, root):
-  return t.srcs if t.op not in WHOLE or root and t.op == "cast" else ()
+def _below(t, root):  # the operands a kernel for t computes. a spread's is read in place, as an input
+  return t.srcs if t.op not in (*WHOLE, "spread") or root and t.op == "cast" else ()
 def _lazy(t, seen):  # the unrealized ops under t, t first
   stack = [(t, True)]
   while stack:
@@ -1052,7 +1069,7 @@ def _lazy(t, seen):  # the unrealized ops under t, t first
     yield u
     stack.extend((s, False) for s in reversed(_below(u, root)))
 
-def _ops(t): return sum(u.op != "lead" for u in _lazy(t, set()))  # how many ops a kernel for t would hold, at most
+def _ops(t): return sum(u.op not in ("lead", "spread") for u in _lazy(t, set()))  # the most ops a kernel for t holds
 
 def _tree(t, inputs):
   """The expression that fused_kernel computes for t, with realized tensors as indices into inputs, and the dtype it
@@ -1100,6 +1117,7 @@ def _expr(t, shape, inputs, kernel):
   if t is kernel[4] and t.op == "cast": return ("cast", _expr(t.srcs[0], shape, inputs, kernel))
   if t is not kernel[4] and (t.dtype != kernel[3] or t.op == "cast" or (t.op == "matmul" and kernel[3] != "bf16")):
     return _expr(t.realize(), shape, inputs, kernel)
+  if t.op == "spread": return _input(_spread_view(t), inputs)  # read in place, like an input
   axis = kernel[0]
   if any(t._dims[ax] != shape[ax] for ax in range(3) if ax != axis): return _expr(t.realize(), shape, inputs, kernel)
   if t.op in COMBINE:
@@ -1112,18 +1130,29 @@ def _expr(t, shape, inputs, kernel):
   # kernels of their own, but a matmul can read B transposed (below)
   if t.op in ("T", "move"): return _expr(t.realize(), shape, inputs, kernel)
   if t.op == "matmul":  # a matmul reads its operands as matrices, not tile by tile, so realize them first
-    a, b, *picked = t.srcs  # picked: the indices that pick B's matrices, if any
+    a, b, *picked = map(_bare, t.srcs)  # picked: the indices that pick B's matrices, if any
     if b.op == "T":  # read transposed. a block float, like a bfp8 key cache, is read as is and transposed on the way in
       src = b.srcs[0].realize()
       if src.runs: raise ValueError("a tensor by columns can only be a matmul's B as it is, not transposed")
       b = ("T" + src.dtype, _input(src, inputs)) if src.dtype in BFP else ("T", _expr(src, shape, inputs, kernel))
     elif b.runs: b = ("C" + (b.dtype if b.dtype in BFP else ""), _input(b, inputs))  # laid out by columns()
-    else: b = (b.dtype, _input(b.realize(), inputs)) if b.dtype in BFP else _expr(b.realize(), shape, inputs, kernel)
+    else: b = (b.dtype, _input(_operand(b), inputs)) if b.dtype in BFP else _expr(_operand(b), shape, inputs, kernel)
     if picked:
       b = (("I" + b[0], b[1], _input(picked[0].realize(), inputs)) if isinstance(b, tuple) else
            ("I", b, _input(picked[0].realize(), inputs)))
-    return ("matmul", _expr(a.realize(), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
+    return ("matmul", _expr(_operand(a), shape, inputs, kernel), b) + ((t.fidelity,) if t.fidelity != 4 else ())
   return (t.op, *(_expr(s, shape, inputs, kernel) for s in t.srcs))
+
+def _bare(t):  # t without relabels, which matmul reads through, since its matrices are the same
+  while t.op == "lead": t = t.srcs[0]
+  return t
+def _operand(t): return _spread_view(t) if t.op == "spread" else t.realize()  # a matmul's operand, read in place
+def _spread_view(t):  # a spread as a kernel reads it: its source's matrices, with the result's batch
+  if t.view is None:  # made once, so a kernel that reads it twice reads one input
+    x = _plain(t.srcs[0].realize())
+    t.view = x._view(t.rows, t.cols, t.batch, 0, x.bstride)
+    t.view.rep, t.view.cyc = t.spread
+  return t.view
 
 def _input(t, inputs):  # the index of a realized tensor among a kernel's inputs, added if new
   for i, u in enumerate(inputs):
