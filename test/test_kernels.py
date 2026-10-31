@@ -1601,6 +1601,30 @@ def test_leading_broadcast(chip):
     close(tx @ Tensor.of(rt, b.tolist()), x @ b, 2**-6)
   close(Tensor.of(rt, v.tolist()) @ Tensor.of(rt, w.tolist()), v @ w, 2**-6)
 
+def test_leading_reductions(chip):
+  # A reduction over a leading dimension sweeps each result tile's line through the batch, from the result matrix's
+  # first matrix, a step of the dimensions after it at a time, in one kernel. sum, max, mean and softmax over each
+  # leading dimension of four and five match numpy, and a gradient comes back over the leading dimensions an operand
+  # broadcasts over.
+  rng, rt = np.random.default_rng(41), Runtime(chip)
+  x, z = bf16(rng.uniform(-2, 2, (2, 3, 5, 40))), bf16(rng.uniform(-2, 2, (2, 3, 2, 5, 40)))
+  for a in (x, z):
+    t = Tensor.of(rt, a.tolist())
+    for axis in range(a.ndim - 2):
+      launches, s = rt.launches, t.sum(axis).realize()
+      assert kernels(rt, launches) == 1 and s.shape == a.sum(axis, keepdims=True).shape, axis
+      close(s, a.sum(axis, keepdims=True), 2**-6)
+      close(t.max(axis), a.max(axis, keepdims=True), 0)
+      close(t.mean(axis), a.mean(axis, keepdims=True), 2**-6)
+      e = np.exp(a - a.max(axis, keepdims=True))
+      close(t.softmax(axis), e / e.sum(axis, keepdims=True), 2**-6)
+  a, b, c = (Tensor.of(rt, v.tolist(), "fp32").requires_grad_() for v in (x, x[:, :1], x[:1]))
+  ga, gb, gc = (a * b + c).sum().gradient(a, b, c)  # b is spread over the second leading dimension, c over the first
+  assert value(ga).tolist() == np.broadcast_to(x[:, :1], x.shape).tolist() and value(gc).tolist() == np.full(gc.shape, 2.0).tolist()
+  close(gb, x.sum(1, keepdims=True), 1e-5)
+  g, top = a.max(1).sum().gradient(a)[0], x == x.max(1, keepdims=True)
+  close(g, top / top.sum(1, keepdims=True), 1e-6)  # to each maximum, split between ties
+
 def test_leading_dimensions(chip):
   # A tensor takes up to five dimensions, and the leading ones fold into the batch in row-major order, so (2, 3, 5, 40)
   # is stored as (6, 5, 40). A reshape of the leading sizes alone is then a view, with no launch, and an unrealized one
@@ -1635,7 +1659,6 @@ def test_leading_dimensions(chip):
                   (tx.reshape(3, 2, 8, 25), x.reshape(3, 2, 8, 25))]:
     assert t.shape == want.shape and value(t).tolist() == want.tolist(), (t.shape, want.shape)
   with pytest.raises(ValueError, match="dimensions"): tx.reshape(1, 2, 1, 3, 5, 40)
-  with pytest.raises(ValueError, match="leading"): tx.sum(1)
   with pytest.raises(ValueError, match="matmul"): tx @ Tensor.of(rt, w[:, :2].tolist())
   with pytest.raises(ValueError, match="three dimensions"): tx.split(2)
   out = Tensor.zeros(rt, 8, 25, 6).reshape(2, 3, 8, 25)
@@ -1911,7 +1934,7 @@ def test_fuzz(chip, monkeypatch):
     if t.op in (None, "T", "move"): return realize(t)  # test_movement covers data movement
     tensor._fit(t)  # realize may compute parts first (a long matmul, a shared value, a tree too big): check those too
     inputs = []
-    e, _ = tensor._tree(t, inputs)
+    e, _, _ = tensor._tree(t, inputs)
     xs = [value(u) for u in inputs]
     realize(t)
     want, got = numpy(e, xs), value(t)

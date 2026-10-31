@@ -38,7 +38,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
           return -(-kt // -(-kt // kp)), q, acc  # make the parts as even as possible
   return False
 
-def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None):
+def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None):
   """Compile an expression into one kernel. Return (image, work units).
 
   Expressions use nested tuples. An integer refers to an input by its index in shapes:
@@ -59,7 +59,9 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   and computation format. out sets the final storage format, allowing a cast or an fp32 matmul result.
   grid and readers come from Runtime: grid enables multicast sharing, and readers assigns DRAM banks
   and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep. An input
-  spread over the result's leading dimensions has (rep, n) there, and matrix b reads (b // rep) % n.
+  spread over the result's leading dimensions has (rep, n) there, and matrix b reads (b // rep) % n. leading, for a
+  reduction over the batch, is (K, S): result matrix b folds K matrices S apart, from b // S * K * S + b % S on, as
+  for a leading dimension of K with S matrices to each step of it. Without it, the batch folds into one matrix.
 
   Kernel arguments:
   - a[0:2]: first work unit and unit count.
@@ -70,7 +72,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
 
   A work unit is normally one output tile. With one matmul and no reduction, it is a block of up to
   4 x 4 tiles, or a worker's block on the grid. With a reduction, it is a line of tiles along that axis:
-  a row, a column, or the same tile position across the batch.
+  a row, a column, or the same tile position across the batch, or with leading, across the matrices that fold into
+  one.
 
   bf16 arithmetic uses SrcA, SrcB and the FPU. fp32 and int32 elementwise kernels bypass the 19-bit
   Src registers: the math thread loads operands into Dst, and the SFPU computes every operation.
@@ -120,7 +123,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                 shape=(batch, a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
-      op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
+      fold = lambda s: s // leading[0] if leading else 1  # with leading, the batch folds K matrices into each
+      op = dict(kind=e[0], x=x, shape=tuple(fold(s) if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
     elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:
       # A unary op, or the root's cast. That packs as out, after an SFPU program between floats and ints if needed.
       x = visit(e[1])
@@ -157,11 +161,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   n = [max([ext(op["shape"], ax) for op in ops] + [ext(size(r), ax) for op in ops for r in operands(op)])
        for ax in range(3)]
   nb, rt, w = n
-  L = n[axis]  # the length of a sweep
-  assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), \
+  span, L = n[axis], leading[0] if leading else n[axis]  # how far the ops reach along the axis, and a sweep's length
+  assert all(ext(size(r), axis) in (1, span // L, span) for op in ops for r in operands(op)), \
     "all operands along the reduction axis must broadcast or have the same tile count"
   # r varies along the sweep. If not, it's one tile a line
-  swept = lambda r: r != "zero" and ext(size(r), axis) == L and not reduced(r)
+  swept = lambda r: r != "zero" and ext(size(r), axis) == span and not reduced(r)
   assert len(ops) <= MAX_OPS, f"SEM_L1 counts at most {MAX_OPS} intermediates"
   # Passes. A swept op runs in the first pass after the reductions it depends on have finished. A narrow op is ready
   # then too.
@@ -352,6 +356,7 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   # over the result's leading dimensions, or 0 for a batch of 1
   def which(r):
     if size(r)[0] == 1: return "0"
+    if leading and not isinstance(r, int) and size(r)[0] != span: return "bo"  # one of the folded result's matrices
     rep, n = (reps[r] if isinstance(reps[r], tuple) else (reps[r], 0)) if reps and isinstance(r, int) else (1, 0)
     if n: return f"(b / {rep}) % {n}" if rep > 1 else f"b % {n}"
     return f"b / {rep}" if rep > 1 else "b"
@@ -664,11 +669,16 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   }}"""
     index = ("b", "i_", "j")  # a tile's position: matrix, row, column. A unit fixes the two the sweep doesn't walk
     (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
-    sweeps = "\n".join(f"""    for (unsigned {index[axis]} = 0, k = 0; k < {L if full else 1}; {index[axis]}++, k++) {{
+    # with leading, unit bo's line through the batch starts at its first matrix and steps over the matrices after it
+    S = leading[1] if leading else 1
+    start, step = (f"bo / {S} * {L * S} + bo % {S}", f" += {S}") if leading else ("0", "++")
+    v = index[axis]
+    sweeps = "\n".join(f"""    for (unsigned {v} = {start}, k = 0; k < {L if full else 1}; {v}{step}, k++) {{
       {tile_c(b)}
     }}""" for full, b in passes)
+    at = f"bo = unit / {n[1] * m}, {outer} = unit % {n[1] * m} / {m}" if leading else f"{outer} = unit / {m}"
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, {outer} = unit / {m}, {inner} = unit % {m};
+    unsigned unit = a[0] + u, {at}, {inner} = unit % {m};
 {sweeps}
   }}"""
   # result tiles to write to DRAM

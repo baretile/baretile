@@ -497,7 +497,7 @@ class Tensor:
                       *(v & 0xFFFFFFFF for v in self.map), *self.lead[1:lead], name="move")
     _fit(self)
     inputs = []
-    e, dtype = _tree(self, inputs)
+    e, dtype, sweep = _tree(self, inputs)
     matmul = any(u.op == "matmul" for u in _lazy(self, set()))
     if into is not None and any(t.addr == into.addr and (_layout(t) != _layout(into) or matmul) for t in inputs):
       into.assign(self.realize())  # finish every source read before any destination tile is overwritten
@@ -508,7 +508,7 @@ class Tensor:
     # when only the result's rows matter, round the inputs' rows up to tiles, so the same kernel serves any row count
     if _rows_free(e): shapes = tuple((b, r if r == 1 else -(-r // 32) * 32, c) for b, r, c in shapes)
     reps = tuple((u.rep, u.cyc) if u.cyc else u.rep for u in inputs)
-    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers)
+    key = (e, shapes, dtype, self.dtype, self.rt.grid, reps, self.rt.readers, sweep)
     kernel, units, name = _cached(key, lambda: (*fused_kernel(*key), _name(e)))
     if into is not None: self._alias(into)
     else: self.addr = self._alloc()
@@ -656,8 +656,8 @@ class Tensor:
   def max(self, axis=None): return self._reduce("max", axis)
   def _reduce(self, f, axis):
     """Reduce like numpy with keepdims: over a leading dimension, down the rows (axis -2), along each row (-1), or
-    over everything for None. Each axis is its own kernel, which sweeps lines of tiles along it: the batch, for a
-    leading dimension, which the other leading dimensions leave as the whole batch."""
+    over everything for None. Each axis is its own kernel, which sweeps lines of tiles along it. For a leading
+    dimension, the line goes through the batch, a step of the dimensions after it at a time."""
     n = len(self.shape)
     if axis is not None: axis = operator.index(axis)
     if axis is not None and not -n <= axis < n: raise ValueError(f"axis {axis} outside {self.shape}")
@@ -665,14 +665,15 @@ class Tensor:
     if axis is None:
       flat = self._relabel((self.batch,))
       return flat._reduce(f, 0)._reduce(f, 1)._reduce(f, 2)._relabel((1,) * len(self.lead))
-    axis, lead = axis % n, list(self.lead)
-    if axis < n - 2 and self.batch != lead[axis]:
-      raise ValueError(f"reducing axis {axis} of {self.shape} needs its other leading sizes 1")
-    if axis < n - 2: lead[axis] = 1
-    k = 0 if axis < n - 2 else axis - (n - 3)  # the axis of (batch, rows, cols) that the kernel folds
-    shape = [1 if ax == k else s for ax, s in enumerate(self._dims)]
+    axis, lead, leading = axis % n, list(self.lead), axis % n < n - 2
+    if leading: lead[axis] = 1
+    k = 0 if leading else axis - (n - 3)  # the axis of (batch, rows, cols) that the kernel folds
+    shape = [math.prod(lead) if ax == k and leading else 1 if ax == k else s for ax, s in enumerate(self._dims)]
     if shape == list(self._dims): return self
-    return _lead(Tensor(self.rt, shape[1], shape[2], f"{f}{k}", (self,), shape[0], self.dtype), lead)
+    t = _lead(Tensor(self.rt, shape[1], shape[2], f"{f}{k}", (self,), shape[0], self.dtype), lead)
+    # with other leading sizes, each result matrix folds lead[axis] of these, the ones after it apart
+    t.axis, t.sweep = axis, (self.lead[axis], math.prod(self.lead[axis + 1:])) if leading and shape[0] > 1 else None
+    return t
   def mean(self, axis=None):
     s = self.sum(axis)
     return s * (math.prod(s.shape) / math.prod(self.shape))
@@ -950,14 +951,14 @@ def _backward(t, g):
   if op in FOLDS:  # a sum broadcasts back. a max goes to its maxima, split between ties
     if op[:3] == "sum": return (g,)
     m = x.eq(t)
-    return (g * m / m.sum(FOLDS[op]),)
+    return (g * m / m.sum(t.axis),)
   unary = {"exp": lambda: g * t, "exp2": lambda: g * t * math.log(2), "log": lambda: g * x.reciprocal(),
            "log2": lambda: g * (x * math.log(2)).reciprocal(), "sin": lambda: g * x.cos(),
            "cos": lambda: -(g * x.sin()),
            "sqrt": lambda: g * (t * 2).reciprocal(), "recip": lambda: -(g * t * t), "relu": lambda: g * (x > 0),
            "cast": lambda: g.cast("bf16" if x.dtype in BFP else x.dtype), "columns": lambda: g}
   if op in unary: return (unary[op](),)
-  if op == "spread": return (_unbroadcast(g, x.shape),)  # each matrix's copies add their gradients up
+  if op == "spread": return (_unbroadcast(g, x.shape, t.shape),)  # each matrix's copies add their gradients up
   if op == "lead":  # the same matrices. a gradient that's one matrix for all of them, as a sum's is, stays one
     g = g if g.batch in (1, t.batch) else _full(g, t.shape)
     return (g._relabel(x.lead if g.batch == t.batch else (1,) * len(x.lead)),)
@@ -1073,14 +1074,16 @@ def _ops(t): return sum(u.op not in ("lead", "spread") for u in _lazy(t, set()))
 
 def _tree(t, inputs):
   """The expression that fused_kernel computes for t, with realized tensors as indices into inputs, and the dtype it
-  computes in. The kernel sweeps along the axis of the first reduction. Reductions along other axes are realized
-  first."""
+  computes in, and the first reduction's sweep through the batch, for a leading dimension. The kernel sweeps along
+  that reduction's axis. Reductions along other axes, or the batch's other ways, are realized first."""
   dtype = t.srcs[0].dtype if t.op in ("cast", "matmul") else t.dtype
   if dtype in BFP: raise ValueError("a block float can only be a matmul's B")
-  axis = next((FOLDS[u.op] for u in _lazy(t, set()) if u.op in COMBINE), 2)
-  # the sweep is as long as t along the axis. if t is a tile long there, its first reduction sets it
-  n = ext(t._dims, axis)
-  return _expr(t, t._dims, inputs, [axis, n if n > 1 else None, set(), dtype, t]), dtype
+  first = next((u for u in _lazy(t, set()) if u.op in COMBINE), None)
+  axis, sweep = (FOLDS[first.op], first.sweep) if first is not None else (2, None)
+  # the sweep is as long as t along the axis, or as the batch it folds. if t is a tile long there, its first reduction
+  # sets it
+  n = first.srcs[0].batch if sweep else ext(t._dims, axis)
+  return _expr(t, t._dims, inputs, [axis, n if n > 1 else None, set(), dtype, t, sweep]), dtype, sweep
 
 # A block-float tile's values as bf16, the way the unpacker converts them (ISA FormatConversion.md): normalized, with 7
 # bits per value. bfp4's 3 bits are shifted up to where bfp8's sit.
@@ -1124,7 +1127,7 @@ def _expr(t, shape, inputs, kernel):
     if FOLDS[t.op] != axis: return _expr(t.realize(), shape, inputs, kernel)
     n = ext(t.srcs[0]._dims, axis)
     if n > 1 and kernel[1] is None: kernel[1] = n
-    if (n > 1 and n != kernel[1]) or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)):
+    if (n > 1 and n != kernel[1]) or t.sweep != kernel[5] or (id(t) not in kernel[2] and len(kernel[2]) == len(ACCS)):
       return _expr(t.realize(), shape, inputs, kernel)
     kernel[2].add(id(t))
   # kernels of their own, but a matmul can read B transposed (below)
