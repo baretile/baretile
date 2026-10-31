@@ -371,6 +371,11 @@ class Tensor:
     if math.prod(shape) != math.prod(self.shape): raise ValueError(f"cannot reshape {self.shape} to {shape}")
     if shape == self.shape: return self
     if shape[-2:] == self.shape[-2:]: return self._relabel(shape[:-2])  # the same matrices, under other leading sizes
+    # whole tile rows, regrouped into other matrices, are the same storage when the matrices are stored in a row
+    if (self.op is None and self.rep == 1 and not self.runs and shape[-1] == self.cols and shape[-2] % 32 == 0
+        and self.rows % 32 == 0 and (self.batch == 1 or self.bstride == self.rows // 32 * self.stride)):
+      v = self._view(shape[-2], self.cols, math.prod(shape[:-2]), 0, shape[-2] // 32 * self.stride)
+      return v._track("reshape", (self,))._relabel(shape[:-2])
     return self.move(shape, 0, _strides(shape))._track("reshape", (self,))
   def permute(self, *order):
     n = len(self.shape)
