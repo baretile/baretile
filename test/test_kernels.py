@@ -1673,6 +1673,11 @@ def test_leading_dimensions(chip):
   ga, gb = (a * a * b).sum().gradient(a, b)  # b is one matrix for all six, so its gradient sums over them
   assert ga.shape == x.shape and value(ga).tolist() == (2 * x * matrix).tolist()
   close(gb, (x * x).sum((0, 1)), 1e-5)
+  # matrices of whole tile rows, stored one after another, regroup into others as a view: rows merge or split freely
+  tiles, n = Tensor.of(rt, np.arange(2 * 64 * 40).reshape(2, 64, 40).tolist(), "fp32"), np.arange(2 * 64 * 40)
+  launches, views = rt.launches, [tiles.reshape(*s) for s in ((128, 40), (4, 32, 40), (2, 2, 32, 40))]
+  assert rt.launches == launches and all(v.addr == tiles.addr for v in views), "no copy"
+  assert all(value(v).tolist() == n.reshape(v.shape).tolist() for v in views)
 
 def test_fp32(chip):
   # fp32 tensors have 4 KiB tiles. The math thread unpacks them into Dst, bypassing SrcA and SrcB, and the SFPU does

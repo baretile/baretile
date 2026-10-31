@@ -117,8 +117,8 @@ def grouping(shape, shape3):  # split shape's axes into three consecutive groups
 
 def materialize(v, groups=None):
   """Convert v to a baretile tensor with three axes, grouping its axes as fold does by default. Try the
-  existing layout, a transpose, a single move, then several moves to swap axis groups. Fall back to a host
-  copy if none works."""
+  existing layout, a transpose, a single move over the three groups, one over up to five runs of axes, then
+  several moves to swap axis groups. Fall back to a host copy if none works."""
   groups = groups or groups3(v.shape)
   shape3, t = tuple(math.prod(v.shape[k] for k in g) for g in groups), v.t
   if v.whole() and t.shape == shape3: return t
@@ -129,8 +129,24 @@ def materialize(v, groups=None):
      and t.shape == (shape3[0], *shape3[:0:-1]): return t.T
   if m is not None:
     return t.move(shape3, v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m], [hi for _, _, _, hi in m])
+  if (p := runs_moved(v, groups)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
   if (p := transposes(v)) is not None: return p if p.shape == shape3 else p.reshape(*shape3)
   return upload(download(v), v.t.dtype, shape3)
+
+def runs_moved(v, groups):
+  """v in one move over up to five axes, each a run of a group's axes that merges to one stride, or None if it
+  takes more. A permute within a group, or padding on two of its axes, splits it. When the last two groups are a
+  run each, the move's last two axes are theirs, and folding it to three groups is free, as it is when the rows
+  are whole tiles."""
+  runs = []
+  for g in groups:
+    for k in g:
+      if runs and runs[-1][0] is g and merge(v.view, [runs[-1][1] + [k]]) is not None: runs[-1][1].append(k)
+      else: runs.append((g, [k]))
+  if len(runs) > tensor.DIMS: return None
+  m = merge(v.view, [[]] * (3 - len(runs)) + [r for _, r in runs])  # at least three axes
+  return v.t.move([n for n, _, _, _ in m], v.view.offset, [s for _, s, _, _ in m], [lo for _, _, lo, _ in m],
+                  [hi for _, _, _, hi in m]).realize()  # realized, so a fold of whole tile rows is a view of it
 
 def transposes(v):
   """Convert an axis permutation, such as (B, T, H, D) to (B, H, T, D), into moves that swap two groups of

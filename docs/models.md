@@ -250,7 +250,12 @@ deep as its level leaves; deeper ones get HTTP 400.
 Import `baretile.adapters.tinygrad_device` before using tinygrad's `BARETILE` device.
 The adapter translates tinygrad's graph into baretile tensors before tinygrad
 schedules kernels. It recognizes a broadcast multiply followed by a reduction
-as a matmul. `TinyJit` uses baretile recordings when the call can be recorded.
+as a matmul. Its tensors have three dimensions, with tinygrad's leading axes
+folded into the rows. A view that an operation needs as a tensor, like a permute
+or padding, is one move on the chip when its axes merge into at most five runs.
+A permute with more runs takes a move for each pair of axis groups it swaps,
+and anything else is copied through the host. `TinyJit` uses baretile
+recordings when the call can be recorded.
 
 You can run an existing tinygrad script through the adapter:
 

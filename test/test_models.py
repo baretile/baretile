@@ -245,18 +245,22 @@ def test_tinygrad_jit_rebinds(chip):
 
 
 def test_tinygrad_host_materialize(chip):
+  # Padding on six axes takes six runs of axes, where a move maps five, so it goes through the host, and a TinyJit
+  # can't replay that frozen upload: each call runs. Padding on two of three axes is one move on the chip, over the
+  # three axes, and a replay repeats it.
   adapter = adapter_on(chip)
   from tinygrad import Tensor, TinyJit
-  calls, pins = [], dict(adapter.RT.pinned)
-  @TinyJit
-  def padded(x):
-    calls.append(1)
-    return (x.pad(((1, 0), (1, 0), (0, 0))) * 2).realize()
-  for n in (1, 2, 3, 4):
-    got = padded(Tensor(np.full((2, 3, 4), n, np.float32), device="BARETILE")).numpy()
-    assert np.array_equal(got, np.pad(np.full((2, 3, 4), n * 2), ((1, 0), (1, 0), (0, 0))))
-  assert len(calls) == 4, "host-dependent materialization cannot replay a frozen upload"
-  assert dict(adapter.RT.pinned) == pins, "discarded recordings release their pins"
+  for shape, widths, runs in (((2,) * 6, ((1, 0),) * 6, 4), ((2, 3, 4), ((1, 0), (1, 0), (0, 0)), 2)):
+    calls, pins = [], dict(adapter.RT.pinned)
+    @TinyJit
+    def padded(x):
+      calls.append(1)
+      return (x.pad(widths) * 2).realize()
+    for n in (1, 2, 3, 4):
+      got = padded(Tensor(np.full(shape, n, np.float32), device="BARETILE")).numpy()
+      assert np.array_equal(got, np.pad(np.full(shape, n * 2), widths))
+    assert len(calls) == runs, (shape, "on the chip, a replay repeats it" if runs == 2 else "the host's can't be replayed")
+    assert runs == 2 or dict(adapter.RT.pinned) == pins, "discarded recordings release their pins"
 
 
 def test_tinygrad_fallback_dtypes(chip):

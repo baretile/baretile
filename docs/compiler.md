@@ -26,8 +26,11 @@ dimensions. Only the last two are tiles, so each matrix pads to whole tiles: a
 `(N, C, 7, 7)` tensor uses 49 of each tile's 1,024 values. Keep the last two
 dimensions large, and merge small ones into them. A reshape that changes only
 the leading sizes is a view, and so is a slice that picks evenly spaced
-matrices, as any slice of the first leading dimension does. Other movement over
-leading dimensions is one launch of the move kernel, which maps up to five axes.
+matrices, as any slice of the first leading dimension does. So is a reshape
+that regroups whole tile rows into other matrices, like `(2, 64, cols)` into
+`(128, cols)` or `(4, 32, cols)`, when the matrices are stored one after
+another. Other movement over leading dimensions is one launch of the move
+kernel, which maps up to five axes.
 
 An operand whose leading sizes are one run of the result's, like `(2, 1)` or
 `(1, 3)` in `(2, 3)`, is read in place: for the result's matrix `b`, a kernel
