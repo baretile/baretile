@@ -2,9 +2,10 @@
 # test suite on 120 and on 140 Tensix tiles, and alongside them the kernel tests on ttsim-chaos with timing noise. The
 # suite and the noise runs are split across runners, and each uses all of its runner's CPUs, with NumPy on one thread a
 # process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints,
-# PyTorch, transformers or tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a
-# newer push to it cancels the run still going. The card job runs the bring-up stages on a P150a, once a runner for it
-# exists (docs/bring-up.md).
+# PyTorch, transformers or tiktoken skip themselves here. A test that takes over ten minutes prints the stacks of its
+# process's threads (faulthandler_timeout), so a hung one says where, and a job that takes over 20 minutes, where it
+# takes about 5, is stopped. A pull request's branch runs once, as the pull request, and a newer push to it cancels the
+# run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
 name: test
 on:
   push:
@@ -51,7 +52,7 @@ jobs:
   test:
     name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/3)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -105,7 +106,7 @@ jobs:
           if [ ${{ matrix.tiles }} = 140 ]; then
             export TTSIM="$RUNNER_TEMP/ttsim-chaos/src/_out/release_bh/libttsim.so" TTSIM_CHAOS_UNHARVESTED=1
           fi
-          PART=${{ matrix.group }}/3 python -m pytest -n auto --dist worksteal test
+          PART=${{ matrix.group }}/3 python -m pytest -n auto --dist worksteal -o faulthandler_timeout=600 test
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
@@ -116,7 +117,7 @@ jobs:
   # missing package can't pass for a green run. The PyTorch frontend also needs the pinned tinygrad.
   references:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -139,9 +140,10 @@ jobs:
           restore-keys: kernels-
       - run: python -m baretile.chip ttsim
       - run: >-
-          python -m pytest -s -rs test/test_models.py::test_train test/test_models.py::test_train_gpt2 test/test_models.py::test_llama_frequencies
-          test/test_models.py::test_tokenizer test/test_models.py::test_hf_families test/test_models.py::test_qwen3_moe
-          test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4 test/test_models.py::test_torch_frontend
+          python -m pytest -s -rs -o faulthandler_timeout=600 test/test_models.py::test_train test/test_models.py::test_train_gpt2
+          test/test_models.py::test_llama_frequencies test/test_models.py::test_tokenizer test/test_models.py::test_hf_families
+          test/test_models.py::test_qwen3_moe test/test_models.py::test_qwen3_5_moe test/test_models.py::test_mxfp4
+          test/test_models.py::test_torch_frontend
         env:
           SKIPS: fail
           TINYGRAD: ${{ runner.temp }}/tinygrad
@@ -150,11 +152,11 @@ jobs:
   # two jobs, each a process for each of the runner's CPUs, on every nth test from its own on (PART in test/conftest.py).
   # ttsim-chaos seeds a process's noise once, so what a test sees follows from the tests before it, and
   # TTSIM_CHAOS_SEED=s PART=i/n repeats part i of n of run s, as re-running a failed job does. The log shows both. A part
-  # that hangs is stopped at 45 minutes, so its log still shows.
+  # that hangs is stopped at 15 minutes, before the job is, so its log still shows.
   chaos:
     name: chaos (${{ matrix.group }}/2)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -187,7 +189,8 @@ jobs:
                  test/test_models.py::test_moe 'test/test_models.py::test_ramp[4_kernel.py]')
           n=$(nproc) parts=$((2 * $(nproc))) first=$(((${{ matrix.group }} - 1) * $(nproc)))
           for i in $(seq $n); do
-            PART=$((first + i))/$parts timeout 45m python -m pytest -s "${tests[@]}" > "$RUNNER_TEMP/part$i.log" 2>&1 &
+            PART=$((first + i))/$parts timeout 15m python -m pytest -s -o faulthandler_timeout=600 "${tests[@]}" \
+              > "$RUNNER_TEMP/part$i.log" 2>&1 &
             pids[i]=$!
           done
           for i in $(seq $n); do

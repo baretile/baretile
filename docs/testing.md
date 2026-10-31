@@ -168,7 +168,9 @@ the ith. The suite on each ttsim runs as three jobs, each in a pytest-xdist
 worker for each CPU. The noise runs as two jobs, each a process for each CPU on
 its own part. A process's noise follows from the seed and the tests it runs, in
 order, so `TTSIM_CHAOS_SEED=s PART=i/n`, with the job's settings and tests,
-repeats a failed part, and the log shows all of them.
+repeats a failed part, and the log shows all of them. A test that runs over ten
+minutes prints the stacks of its process's threads, pytest's
+`faulthandler_timeout`, so a test that hangs in CI says where.
 
 `TTSIM_CHAOS_MATH=lo,hi` gives the FPU and SFPU time. Each of their instructions
 runs a random lo to hi clocks after it leaves its thread, and the thread goes on
