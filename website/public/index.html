@@ -76,7 +76,7 @@ print((x @ w).relu().tolist())
 <span class="c"># [[2.0, 6.0], [6.0, 12.0]]</span></code></pre>
 
 <p>The matmul and ReLU run in one kernel: the ReLU works on the matmul's result in the math unit's registers, before it's written out.
-Tensors support broadcasting, reductions, views and autograd, with bf16, fp32, int32, bfp8 and bfp4 storage.</p>
+Tensors have up to five dimensions and support broadcasting, reductions, views and autograd, with bf16, fp32, int32, bfp8 and bfp4 storage.</p>
 
 <h2>Running a model</h2>
 

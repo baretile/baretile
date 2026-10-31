@@ -21,6 +21,9 @@ python3 -m pytest -s test
 ruff check
 ```
 
+With pytest-xdist installed, `-n auto` runs the tests in a process for each CPU,
+as CI does. On GitHub's four-CPU runner, that halves the time.
+
 [Testing and debugging](docs/testing.md) lists the optional checks that need
 model files, PyTorch or transformers, and explains what to do when a launch
 hangs.
