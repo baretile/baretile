@@ -1584,15 +1584,16 @@ def transpose_kernel(rows, cols):
 # move_kernel caches x's tiles in L1, tile t in slot t % MOVE_SLOTS. A prime spreads out power-of-two strides.
 MOVE_SLOTS = 127
 
-def move_kernel(dtype):
+def move_kernel(dtype, lead=1):
   """Move a tensor around: reshape, permute, expand, pad, slice. BRISC does it alone.
 
   args: [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's rows and columns, the
   result's rows and columns, then the map: an offset and strides sb, sr and sc for batch, row and column, then the
-  bounds: lo for batch, row and column, then hi].
+  bounds: lo for batch, row and column, then hi]. With lead leading axes in place of the batch, each of them has a
+  stride and bounds where the batch has one, and the result's sizes along them, after the first, come last.
 
   Element (b, r, c) of the result is element offset + b sb + r sr + c sc of x, counted in row-major order, if it's
-  inside the bounds. Outside them it's 0.
+  inside the bounds. Outside them it's 0. With leading axes, b sb is the sum of each one's index times its stride.
 
   NoC alignment rules prevent arbitrary two-byte reads, so fetch complete input tiles into an L1 cache.
   If an output tile is an unchanged input tile within the bounds, copy it directly, bypassing the cache.
@@ -1600,7 +1601,19 @@ def move_kernel(dtype):
   values in runs along rows or columns, whichever are contiguous in x. Stop each run at a face boundary.
   When neither axis forms a run, copy individual values without dividing at each step.
   Repeat a single output column across its tile. Repeat a single row using NoC copies within L1."""
-  tb = tile_bytes(dtype)
+  tb, n = tile_bytes(dtype), lead
+  # with leading axes, matrix b's indices along them, last first, give where it starts in x and whether it's in bounds
+  axes = "" if n == 1 else f"""
+    unsigned eb = 0;
+    int inb = 1;
+    for (int k = {n - 1}, q = b; k >= 0; k--) {{
+      int d = k ? q % (int)a[{17 + 3 * n} + k] : q;
+      q = k ? q / (int)a[{17 + 3 * n} + k] : 0;
+      eb += (unsigned)d * a[12 + k], inb &= (int)a[{14 + n} + k] <= d && d < (int)a[{16 + 2 * n} + k];
+    }}"""
+  at_b, in_b = ("(unsigned)b * sb", "lo_b <= b && b < hi_b") if n == 1 else ("eb", "inb")
+  reads = ("sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18]," if n == 1 else
+           f"sr = a[{12 + n}], sc = a[{13 + n}], lo_r = a[{14 + 2 * n}], lo_c = a[{15 + 2 * n}],")
   return compile_kernel(f"""
 #define OUT {DATA:#x}
 #define CACHE {DATA + tb:#x}
@@ -1642,8 +1655,8 @@ void kmain(volatile unsigned *a) {{
   unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
   launch++;
   unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
-  int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18],
-      hi_r = a[19], hi_c = a[20];
+  int e0 = a[11], {reads}
+      hi_r = a[{16 + 3 * n}], hi_c = a[{17 + 3 * n}];
   // The datums go in lines along the result's rows, or down its columns. Down is for when the columns lie in x as runs
   // (along a row of x, or down a column) and the rows don't or are shorter, and always for a single column. step is
   // the step along a line, in x's elements, split into x's matrices, rows and columns so stepping needs no division.
@@ -1657,11 +1670,11 @@ void kmain(volatile unsigned *a) {{
   unsigned held_t = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
-    int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
-    int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c),
+    int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;{axes}
+    int r0 = from(i, rows, lo_r), r1 = {in_b} ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c),
         c1 = to(j, cols, lo_c, hi_c);
     // where the tile starts in x
-    unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr,
+    unsigned e = (unsigned)e0 + {at_b} + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr,
              col = e % xc;
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32
@@ -1683,7 +1696,7 @@ void kmain(volatile unsigned *a) {{
           k1 = down ? r1 : c1;
       for (int line = lines0; line < lines1; line++) {{
         int r = down ? k0 : line, c = down ? line : k0;
-        unsigned e_line = (unsigned)e0 + (unsigned)b * sb + (rows == 1 ? 0u : i * 32u + r) * sr
+        unsigned e_line = (unsigned)e0 + {at_b} + (rows == 1 ? 0u : i * 32u + r) * sr
                           + (cols == 1 ? 0u : j * 32u + c) * sc;
         unsigned xrow = e_line / xc, xb = xrow / xr, xi = xrow % xr, xj = e_line % xc;
         for (int k = k0; k < k1;) {{

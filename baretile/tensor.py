@@ -1,6 +1,6 @@
 # Build tensor expressions and compile them into kernels. Fuse operations where possible; compute inputs
 # separately when fusion would exceed a kernel's limits or require a different layout or dtype.
-import array, collections, functools, math, operator, struct
+import array, collections, functools, itertools, math, operator, struct
 from baretile import bh
 from baretile.runtime import Bound
 from baretile.tensix import ACCS, BFP, COMBINE, FOLDS, INT32_OPS, ITEMSIZE, MAX_OPS, ext, round_bf16, tile_bytes
@@ -292,40 +292,44 @@ class Tensor:
     return t._track("slice", (self,), ranges)
 
   def _lead_item(self, key):
-    """x[i], or slices with leading dimensions, through the batch they fold into. An index or a slice of the first
-    leading dimension takes whole matrices, with a step of 1 if the others aren't all 1. Slices of the rows and
-    columns follow, as with three dimensions, and missing leading slices are whole."""
-    lead, inner, flat = self.lead, math.prod(self.lead[1:]), self._relabel((self.batch,))
+    """x[i], or slices with leading dimensions, where missing leading slices are whole. Leading slices that pick
+    evenly spaced matrices, as any slice of the first does, give a slice of the batch they fold into, which slices the
+    rows and columns as with three dimensions. Other leading slices copy, in one launch, as does a slice of an
+    unrealized move, which joins it."""
+    lead, n = self.lead, len(self.shape)
     if isinstance(key, int):
       if not -lead[0] <= key < lead[0]: raise IndexError(f"index {key} outside a leading size of {lead[0]}")
-      key %= lead[0]
-      return flat[key * inner:(key + 1) * inner, :, :]._relabel(lead[1:])
-    if not (isinstance(key, tuple) and 2 <= len(key) <= len(self.shape) and all(isinstance(k, slice) for k in key)):
-      raise ValueError(f"index {self.shape} as x[i] or with two to {len(self.shape)} slices, not x[{key!r}]")
-    key = (slice(None),) * (len(self.shape) - len(key)) + key
-    first = range(*key[0].indices(lead[0]))
-    if not first: raise ValueError(f"an empty slice of {self.shape}")
-    if (any(range(*k.indices(n)) != range(n) for k, n in zip(key[1:-2], lead[1:])) or first.step < 0
-        or first.step > 1 and inner > 1 and len(first) > 1):
-      raise ValueError(f"slice {self.shape} along its first leading dimension, forward, by 1 unless the rest are 1")
-    batch = (slice(first.start, first[-1] + 1, first.step) if inner == 1 else
-             slice(first.start * inner, (first[-1] + 1) * inner))
-    return flat[batch, key[-2], key[-1]]._relabel((len(first), *lead[1:]))
+      return self[(slice(key % lead[0], key % lead[0] + 1), *(slice(None),) * (n - 1))]._relabel(lead[1:])
+    if not (isinstance(key, tuple) and 2 <= len(key) <= n and all(isinstance(k, slice) for k in key)):
+      raise ValueError(f"index {self.shape} as x[i] or with two to {n} slices, not x[{key!r}]")
+    key = (slice(None),) * (n - len(key)) + key
+    ranges = [range(*k.indices(m)) for k, m in zip(key, self.shape)]
+    if not all(ranges): raise ValueError(f"an empty slice of {self.shape}")
+    sizes = [math.prod(lead[k + 1:]) for k in range(len(lead))]  # how far an index along each moves through the batch
+    picked = [sum(i * m for i, m in zip(c, sizes)) for c in itertools.product(*ranges[:-2])]
+    steps = {b - a for a, b in zip(picked, picked[1:])}
+    if self.op != "move" and len(steps) <= 1 and min(steps, default=1) > 0:
+      batch = slice(picked[0], picked[-1] + 1, min(steps, default=1))
+      return self._relabel((self.batch,))[batch, key[-2], key[-1]]._relabel(tuple(map(len, ranges[:-2])))
+    t = self._map(tuple(map(len, ranges)), range(n), [g.start for g in ranges], [g.step for g in ranges])
+    return t._track("slice", (self,), ranges)
 
   # Movement. Each op maps the result's elements to this tensor's, and one launch copies them: move_kernel, or
   # transpose_kernel for a bf16 transpose.
-  def move(self, shape, offset, strides, lo=(0, 0, 0), hi=None):
-    """Map elements into a new tensor of shape (batch, rows, cols). Output element (b, r, c) reads
-    input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order.
+  def move(self, shape, offset, strides, lo=None, hi=None):
+    """Map elements into a new tensor of shape, with three to five dimensions. Output element (b, r, c) reads
+    input element offset + b * strides[0] + r * strides[1] + c * strides[2], in row-major order, and each
+    leading dimension past the first adds its index times its stride the same way.
     Output positions outside [lo, hi) on any axis are zero. Every selected source element must lie
     inside this tensor; offsets and strides are signed 32-bit integers. No gradient: reshape, permute,
     expand, pad and slices provide their own gradient rules."""
     try:
-      shape, strides, lo = (tuple(map(operator.index, values)) for values in (shape, strides, lo))
+      shape, strides = (tuple(map(operator.index, values)) for values in (shape, strides))
+      lo = (0,) * len(shape) if lo is None else tuple(map(operator.index, lo))
       hi, offset = shape if hi is None else tuple(map(operator.index, hi)), operator.index(offset)
     except TypeError: raise ValueError("move needs integer dimensions, offset, strides and bounds") from None
-    if any(len(values) != 3 for values in (shape, strides, lo, hi)):
-      raise ValueError("move needs three dimensions, strides and bounds")
+    if not 3 <= len(shape) <= DIMS or any(len(values) != len(shape) for values in (strides, lo, hi)):
+      raise ValueError(f"move needs three to {DIMS} dimensions, with a stride and bounds for each")
     shape = _shape(shape)
     if not all(0 <= a <= b <= n < 2**31 for a, b, n in zip(lo, hi, shape)):
       raise ValueError("move bounds must lie inside its signed 32-bit output dimensions")
@@ -336,16 +340,15 @@ class Tensor:
       first, last = offset + sum(min(v) for v in ends), offset + sum(max(v) for v in ends)
       if not 0 <= first <= last < min(math.prod(self.shape), 2**32):
         raise ValueError("move reads outside its input's logical storage or 32-bit element addresses")
-    t = Tensor(self.rt, shape[1], shape[2], "move", (self,), shape[0], self.dtype)
+    t = _lead(Tensor(self.rt, *shape[-2:], "move", (self,), math.prod(shape[:-2]), self.dtype), shape[:-2])
     t.map = (offset, *strides, *lo, *hi)
     return t
   def _map(self, shape, axes, starts, steps):
     """Map output index e on axis a to starts[a] + steps[a] * e on source axis axes[a], using zero outside the
-    source. Return shape (batch, rows, cols). Compose with an unrealized move so a chain of maps can run in
-    one launch."""
-    if self.op == "move":
-      x, offset, strides, lo, hi = self.srcs[0], self.map[0], self.map[1:4], self.map[4:7], self.map[7:]
-    else: x, offset, strides, lo, hi = self, 0, (self.rows * self.cols, self.cols, 1), (0, 0, 0), self._dims
+    source. Return shape, with as many dimensions as this tensor. Compose with an unrealized move so a chain of
+    maps can run in one launch."""
+    if self.op == "move": x, offset, strides, lo, hi = self.srcs[0], self.map[0], *_split(self.map[1:], len(self.shape))
+    else: x, offset, strides, lo, hi = self, 0, _strides(self.shape), (0,) * len(self.shape), self.shape
     inside = [_inside(o, s, lo[k], hi[k], n) for k, o, s, n in zip(axes, starts, steps, shape)]
     return x.move(shape, offset + sum(strides[k] * o for k, o in zip(axes, starts)),
                   [strides[k] * s for k, s in zip(axes, steps)], *zip(*inside))
@@ -354,46 +357,41 @@ class Tensor:
     if math.prod(shape) != math.prod(self.shape): raise ValueError(f"cannot reshape {self.shape} to {shape}")
     if shape == self.shape: return self
     if shape[-2:] == self.shape[-2:]: return self._relabel(shape[:-2])  # the same matrices, under other leading sizes
-    flat = (math.prod(shape[:-2]), *shape[-2:])
-    return self.move(flat, 0, (shape[-2] * shape[-1], shape[-1], 1))._track("reshape", (self,))._relabel(shape[:-2])
-  @_matrices
+    return self.move(shape, 0, _strides(shape))._track("reshape", (self,))
   def permute(self, *order):
-    if sorted(order) != [0, 1, 2]: raise ValueError(f"permute needs an order of the axes 0, 1 and 2, not {order}")
-    if order == (0, 2, 1): return self.T
-    if order == (0, 1, 2): return self
-    return self._map(tuple(self.shape[k] for k in order), order, (0, 0, 0), (1, 1, 1))._track("permute", (self,), order)
+    n = len(self.shape)
+    if sorted(order) != list(range(n)):
+      raise ValueError(f"permute needs an order of the axes 0 to {n - 1}, not {order}")
+    if tuple(order) == (*range(n - 2), n - 1, n - 2): return self.T
+    if tuple(order) == tuple(range(n)): return self
+    return self._map(tuple(self.shape[k] for k in order), order, (0,) * n, (1,) * n)._track("permute", (self,), order)
   def expand(self, *shape):  # repeats dimensions of 1. missing leading sizes are 1
     shape = _shape(shape)
     if _broadcast(self.shape, shape) != shape: raise ValueError(f"cannot expand {self.shape} to {shape}")
     if shape == self.shape: return self
-    if len(shape) > 3:  # through the batch they fold into, from one matrix or from as many as the result has
-      if self.batch not in (1, math.prod(shape[:-2])):
-        raise ValueError(f"expanding {self.shape} to {shape} needs leading sizes all 1 or all the result's")
-      return self._relabel((self.batch,)).expand(math.prod(shape[:-2]), *shape[-2:])._relabel(shape[:-2])
-    return self._map(shape, (0, 1, 2), (0, 0, 0),
-                     [int(n == m) for n, m in zip(self.shape, shape)])._track("expand", (self,))
-  @_matrices
+    x, n = self._relabel((1,) * (len(shape) - len(self.shape)) + self.lead), len(shape)  # with shape's dimensions
+    return x._map(shape, range(n), (0,) * n, [int(a == b) for a, b in zip(x.shape, shape)])._track("expand", (self,))
   def pad(self, widths):  # zeros, with (before, after) for each of the last len(widths) axes, like numpy
     try: widths = tuple(tuple(map(operator.index, w)) for w in widths)
     except TypeError: raise ValueError("pad needs integer (before, after) pairs") from None
-    if len(widths) > 3 or any(len(w) != 2 for w in widths):
-      raise ValueError("pad needs at most three (before, after) pairs")
-    widths = ((0, 0),) * (3 - len(widths)) + widths
-    shape = tuple(n + w[0] + w[1] for n, w in zip(self.shape, widths))
-    return self._map(shape, (0, 1, 2), [-w[0] for w in widths], (1, 1, 1))._track("pad", (self,), widths)
+    n = len(self.shape)
+    if len(widths) > n or any(len(w) != 2 for w in widths):
+      raise ValueError(f"pad needs at most {n} (before, after) pairs, one for each dimension")
+    widths = ((0, 0),) * (n - len(widths)) + widths
+    shape = tuple(m + w[0] + w[1] for m, w in zip(self.shape, widths))
+    return self._map(shape, range(n), [-w[0] for w in widths], (1,) * n)._track("pad", (self,), widths)
 
-  @_matrices
   def cat(self, *xs, axis=0):  # like tinygrad: pad each with zeros to its position along axis, then sum
     self._same_runtime(*xs)
-    axis = operator.index(axis)
-    if not -3 <= axis < 3: raise ValueError(f"axis {axis} outside a tensor's three dimensions")
-    ts, axis = (self, *xs), axis % 3
-    if not all(t.shape[a] == self.shape[a] for t in xs for a in range(3) if a != axis):
+    axis, n = operator.index(axis), len(self.shape)
+    if not -n <= axis < n: raise ValueError(f"axis {axis} outside {self.shape}")
+    ts, axis = (self, *xs), axis % n
+    if not all(len(t.shape) == n and t.shape[a] == self.shape[a] for t in xs for a in range(n) if a != axis):
       raise ValueError("cat requires matching dimensions outside its axis")
-    n, out, at = sum(t.shape[axis] for t in ts), None, 0
+    m, out, at = sum(t.shape[axis] for t in ts), None, 0
     for t in ts:
-      widths = [(0, 0)] * 3
-      widths[axis] = (at, n - at - t.shape[axis])
+      widths = [(0, 0)] * n
+      widths[axis] = (at, m - at - t.shape[axis])
       out, at = t.pad(widths) if out is None else out + t.pad(widths), at + t.shape[axis]
     return out
 
@@ -479,8 +477,9 @@ class Tensor:
         return self.run(("transpose", x.rows, x.cols), lambda: transpose_kernel(x.rows, x.cols), *where,
                         name="transpose")
       if op == "T": self.map = (0, x.rows * x.cols, 1, x.cols, 0, 0, 0, *self._dims)
-      return self.run(("move", d), lambda: move_kernel(d), *where, x.rows, x.cols, self.rows, self.cols,
-                      *(v & 0xFFFFFFFF for v in self.map), name="move")
+      lead = (len(self.map) - 1) // 3 - 2  # the map's leading axes: one, the batch, for a transpose
+      return self.run(("move", d, lead), lambda: move_kernel(d, lead), *where, x.rows, x.cols, self.rows, self.cols,
+                      *(v & 0xFFFFFFFF for v in self.map), *self.lead[1:lead], name="move")
     _fit(self)
     inputs = []
     e, dtype = _tree(self, inputs)
@@ -904,6 +903,8 @@ def _lead(t, lead):  # t, a tensor this call made, with leading dimensions lead
   t.lead = tuple(lead)
   return t
 def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for ops that can't take g broadcast
+def _strides(shape): return tuple(math.prod(shape[k + 1:]) for k in range(len(shape)))  # in row-major order
+def _split(values, n): return values[:n], values[n:2 * n], values[2 * n:]  # a move's strides, lo and hi
 def _layout(t): return t._dims, t.bstride, t.stride, t.offset, t.rep, t.runs
 
 def _graph(t):  # autograd's operands before their users, without recursion through long histories
@@ -958,9 +959,9 @@ def _backward(t, g):
     return gx, _unbroadcast(gy, (*y.lead, y.cols, y.rows)).T if turn else _unbroadcast(gy, y.shape)
   if op == "T": return (g.T,)
   if op == "reshape": return (g.reshape(*x.shape),)
-  if op == "permute": return (g.permute(*sorted(range(3), key=args[0].__getitem__)),)
+  if op == "permute": return (g.permute(*sorted(range(len(args[0])), key=args[0].__getitem__)),)
   if op == "expand": return (_unbroadcast(g, x.shape),)
-  if op == "pad": return (g._map(x.shape, (0, 1, 2), [w[0] for w in args[0]], (1, 1, 1)),)
+  if op == "pad": return (g._map(x.shape, range(len(x.shape)), [w[0] for w in args[0]], (1,) * len(x.shape)),)
   if op == "index": return (g.pad(((args[0], x.batch - args[0] - 1), (0, 0), (0, 0))),)
   if op == "split": return (g.merge() if args[0] == 2 else g.reshape(*x.shape),)
   if op == "repeat": return (g.reshape(x.batch, args[0], x.rows * x.cols).sum(1).reshape(*x.shape),)

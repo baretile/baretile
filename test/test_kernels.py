@@ -1547,12 +1547,43 @@ def test_movement(chip):
       t, a = move(t, a)
       assert value(t).tolist() == a.reshape(t.shape).tolist(), a.shape
 
+def test_leading_movement(chip):
+  # Moves over leading dimensions match numpy bit for bit: permutes, expands, pads, cat, reshapes that change the
+  # matrices, and slices of any leading dimension, in four and five dimensions. Leading slices that pick evenly spaced
+  # matrices are views, and a chain of moves is one move. A gradient comes back through the moves.
+  rng, rt = np.random.default_rng(39), Runtime(chip)
+  x = bf16(rng.uniform(-2, 2, (2, 3, 5, 40)))
+  tx, f = Tensor.of(rt, x.tolist()), x.reshape(3, 1, 2, 5, 40)
+  tf = tx.reshape(*f.shape)
+  cases = [(tx.permute(1, 0, 2, 3), x.transpose(1, 0, 2, 3)), (tx.permute(3, 1, 0, 2), x.transpose(3, 1, 0, 2)),
+           (tf.permute(2, 4, 0, 3, 1), f.transpose(2, 4, 0, 3, 1)), (tx[:, 0:2, :, :], x[:, 0:2]),
+           (Tensor.of(rt, x.tolist(), "fp32").permute(1, 0, 3, 2), x.transpose(1, 0, 3, 2)),
+           (tx[::-1, ::2, 1:4, ::-1], x[::-1, ::2, 1:4, ::-1]), (tf[1:, :, ::-1, :, 8:], f[1:, :, ::-1, :, 8:]),
+           (tx[0:1, :, :, :].expand(2, 3, 5, 40), np.broadcast_to(x[0:1], x.shape)),
+           (tx[:, 0:1, :, :].expand(2, 3, 5, 40), np.broadcast_to(x[:, 0:1], x.shape)),
+           (Tensor.of(rt, x[0].tolist()).expand(2, 3, 5, 40), np.broadcast_to(x[0], x.shape)),
+           (tx.pad(((1, 0), (0, 2), (3, 1), (0, 0))), np.pad(x, ((1, 0), (0, 2), (3, 1), (0, 0)))),
+           (tx.cat(tx[:, 0:2, :, :], axis=1), np.concatenate((x, x[:, 0:2]), 1)),
+           (tx.cat(tx, axis=0), np.concatenate((x, x))), (tx.reshape(2, 5, 3, 40), x.reshape(2, 5, 3, 40))]
+  for t, want in cases: assert t.shape == want.shape and value(t).tolist() == want.tolist(), (t.shape, want.shape)
+  launches, v = rt.launches, tx[:, 1:2, :, :]
+  assert rt.launches == launches and v.addr == tx.addr and value(v).tolist() == x[:, 1:2].tolist(), "a view, no copy"
+  launches, t = rt.launches, tx.permute(1, 0, 3, 2)[:, :, 2:9, ::-1].pad(((0, 0), (1, 1), (0, 0), (0, 0)))
+  want = np.pad(x.transpose(1, 0, 3, 2)[:, :, 2:9, ::-1], ((0, 0), (1, 1), (0, 0), (0, 0)))
+  assert value(t).tolist() == want.tolist() and kernels(rt, launches) == 1, "a chain of moves is one move"
+  a = Tensor.of(rt, x.tolist(), "fp32").requires_grad_()
+  g, grad = (a.permute(1, 0, 3, 2)[:, :, 2:9, ::-1].pad(((0, 0), (1, 1), (0, 0), (0, 0))) * 2).sum().gradient(a)[0], np.zeros_like(x)
+  grad[:, :, :, 2:9] = 2
+  assert g.shape == x.shape and value(g).tolist() == grad.tolist()
+  with pytest.raises(ValueError, match="permute"): tx.permute(0, 1, 2)
+  with pytest.raises(ValueError, match="move"): tx.move((1, 1, 1, 1, 1, 1), 0, (0,) * 6)
+
 def test_leading_dimensions(chip):
   # A tensor takes up to five dimensions, and the leading ones fold into the batch in row-major order, so (2, 3, 5, 40)
   # is stored as (6, 5, 40). A reshape of the leading sizes alone is then a view, with no launch, and an unrealized one
-  # fuses into the kernel that reads it. Elementwise ops, reductions, matmuls, transposes and slices of the first
-  # leading dimension keep the leading shape, an operand whose leading sizes are all 1 broadcasts, and a gradient
-  # comes back through the views to each input's shape.
+  # fuses into the kernel that reads it. Elementwise ops, reductions, matmuls, transposes and slices keep the leading
+  # shape, an operand whose leading sizes are all 1 broadcasts, and a gradient comes back through the views to each
+  # input's shape.
   rng, rt = np.random.default_rng(38), Runtime(chip)
   x, y = (bf16(rng.uniform(-2, 2, (2, 3, 5, 40))) for _ in range(2))
   tx, ty = Tensor.of(rt, x.tolist()), Tensor.of(rt, y.tolist())
@@ -1583,7 +1614,6 @@ def test_leading_dimensions(chip):
   with pytest.raises(ValueError, match="dimensions"): tx.reshape(1, 2, 1, 3, 5, 40)
   with pytest.raises(ValueError, match="broadcasting"): tx + Tensor.of(rt, x[:1].tolist())
   with pytest.raises(ValueError, match="leading"): tx.sum(1)
-  with pytest.raises(ValueError, match="leading"): tx[:, 1:2, :, :]
   with pytest.raises(ValueError, match="matmul"): tx @ Tensor.of(rt, w[:1].tolist())
   with pytest.raises(ValueError, match="three dimensions"): tx.split(2)
   out = Tensor.zeros(rt, 8, 25, 6).reshape(2, 3, 8, 25)
