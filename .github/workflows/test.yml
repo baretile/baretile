@@ -1,10 +1,10 @@
 # For every pull request and every push to main: build and check the wheel on Python 3.12 to 3.14, run ruff and the
-# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. Each job that runs tests
-# uses all of the runner's CPUs, with NumPy on one thread a process: the test job in a pytest-xdist worker for each CPU,
-# and the chaos jobs in a part of their tests for each, which a seed repeats. The suite on ttsim
-# includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or
-# tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a newer push to it cancels
-# the run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
+# test suite on 120 and on 140 Tensix tiles, and alongside them the kernel tests on ttsim-chaos with timing noise. The
+# suite and the noise runs are split across runners, and each uses all of its runner's CPUs, with NumPy on one thread a
+# process. The suite includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints,
+# PyTorch, transformers or tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a
+# newer push to it cancels the run still going. The card job runs the bring-up stages on a P150a, once a runner for it
+# exists (docs/bring-up.md).
 name: test
 on:
   push:
@@ -45,9 +45,18 @@ jobs:
         run: |
           python -I -c "from baretile.models import cost, gpt2, llama, qwen, serve, train"
           python -I -m baretile.models.serve 2>&1 | grep -q "usage"
+  # The suite on released ttsim, whose p150 has 120 Tensix tiles, and on ttsim-chaos with all 140 and no noise, since a
+  # p150 reports 120 or 140 depending on its firmware. Each runs as three jobs, the gth on every third test from the gth
+  # on (PART in test/conftest.py), in a pytest-xdist worker for each of the runner's CPUs.
   test:
+    name: test (${{ matrix.tiles }} tiles, ${{ matrix.group }}/3)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        tiles: [120, 140]
+        group: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -73,16 +82,30 @@ jobs:
       # test_kmd_layouts checks pci.Kmd's ioctl arguments against tt-kmd's header, from the 2.11.0 release
       - name: Download tt-kmd's ioctl.h
         run: curl --fail --location --silent --output "$RUNNER_TEMP/ioctl.h" https://raw.githubusercontent.com/tenstorrent/tt-kmd/c05f22460985960905928cf48b3fbde602d9ea37/ioctl.h
-      # Compiled kernels are cached by their source, so a cache from an older commit only saves time.
+      - name: Build ttsim-chaos
+        if: matrix.tiles == 140
+        run: |
+          git clone --depth 1 --branch v1.11.5 https://github.com/tenstorrent/ttsim "$RUNNER_TEMP/ttsim-chaos"
+          cd "$RUNNER_TEMP/ttsim-chaos"
+          git apply "$GITHUB_WORKSPACE/test/ttsim-chaos.patch"
+          ./make.py src/_out/release_bh/libttsim.so
+      # Compiled kernels are cached by their source, so a cache from an older commit only saves time. Each job keeps its
+      # own, which holds the kernels its tests compile.
       - uses: actions/cache@v4
         with:
           path: ~/.cache/baretile
-          key: kernels-${{ github.sha }}
-          restore-keys: kernels-
+          key: kernels-${{ matrix.tiles }}-${{ matrix.group }}-${{ github.sha }}
+          restore-keys: |
+            kernels-${{ matrix.tiles }}-${{ matrix.group }}-
+            kernels-
       - run: python -m baretile.chip ttsim
       - run: python -m baretile.chip check
       - run: ruff check
-      - run: python -m pytest -n auto --dist worksteal test
+      - run: |
+          if [ ${{ matrix.tiles }} = 140 ]; then
+            export TTSIM="$RUNNER_TEMP/ttsim-chaos/src/_out/release_bh/libttsim.so" TTSIM_CHAOS_UNHARVESTED=1
+          fi
+          PART=${{ matrix.group }}/3 python -m pytest -n auto --dist worksteal test
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
@@ -122,30 +145,20 @@ jobs:
         env:
           SKIPS: fail
           TINYGRAD: ${{ runner.temp }}/tinygrad
-  # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
-  # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
-  # The other job runs the suite on all 140 Tensix tiles, since a p150 reports 120 or 140 depending on its firmware.
-  # Each runs a process for each CPU, on every nth test from its own on (PART in test/conftest.py). ttsim-chaos seeds a
-  # process's noise once, so what a test sees follows from the tests before it, and TTSIM_CHAOS_SEED=s PART=i/n repeats
-  # part i of n of run s, as re-running a failed job does. The log shows both. A part that hangs is stopped at 45 minutes,
-  # so its log still shows.
+  # The kernels on ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md,
+  # "ttsim-chaos"), with every kind of timing noise. The run number seeds it, so each run tries other timings. It runs as
+  # two jobs, each a process for each of the runner's CPUs, on every nth test from its own on (PART in test/conftest.py).
+  # ttsim-chaos seeds a process's noise once, so what a test sees follows from the tests before it, and
+  # TTSIM_CHAOS_SEED=s PART=i/n repeats part i of n of run s, as re-running a failed job does. The log shows both. A part
+  # that hangs is stopped at 45 minutes, so its log still shows.
   chaos:
-    name: chaos (${{ matrix.name }})
+    name: chaos (${{ matrix.group }}/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: every setting
-            key: noise
-            tests: test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces test/test_models.py::test_moe
-              'test/test_models.py::test_ramp[4_kernel.py]'
-            settings: TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40
-          - name: 140 tiles
-            key: unharvested
-            tests: test
-            settings: TTSIM_CHAOS_UNHARVESTED=1
+        group: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -164,19 +177,22 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/baretile
-          key: kernels-${{ matrix.key }}-${{ github.sha }}
-          restore-keys: kernels-
+          key: kernels-noise-${{ matrix.group }}-${{ github.sha }}
+          restore-keys: |
+            kernels-noise-${{ matrix.group }}-
+            kernels-
       # each part's log once all are done, under its result
       - run: |
-          n=$(nproc)
+          tests=(test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces
+                 test/test_models.py::test_moe 'test/test_models.py::test_ramp[4_kernel.py]')
+          n=$(nproc) parts=$((2 * $(nproc))) first=$(((${{ matrix.group }} - 1) * $(nproc)))
           for i in $(seq $n); do
-            env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} PART=$i/$n timeout 45m python -m pytest -s \
-              ${{ matrix.tests }} > "$RUNNER_TEMP/part$i.log" 2>&1 &
+            PART=$((first + i))/$parts timeout 45m python -m pytest -s "${tests[@]}" > "$RUNNER_TEMP/part$i.log" 2>&1 &
             pids[i]=$!
           done
           for i in $(seq $n); do
             wait ${pids[i]} || failed=1
-            echo "::group::PART=$i/$n: $(tail -n 1 "$RUNNER_TEMP/part$i.log")"
+            echo "::group::PART=$((first + i))/$parts: $(tail -n 1 "$RUNNER_TEMP/part$i.log")"
             cat "$RUNNER_TEMP/part$i.log"
             echo "::endgroup::"
           done
@@ -184,6 +200,21 @@ jobs:
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM: ${{ runner.temp }}/ttsim-chaos/src/_out/release_bh/libttsim.so
+          TTSIM_CHAOS_NOC: 1,400
+          TTSIM_CHAOS_RISCV: 0.2
+          TTSIM_CHAOS_TENSIX: 0.2
+          TTSIM_CHAOS_MATH: 1,40
+          TTSIM_CHAOS_SEED: ${{ github.run_number }}
+  # The check that main's branch protection requires: it passes when every job above passed, so they can be split or
+  # renamed without changing the repository's settings. It runs even when one fails, since a skipped check would pass.
+  all:
+    if: always()
+    needs: [package, test, references, chaos]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "${{ join(needs.*.result, ' ') }}"
+          [ -z "$(echo "${{ join(needs.*.result, ' ') }}" | tr ' ' '\n' | grep -v '^success$')" ]
   # The bring-up stages on a P150a, from preflight through the model tests, on the self-hosted runner in the card's
   # machine. They run once a maintainer sets the repository variable CARD to true, and never for a pull request from a
   # fork: a self-hosted runner runs whatever the pull request's code does, with the machine's access. With the variable

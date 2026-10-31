@@ -216,8 +216,8 @@ tool-call marker until the marker is complete or ruled out. Once generation ends
 the whole answer stays in the content if no tool call parses. Otherwise, content
 contains the text before the first tool-call marker. `tool_choice` and
 JSON response formats constrain which tokens can be sampled. `test_chat_tools`,
-`test_serve_http` and `test_serve_chat` have example requests to start from when
-adding a model or client.
+`test_serve_http`, `test_serve_schema` and `test_serve_chat` have example
+requests to start from when adding a model or client.
 JSON schemas support types, properties, required fields, additional properties,
 arrays, enums, constants, alternatives and nonrecursive local references.
 Sibling constraints intersect, including fields beside `$ref`, following the

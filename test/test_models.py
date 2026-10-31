@@ -2174,16 +2174,21 @@ def test_serve(chip, tmp_path):
   r.gone = True  # its client has gone
   assert r.take(np.eye(256)[97], True) and (r.made, r.finish) == ([], "gone") and r.out.empty()
 
-def test_serve_http(chip, tmp_path):
-  # serve.py's HTTP side: completions match the engine's tokens, streamed or not, with logprobs or a JSON schema. When
-  # no slot is free, a request gets an immediate 429 so the client can retry or use another provider.
+def completions(engine):  # serve.py's HTTP server on engine, its URL, and a function that posts a completion request
   import urllib.request
-  engine, tok, _, _ = serving(chip, tmp_path)
   http = serve.server(engine, "smol", port=0, defaults={"temperature": 0})
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
   post = lambda body: urllib.request.urlopen(urllib.request.Request(url + "/completions", json.dumps(body).encode(),
                                                                     {"Content-Type": "application/json"}), timeout=600)
+  return http, url, post
+
+def test_serve_http(chip, tmp_path):
+  # serve.py's HTTP side: completions match the engine's tokens, streamed or not, with logprobs. When no slot is free,
+  # a request gets an immediate 429 so the client can retry or use another provider.
+  import urllib.request
+  engine, tok, _, _ = serving(chip, tmp_path)
+  http, url, post = completions(engine)
   r = serve.Request(tok, tok.encode("Hi there"), 6, 0)
   engine.waiting.put(r)
   text = tok.decode(done(r))
@@ -2193,10 +2198,6 @@ def test_serve_http(chip, tmp_path):
   assert reply["usage"]["prompt_tokens_details"]["cached_tokens"] == held, "all but the prompt's last token, which runs again"
   events, usage = streamed(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}))
   assert "".join(e["text"] for e in events) == text and events[-1]["finish_reason"] == "length" and usage["completion_tokens"] == 6
-  schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}
-  shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0,
-                           "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}))["choices"][0]
-  assert json.loads(shaped["text"])["answer"] in ("yes", "no") and shaped["finish_reason"] == "stop", shaped  # the schema allows no more text
   # greedy: each token is the most likely
   chances = json.load(post({"prompt": "Hi there", "max_tokens": 6, "temperature": 0, "logprobs": 2}))["choices"][0]["logprobs"]
   assert len(chances["tokens"]) == 6 and all(p == max(top.values()) <= 0 for p, top in zip(chances["token_logprobs"], chances["top_logprobs"]))
@@ -2207,6 +2208,17 @@ def test_serve_http(chip, tmp_path):
   assert e.value.code == 429 and json.load(e.value)["error"]["code"] == 429, "with no slot free, expected an immediate 429, not a wait"
   for h in holding: assert streamed(h)[1] is None, "usage only when the request asks for it"
   assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "the slots should be free once the streams end"
+  http.shutdown()
+
+def test_serve_schema(chip, tmp_path):
+  # A JSON schema as a completion's response format: the text is JSON that the schema allows, and it stops where the
+  # schema allows no more.
+  engine, _, _, _ = serving(chip, tmp_path)
+  http, _, post = completions(engine)
+  schema = {"type": "object", "properties": {"answer": {"enum": ["yes", "no"]}}, "required": ["answer"], "additionalProperties": False}
+  shaped = json.load(post({"prompt": "Hi there", "max_tokens": 80, "temperature": 0,
+                           "response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}))["choices"][0]
+  assert json.loads(shaped["text"])["answer"] in ("yes", "no") and shaped["finish_reason"] == "stop", shaped  # the schema allows no more text
   http.shutdown()
 
 def test_serve_chat(chip, tmp_path):
