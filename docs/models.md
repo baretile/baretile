@@ -251,12 +251,17 @@ Import `baretile.adapters.tinygrad_device` before using tinygrad's `BARETILE` de
 The adapter translates tinygrad's graph into baretile tensors before tinygrad
 schedules kernels. It recognizes a broadcast multiply followed by a reduction
 as a matmul, also when the products are cast to fp32 before the sum, as in
-tinygrad's bf16 matmul. Its tensors have three dimensions, with tinygrad's
-leading axes folded into the rows. A view that an operation needs as a tensor,
-like a permute or padding, is one move on the chip when its axes merge into at
-most five runs. A permute with more runs takes a move for each pair of axis
-groups it swaps, and anything else is copied through the host. `TinyJit` uses
-baretile recordings when the call can be recorded.
+tinygrad's bf16 matmul. That matmul casts its sum back to bf16, so it's
+baretile's bf16 matmul, and the elementwise ops after it, like a bias and an
+activation, join its kernel. A matmul that more than one kernel reads is
+computed once, on its own. A matmul that baretile cuts into parts along K, as
+it can for a single row of tiles, keeps the fp32 sum, since in bf16 each part
+would round. Its tensors have three dimensions, with tinygrad's leading axes
+folded into the rows. A view that an operation needs as a tensor, like a permute
+or padding, is one move on the chip when its axes merge into at most five runs.
+A permute with more runs takes a move for each pair of axis groups it swaps,
+and anything else is copied through the host. `TinyJit` uses baretile
+recordings when the call can be recorded.
 
 You can run an existing tinygrad script through the adapter:
 

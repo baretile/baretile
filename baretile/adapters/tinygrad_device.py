@@ -323,6 +323,18 @@ class Evaluator:
     return all(r.op is Ops.REDUCE and r.arg[0] is Ops.ADD or (r.op is Ops.PERMUTE or widens(r)) and self.summed(r)
                for r in self.users[u])
 
+  def ends(self, u):
+    """The first ops after u that aren't elementwise. A kernel can compute u with the elementwise ops after it, but
+    with more than one end, more than one kernel reads u."""
+    out, seen, todo = set(), set(), [u]
+    while todo:
+      for r in self.users[todo.pop()]:
+        if r in seen: continue
+        seen.add(r)
+        if r.op in ELEMENTWISE: todo.append(r)
+        else: out.add(r)
+    return out
+
   def force(self, u):
     if self.values[u] is DEFER: self.values[u] = self.eval(u, defer=False)
     return self.values[u]
@@ -357,11 +369,12 @@ class Evaluator:
         return None if pick is None else whole(pick)
       return whole(c.where(x, y))
     # a cast of a view that covers its tensor, like a transposed weight, casts the tensor and keeps the view, so a
-    # matmul can read the cast's source in place
+    # matmul can read the cast's source in place. bf16 cast up to fp32 and back is the bf16 value
     if u.op is Ops.CAST:
-      if isinstance(v := srcs[0], Value) and v.covers() and DTYPES.get(u.dtype):
+      v = uncast(srcs[0]) if u.dtype is dtypes.bfloat16 else srcs[0]
+      if isinstance(v, Value) and v.covers() and DTYPES.get(u.dtype):
         return Value(v.t.cast(DTYPES[u.dtype]), v.view, u.dtype)
-      x = self.operand(srcs[0], shape, groups)
+      x = self.operand(v, shape, groups)
       if not is_tensor(x): return None
       return whole(x.ne(0) if u.dtype is dtypes.bool else x.cast(DTYPES[u.dtype]))
     return None
@@ -397,6 +410,14 @@ class Evaluator:
     A = materialize(Value(a.t, pick(a, batch + rows + summed), a.dtype), runs(nb, nr, nk))
     B = materialize(Value(b.t, pick(b, batch + summed + cols), b.dtype), runs(len(batch), nk, len(cols)))
     out = A.matmul(B, DTYPES[u.dtype])  # u's dtype, so bf16s cast up to fp32 give an fp32 product
+    # tinygrad's bf16 matmul then casts that sum to bf16, which a bf16 matmul kernel does itself, rounding Dst's fp32
+    # sum. So where each use is that cast, make the bf16 one, cast up for u. The cast reads through it, so the ops after
+    # it join its kernel, unless more than one kernel reads it: then it's computed once, first. A matmul in more than
+    # one kernel, like a row of tiles that sums K's parts, stays fp32, since in bf16 each part would round
+    if (out.op == "matmul" and u.dtype is dtypes.float32 and A.dtype == B.dtype == "bf16"
+        and all(r.op is Ops.CAST and r.dtype is dtypes.bfloat16 for r in self.users[u])):
+      out = A.matmul(B, "bf16")
+      out = (out.realize() if len(self.ends(u)) > 1 else out).float()
     made = batch + rows + cols  # the result's axes as made, permuted below into free's order for u
     return Value(out, View([shape[k] for k in made]).permute([made.index(k) for k in free]), u.dtype)
 
