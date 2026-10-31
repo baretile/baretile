@@ -316,8 +316,12 @@ class Evaluator:
   """Evaluate a tinygrad graph. Each UOp becomes a chip Value, a number or a tinygrad CPU tensor."""
   def __init__(self, users): self.values, self.users = {}, users
 
-  def summed(self, u):  # True if u's uses are sums, maybe through a permute, so u is a matmul's product
-    return all(r.op is Ops.REDUCE and r.arg[0] is Ops.ADD or r.op is Ops.PERMUTE and self.summed(r) for r in self.users[u])
+  def summed(self, u):
+    """True if u's uses are sums, maybe through a permute, so u is a matmul's product. A cast that widens it, as
+    tinygrad's bf16 matmul sums its bf16 products in fp32, keeps its values, so its sums count too."""
+    widens = lambda r: r.op is Ops.CAST and dtypes.is_float(r.dtype) and r.dtype.itemsize >= r.src[0].dtype.itemsize
+    return all(r.op is Ops.REDUCE and r.arg[0] is Ops.ADD or (r.op is Ops.PERMUTE or widens(r)) and self.summed(r)
+               for r in self.users[u])
 
   def force(self, u):
     if self.values[u] is DEFER: self.values[u] = self.eval(u, defer=False)
@@ -370,9 +374,10 @@ class Evaluator:
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
     through a PERMUTE. Both operands must span the reduced axes. Of the remaining axes, those spanned by
     both become batch dimensions; those spanned by a become rows, and those spanned by b become columns."""
-    p = u.src[0]
+    bare = lambda x: bare(x.src[0]) if x.op is Ops.CAST else x  # without the widening casts that summed allows
+    p = bare(u.src[0])
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
-    m = p.src[0] if p.op is Ops.PERMUTE else p
+    m = bare(p.src[0]) if p.op is Ops.PERMUTE else p
     if m.op is not Ops.MUL or not all(dtypes.is_float(s.dtype) and s.dtype in DTYPES for s in m.src): return None
     lift = lambda s, v: to_chip(v, s.dtype) if isinstance(v, Tensor) and constant(v) is None else v  # upload a weight still on the host
     a, b = (uncast(spread_to(lift(s, self.values.get(s)), m.shape)) for s in m.src)
@@ -427,7 +432,8 @@ class Evaluator:
     if u.op in EMPTIABLE and 0 in u.shape: return Tensor.zeros(u.shape, dtype=u.dtype, device="CPU")
     if u.op is Ops.REDUCE and 0 in u.src[0].shape:
       return Tensor.full(u.shape, identity_element(u.arg[0], u.dtype), dtype=u.dtype, device="CPU")
-    if defer and (u.op is Ops.MUL or u.op is Ops.PERMUTE and self.values.get(u.src[0]) is DEFER) and self.summed(u): return DEFER
+    if (defer and (u.op is Ops.MUL or u.op in (Ops.PERMUTE, Ops.CAST) and self.values.get(u.src[0]) is DEFER)
+        and self.summed(u)): return DEFER
     srcs = [self.values.get(s) for s in u.src]
     if u.op is not Ops.REDUCE: srcs = [self.force(s) if v is DEFER else v for s, v in zip(u.src, srcs)]  # a REDUCE may make a matmul of them
     if u.op is Ops.CONST: return u.arg
