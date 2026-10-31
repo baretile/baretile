@@ -1741,6 +1741,10 @@ def test_autograd(chip):
   (ta * tw).sum().backward()
   assert np.allclose(value(ta.grad)[0], (b + 2 * a) * w + w, rtol=1e-6, atol=1e-6), ".grad adds up"
   assert np.allclose(value((ta * ta).sum().gradient(ta)[0])[0], 2 * a, rtol=1e-6), "gradient() gives it without touching .grad"
+  # a sum's gradient is one value for all of its operand, so an operand broadcast into that operand gets it once a copy
+  tc = Tensor.of(rt, w[:1].tolist(), "fp32").requires_grad_()
+  assert value((ta + tc).sum().gradient(tc)[0]).tolist() == np.full((1, 1, 40), 20.0).tolist(), "20 rows add to each column"
+  assert np.allclose(value((tc - ta).mean().gradient(tc)[0]), 1 / 40, rtol=1e-6), "20 rows of a mean over 800"
 
 def test_long_autograd_history(chip):
   # Graphs deeper than Python's recursion limit realize and differentiate.

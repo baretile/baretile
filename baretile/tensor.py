@@ -783,10 +783,14 @@ def _shape(shape):
   if any(n <= 0 for n in shape): raise ValueError(f"tensor dimensions must be positive: {shape}")
   return (1,) * (3 - len(shape)) + shape
 
-def _unbroadcast(g, shape):  # the gradient of a broadcast operand: g summed over the axes where shape is 1 and g isn't
+def _unbroadcast(g, shape, full=None):
+  """The gradient of an operand of shape that an op broadcast to full: g summed over the axes where shape is 1 and g
+  isn't. Where g is 1 as well, as a sum's gradient is, each of full's copies along the axis has g, so they add up to
+  g times their number."""
+  copies = math.prod(n for n, a, b in zip(full or shape, g.shape, shape) if a == b == 1)
   for ax in range(3):
     if shape[ax] == 1 and g.shape[ax] > 1: g = g.sum(ax)
-  return g
+  return g * copies if copies > 1 else g
 def _full(g, shape): return g if g.shape == shape else g.expand(*shape)  # for ops that can't take g broadcast
 def _layout(t): return t.shape, t.bstride, t.stride, t.offset, t.rep, t.runs
 
@@ -808,12 +812,12 @@ def _backward(t, g):
   if op in ("add", "sub", "mul", "max", "keep", "drop", "join", "cmplt", "cmple", "cmpne"):
     if op in ("cmplt", "cmple", "cmpne"): return (None, None)
     # halves of where: the condition has no gradient
-    if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape))
+    if op in ("keep", "drop"): return (None, _unbroadcast(x._binop(op, g), y.shape, t.shape))
     if op in ("add", "join"): gx, gy = g, g  # join combines where's disjoint masks
     elif op == "sub": gx, gy = g, -g
     elif op == "mul": gx, gy = g * y, g * x
     else: m = (x > y) + x.eq(y) * 0.5; gx, gy = g * m, g * (1 - m)  # max: ties split it, like tinygrad
-    return (_unbroadcast(gx, x.shape), _unbroadcast(gy, y.shape))
+    return (_unbroadcast(gx, x.shape, t.shape), _unbroadcast(gy, y.shape, t.shape))
   if op in FOLDS:  # a sum broadcasts back. a max goes to its maxima, split between ties
     if op[:3] == "sum": return (g,)
     m = x.eq(t)
