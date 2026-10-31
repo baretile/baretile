@@ -138,13 +138,15 @@ def attention(h, p, c, rotary, mask, cache, rows, phases, prefill, slots=None):
   f, gated, hd, rep = fns(h), c.gated, head(c), c.heads // c.kv
   mask, places, window = mask if isinstance(mask, tuple) else (mask, None, 0)  # on the chip, around gives all three
   nh = c.heads + 2 * c.kv + (c.heads if gated else 0)  # Qwen3.5's output gate adds a head for each query head, after v's
-  qkv = f.mm(h, p["qkv_proj"], phases("qkv"))
+  # Qwen3 RMS-norms each head of q and k before RoPE. It runs in fp32 from the matmul's fp32 sum and rounds once for
+  # RoPE: in bf16, its scale would round once for a whole head, off by up to 2^-8, and at Qwen3-0.6B's scores near 48,
+  # 2^-8 is 0.19. v's heads and the gates' go through the same kernel, and qk_on leaves them as they are.
+  normed = "qk_norm" in p
+  qkv = f.mm(h, p["qkv_proj"], phases("qkv"), "fp32" if normed else None)
   qkv = f.split(qkv + p["qkv_bias"] if "qkv_bias" in p else qkv, nh)  # Qwen2's bias
-  # Qwen3 RMS-norms each head of q and k before RoPE. v's heads and the gates' go through the same kernel, and qk_on
-  # leaves them as they are.
-  if "qk_norm" in p:
+  if normed:
     r = f.rsqrt(f.mean(qkv * qkv) + c.eps)
-    qkv = qkv * f.where(p["qk_on"], r * p["qk_norm"] + r if c.centered else r * p["qk_norm"], 1)
+    qkv = f.bf16(qkv * f.where(p["qk_on"], r * p["qk_norm"] + r if c.centered else r * p["qk_norm"], 1))
   qkv = f.merge(rope(qkv, f.split(rotary[0], nh), f.split(rotary[1], nh), rotary[2]))  # a token's heads side by side again
   heads = f.split(qkv, nh)
   kv = heads[c.heads:c.heads + 2 * c.kv, :, :]  # this call's keys and values together. RoPE left v's heads as they were
@@ -462,10 +464,10 @@ def load(folder, places=4096):
 def weight_format(name, prec):
   """The format of a weight on the chip. Matrices that matmuls read as B take their format from prec (see precision).
   Those are the blocks' matrices and the output layer, and experts take the format of their block's MLP. Gated
-  DeltaNet's conv, decay, dt_bias and norm are fp32, since it computes with them in fp32. The rest are bf16, and so are
-  the matrices when there's no prec."""
+  DeltaNet's conv, decay, dt_bias and norm are fp32, and so are the q and k norm's qk_norm and qk_on, since those
+  compute with them in fp32. The rest are bf16, and so are the matrices when there's no prec."""
   op = name.split(".")[-1].removesuffix("_proj")
-  if name.startswith("layers.") and op in ("conv", "decay", "dt_bias", "norm"): return "fp32"
+  if name.startswith("layers.") and op in ("conv", "decay", "dt_bias", "norm", "qk_norm", "qk_on"): return "fp32"
   key = {"embed.T": ("head", None), "embed.T draft": ("draft head", None)}.get(name) or ((op, int(name.split(".")[1])) if matrix(name) else None)
   return prec[key][0] if prec and key in prec else "bf16"
 
