@@ -1,6 +1,7 @@
 # For every pull request and every push to main: build and check the wheel on Python 3.12 to 3.14, run ruff and the
-# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. A job that runs the whole
-# suite runs it in a pytest-xdist worker for each of the runner's CPUs, with NumPy on one thread each. The suite on ttsim
+# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. Each job that runs tests
+# uses all of the runner's CPUs, with NumPy on one thread a process: the test job in a pytest-xdist worker for each CPU,
+# and the chaos jobs in a part of their tests for each, which a seed repeats. The suite on ttsim
 # includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or
 # tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a newer push to it cancels
 # the run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
@@ -123,9 +124,11 @@ jobs:
           TINYGRAD: ${{ runner.temp }}/tinygrad
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
   # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
-  # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. That takes one process, since the seed starts
-  # a process's noise, and what each test sees follows from the tests before it. The other job runs the suite on all
-  # 140 Tensix tiles, since a p150 reports 120 or 140 depending on its firmware. It has no noise, so it runs in workers.
+  # The other job runs the suite on all 140 Tensix tiles, since a p150 reports 120 or 140 depending on its firmware.
+  # Each runs a process for each CPU, on every nth test from its own on (PART in test/conftest.py). ttsim-chaos seeds a
+  # process's noise once, so what a test sees follows from the tests before it, and TTSIM_CHAOS_SEED=s PART=i/n repeats
+  # part i of n of run s, as re-running a failed job does. The log shows both. A part that hangs is stopped at 45 minutes,
+  # so its log still shows.
   chaos:
     name: chaos (${{ matrix.name }})
     runs-on: ubuntu-24.04
@@ -139,12 +142,10 @@ jobs:
             tests: test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces test/test_models.py::test_moe
               'test/test_models.py::test_ramp[4_kernel.py]'
             settings: TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40
-            flags: -s
           - name: 140 tiles
             key: unharvested
             tests: test
             settings: TTSIM_CHAOS_UNHARVESTED=1
-            flags: -n auto --dist worksteal
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -153,7 +154,7 @@ jobs:
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
-          python -m pip install numpy pytest pytest-xdist
+          python -m pip install numpy pytest
       - name: Build ttsim-chaos
         run: |
           git clone --depth 1 --branch v1.11.5 https://github.com/tenstorrent/ttsim "$RUNNER_TEMP/ttsim-chaos"
@@ -165,7 +166,21 @@ jobs:
           path: ~/.cache/baretile
           key: kernels-${{ matrix.key }}-${{ github.sha }}
           restore-keys: kernels-
-      - run: env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} python -m pytest ${{ matrix.flags }} ${{ matrix.tests }}
+      # each part's log once all are done, under its result
+      - run: |
+          n=$(nproc)
+          for i in $(seq $n); do
+            env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} PART=$i/$n timeout 45m python -m pytest -s \
+              ${{ matrix.tests }} > "$RUNNER_TEMP/part$i.log" 2>&1 &
+            pids[i]=$!
+          done
+          for i in $(seq $n); do
+            wait ${pids[i]} || failed=1
+            echo "::group::PART=$i/$n: $(tail -n 1 "$RUNNER_TEMP/part$i.log")"
+            cat "$RUNNER_TEMP/part$i.log"
+            echo "::endgroup::"
+          done
+          exit ${failed:-0}
         env:
           OPENBLAS_NUM_THREADS: 1
           TTSIM: ${{ runner.temp }}/ttsim-chaos/src/_out/release_bh/libttsim.so
