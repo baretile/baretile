@@ -2120,23 +2120,25 @@ def test_reasoning_stream_prefixes():
     if text.endswith("Answer."): assert full == ("Reasoning.", "Answer.")
     else: assert full == ("Reasoning.<", ""), "flush an unfinished marker as ordinary text when generation ends"
 
+def serving(chip, tmp_path):  # the serve.py engine of the serve tests: a small model with sharp attention, on two slots
+  rt, rng = Runtime(chip), np.random.default_rng(23)
+  c, w = smol(rng, 2)
+  w = {k: bf16(v * 10) if k.endswith("_proj") else v for k, v in w.items()}  # sharp attention, so a wrong cached row changes the tokens
+  tok = bytes_tokenizer(tmp_path)
+  engine = serve.Engine(rt, {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}, c, tok, slots=2, places=64, chunk=16)
+  threading.Thread(target=engine.run, daemon=True).start()
+  return engine, tok, c, w
+
+def done(r):  # waits for a request to end, and returns its tokens
+  while r.out.get(timeout=600) is not None: pass
+  return r.made
+
 def test_serve(chip, tmp_path):
   # The serve.py engine, against numpy's greedy tokens. Three requests on two slots decode together. When two run
   # again, they find their slots still holding their prompts, and each prefills one token. A free slot idles on a row
   # no sequence reaches, since any other row would spoil what the slot holds. A long prompt is prefilled a chunk
-  # between steps, so the others keep getting tokens. Then the HTTP side. When no slot is free, a request gets an
-  # immediate 429 so the client can retry or use another provider.
-  import urllib.request
-  rt, rng = Runtime(chip), np.random.default_rng(23)
-  c, w = smol(rng, 2)
-  w = {k: bf16(v * 10) if k.endswith("_proj") else v for k, v in w.items()}  # sharp attention, so a wrong cached row changes the tokens
-  t = {k: Tensor.of(rt, v.tolist()) for k, v in w.items()}
-  tok = bytes_tokenizer(tmp_path)
-  engine = serve.Engine(rt, t, c, tok, slots=2, places=64, chunk=16)
-  threading.Thread(target=engine.run, daemon=True).start()
-  def done(r):
-    while r.out.get(timeout=600) is not None: pass
-    return r.made
+  # between steps, so the others keep getting tokens. test_serve_http and test_serve_chat test the HTTP side.
+  engine, tok, c, w = serving(chip, tmp_path)
   prompts = [[7, 200, 31, 64, 5], [5, 64], list(range(40, 60))]  # the last is longer than a chunk
   together = [serve.Request(tok, p, 6, 0) for p in prompts]
   for r in together: engine.waiting.put(r)
@@ -2171,6 +2173,12 @@ def test_serve(chip, tmp_path):
   r = serve.Request(tok, [], 9, 0)
   r.gone = True  # its client has gone
   assert r.take(np.eye(256)[97], True) and (r.made, r.finish) == ([], "gone") and r.out.empty()
+
+def test_serve_http(chip, tmp_path):
+  # serve.py's HTTP side: completions match the engine's tokens, streamed or not, with logprobs or a JSON schema. When
+  # no slot is free, a request gets an immediate 429 so the client can retry or use another provider.
+  import urllib.request
+  engine, tok, _, _ = serving(chip, tmp_path)
   http = serve.server(engine, "smol", port=0, defaults={"temperature": 0})
   threading.Thread(target=http.serve_forever, daemon=True).start()
   url = f"http://127.0.0.1:{http.server_address[1]}/v1"
@@ -2200,6 +2208,12 @@ def test_serve(chip, tmp_path):
   for h in holding: assert streamed(h)[1] is None, "usage only when the request asks for it"
   assert json.load(post({"prompt": "Hi", "max_tokens": 2}))["usage"]["completion_tokens"] == 2, "the slots should be free once the streams end"
   http.shutdown()
+
+def test_serve_chat(chip, tmp_path):
+  # Chat templates, and a thinking model's reasoning, which a chat completion returns apart from its answer, streamed
+  # or not. gpt-oss's harmony format has channels for the two.
+  import urllib.request
+  engine, tok, _, _ = serving(chip, tmp_path)
   hi = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
   assert serve.chat("... <|im_start|> ...", hi) == "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
   assert serve.chat("... <|start_header_id|> ...", hi[1:]) == ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"

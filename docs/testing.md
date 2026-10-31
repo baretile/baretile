@@ -23,6 +23,10 @@ python3 -m pytest -s test/test_kernels.py
 python3 -m pytest -s test/test_models.py
 ```
 
+With [pytest-xdist](https://pypi.org/project/pytest-xdist/) installed,
+`-n auto` runs the tests in a process for each CPU, each with its own
+simulator, as CI does.
+
 The tests follow the layers of the code. `test_device.py` starts at PCIe access
 and goes through the runtime. `test_kernels.py` tests the instructions and the
 tensor operations built from them. Models, the server, the adapters and the
@@ -31,10 +35,10 @@ which runs the README's Python examples and checks what they print, and
 `test_doc_links`, which checks every link to a file of the repository and its
 anchor. `test_layers` checks that each module imports only the layers below it.
 
-If pytest exits without explaining why, run it with `-s`. ttsim stops the
-process on errors such as an invalid address or decrementing an empty semaphore.
-pytest can otherwise hide that error message. The tests share a `Chip` because
-the simulator can only be initialized once per process.
+If pytest exits without explaining why, run it with `-s` and without `-n`. ttsim
+stops the process on errors such as an invalid address or decrementing an empty
+semaphore. pytest can otherwise hide that error message. The tests share a
+`Chip` because the simulator can only be initialized once per process.
 
 The runtime compiles device programs with clang for `riscv32-unknown-elf` and
 links them with lld. Builds go in `$XDG_CACHE_HOME/baretile`, which is

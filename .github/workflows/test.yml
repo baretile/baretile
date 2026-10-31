@@ -1,5 +1,6 @@
 # For every pull request and every push to main: build and check the wheel on Python 3.12 to 3.14, run ruff and the
-# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. The suite on ttsim
+# test suite on ttsim, and alongside them the kernel tests and the whole suite on ttsim-chaos. A job that runs the whole
+# suite runs it in a pytest-xdist worker for each of the runner's CPUs, with NumPy on one thread each. The suite on ttsim
 # includes the adapter tests, on the tinygrad commit pinned below. Tests that need checkpoints, PyTorch, transformers or
 # tiktoken skip themselves here. A pull request's branch runs once, as the pull request, and a newer push to it cancels
 # the run still going. The card job runs the bring-up stages on a P150a, once a runner for it exists (docs/bring-up.md).
@@ -54,7 +55,7 @@ jobs:
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
-          python -m pip install numpy pytest ruff
+          python -m pip install numpy pytest pytest-xdist ruff
       # The two-chip library that test_two_chips copies a tensor between. The one-chip library comes from
       # baretile.chip ttsim below, as it does for someone trying baretile
       - name: Download two-chip ttsim
@@ -80,8 +81,9 @@ jobs:
       - run: python -m baretile.chip ttsim
       - run: python -m baretile.chip check
       - run: ruff check
-      - run: python -m pytest -s test
+      - run: python -m pytest -n auto --dist worksteal test
         env:
+          OPENBLAS_NUM_THREADS: 1
           TTSIM2: ${{ runner.temp }}/ttsim/libttsim_bh_x2.so
           TINYGRAD: ${{ runner.temp }}/tinygrad
           KMD_IOCTL: ${{ runner.temp }}/ioctl.h
@@ -121,8 +123,9 @@ jobs:
           TINYGRAD: ${{ runner.temp }}/tinygrad
   # ttsim with test/ttsim-chaos.patch, built from the release the patch is for (docs/testing.md, "ttsim-chaos"). One
   # job runs the kernels with every kind of timing noise; the run number seeds it, so each run tries other timings.
-  # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. The other job runs the suite on all 140
-  # Tensix tiles, since a p150 reports 120 or 140 depending on its firmware.
+  # ttsim-chaos prints the seed, and TTSIM_CHAOS_SEED=n repeats a failure. That takes one process, since the seed starts
+  # a process's noise, and what each test sees follows from the tests before it. The other job runs the suite on all
+  # 140 Tensix tiles, since a p150 reports 120 or 140 depending on its firmware. It has no noise, so it runs in workers.
   chaos:
     name: chaos (${{ matrix.name }})
     runs-on: ubuntu-24.04
@@ -136,10 +139,12 @@ jobs:
             tests: test/test_device.py test/test_kernels.py test/test_models.py::test_delta_step test/test_models.py::test_delta_pieces test/test_models.py::test_moe
               'test/test_models.py::test_ramp[4_kernel.py]'
             settings: TTSIM_CHAOS_NOC=1,400 TTSIM_CHAOS_RISCV=0.2 TTSIM_CHAOS_TENSIX=0.2 TTSIM_CHAOS_MATH=1,40
+            flags: -s
           - name: 140 tiles
             key: unharvested
             tests: test
             settings: TTSIM_CHAOS_UNHARVESTED=1
+            flags: -n auto --dist worksteal
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -148,7 +153,7 @@ jobs:
       - name: Install clang, lld and the Python packages
         run: |
           sudo apt-get update && sudo apt-get install -y clang lld
-          python -m pip install numpy pytest
+          python -m pip install numpy pytest pytest-xdist
       - name: Build ttsim-chaos
         run: |
           git clone --depth 1 --branch v1.11.5 https://github.com/tenstorrent/ttsim "$RUNNER_TEMP/ttsim-chaos"
@@ -160,8 +165,9 @@ jobs:
           path: ~/.cache/baretile
           key: kernels-${{ matrix.key }}-${{ github.sha }}
           restore-keys: kernels-
-      - run: env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} python -m pytest -s ${{ matrix.tests }}
+      - run: env ${{ matrix.settings }} TTSIM_CHAOS_SEED=${{ github.run_number }} python -m pytest ${{ matrix.flags }} ${{ matrix.tests }}
         env:
+          OPENBLAS_NUM_THREADS: 1
           TTSIM: ${{ runner.temp }}/ttsim-chaos/src/_out/release_bh/libttsim.so
   # The bring-up stages on a P150a, from preflight through the model tests, on the self-hosted runner in the card's
   # machine. They run once a maintainer sets the repository variable CARD to true, and never for a pull request from a
