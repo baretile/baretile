@@ -244,6 +244,22 @@ def test_tinygrad_jit_rebinds(chip):
   assert len(calls) == 2
 
 
+def test_tinygrad_bf16_matmul(chip, monkeypatch):
+  # tinygrad's bf16 matmul sums its bf16 products in fp32, with a cast between the product and the sum. That's still one
+  # matmul, where it would otherwise make each of the broadcast's 64 x 256 x 96 products and sum them.
+  rt = adapter_on(chip).RT
+  from tinygrad import Tensor, dtypes
+  rng = np.random.default_rng(85)
+  a, b = (bf16(rng.standard_normal(s)) for s in ((64, 256), (256, 96)))
+  x, w = (Tensor(v, device="BARETILE").cast(dtypes.bfloat16).realize() for v in (a, b))
+  names, launch = [], rt.launch
+  monkeypatch.setattr(rt, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  y = (x @ w).realize()
+  assert len(names) <= 2 and any("matmul" in n for n in names), names
+  got = y.float().numpy()
+  assert np.abs(got - a @ b).max() <= 2**-7 * np.abs(a @ b).max(), np.abs(got - a @ b).max()
+
+
 def test_tinygrad_mse_training_replays(chip):
   # An SGD step on an MSE loss: its square is a POW, and its gradient a WHERE on whether the constant exponent is 0.
   # Both run on the chip, so a TinyJit replays the step, nothing comes back to the host, and the losses are the CPU's.
