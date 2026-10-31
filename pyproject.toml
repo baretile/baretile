@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "baretile"
-version = "0.0.4"
+version = "0.0.5"
 description = "A compiler and runtime for Tenstorrent Blackhole, written in Python"
 readme = "README.md"
 license = "Apache-2.0"

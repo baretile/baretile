@@ -3,6 +3,48 @@
 baretile is pre-alpha. Everything below is tested on Tenstorrent's ttsim
 simulator; nothing has run on a P150a yet.
 
+## 0.0.5
+
+The first release whose tensors have more than three dimensions, and whose Qwen3-0.6B passes the generation check:
+
+```python
+from baretile import pci
+from baretile.chip import Chip
+from baretile.runtime import Runtime
+from baretile.tensor import Tensor
+
+rt = Runtime(Chip(pci.open_device()))
+x = Tensor.of(rt, [[[[1.0, 2.0]], [[3.0, 4.0]]], [[[5.0, 6.0]], [[7.0, 8.0]]]])  # (2, 2, 1, 2)
+print(x.sum(1).tolist())
+# [[[[4.0, 6.0]]], [[[12.0, 14.0]]]]
+```
+
+### Added
+
+- A tensor has up to five dimensions: up to three leading ones, which fold into the batch, then the matrices' rows and
+  columns. Elementwise ops and matmuls broadcast over them as NumPy does, reading an operand in place where its leading
+  sizes are one run of the result's, and `sum`, `max`, `mean` and `softmax` reduce over any of them in one kernel.
+  Movement and slicing take every dimension, a reshape of the leading sizes is a view, and gradients come back through
+  all of them. [The public API](docs/api.md#tensors-and-memory) lists the ops that still take three.
+- A kernel's programs can `print(fmt, ...)` a string literal and up to six words. The host shows each line after
+  `wait()`, with the worker, core and launch that printed it, and a hang's report ends with the last three lines of
+  each of the stuck worker's cores. Each core keeps its last 127 lines.
+- The tinygrad adapter makes a view a tensor in one move over up to five axes, where a permute or padding on two axes
+  of a group took several moves or a copy through the host, so a `TinyJit` replays such calls too.
+
+### Changed
+
+- Qwen3 and Qwen3.5 run the q and k norm in fp32 and round once for RoPE. Qwen3-0.6B now passes the first workload's
+  bf16 logit gate, at 2.95% at worst where it was 4.40%, in the same launches.
+- A reshape that regroups whole tile rows into other matrices, like `(2, 64, cols)` into `(128, cols)`, is a view.
+- Each kernel image holds `kmain` once: 153 of the suite's programs held its body twice.
+- Loaded kernels get 16 KiB less room in L1, which the print rings take.
+
+### Fixed
+
+- An operand broadcast into a result whose gradient was broadcast too, as a sum's is, got that gradient once instead
+  of once for each copy: `(a + c).sum()` gave `c` a gradient of 1 where it's the number of copies.
+
 ## 0.0.4
 
 The first release that can open a card without root, and that trains a model from scratch:
