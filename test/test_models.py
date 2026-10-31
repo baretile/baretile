@@ -269,6 +269,40 @@ def test_tinygrad_bf16_matmul(chip, monkeypatch):
   run(on(d) @ on(e), want=[d @ e], within=2**-8)  # a row of tiles, as in decoding, sums K's parts in fp32 first
 
 
+def test_tinygrad_matmul_gradients(chip, monkeypatch):
+  # A matmul's gradients are matmuls too, x.T @ g and g @ w.T, each made as a @ b or as b @ a, whichever is in its
+  # gradient's order, so no transpose follows. Only x.T is a transpose, since a matmul reads B transposed but not A. In
+  # bf16 each sum reaches its cast to bf16 through a reshape, which keeps it a bf16 matmul.
+  rt = adapter_on(chip).RT
+  from tinygrad import Tensor, dtypes
+  rng = np.random.default_rng(88)
+  on = lambda v, dtype: Tensor(v.astype(np.float32), device="BARETILE").cast(dtype).realize()
+  close = lambda got, want: np.abs(got.float().numpy() - want).max() <= 2**-7 * np.abs(want).max()
+  names, launch = [], rt.launch
+  monkeypatch.setattr(rt, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
+  a, b, c = (bf16(rng.standard_normal(s)) for s in ((64, 256), (256, 96), (64, 96)))
+  for dtype in (dtypes.bfloat16, dtypes.float32):
+    x, w, t = on(a, dtype), on(b, dtype), on(c, dtype)
+    x.requires_grad = w.requires_grad = True
+    ((x @ w) * t).sum().backward()
+    names.clear()
+    Tensor.realize(w.grad, x.grad)
+    made = list(names)
+    assert close(w.grad, a.T @ c) and close(x.grad, c @ b.T)
+    if dtype is dtypes.bfloat16: assert sorted(made) == ["T matmul", "matmul", "mul", "transpose"], made
+    else: assert "move" not in made, made  # an fp32 transpose would be a move
+  # Unless b @ a moves more: for x = z.T, x.T @ t reads z in place and transposes its 64 x 32 result, where t.T @ x would
+  # transpose t, which is 256 x 32
+  a, b, c = (bf16(rng.standard_normal(s)) for s in ((64, 256), (64, 32), (256, 32)))
+  z, w, t = (on(v, dtypes.bfloat16) for v in (a, b, c))
+  w.requires_grad = True
+  ((z.T @ w) * t).sum().backward()
+  names.clear()
+  w.grad.realize()
+  assert names == ["mul", "matmul", "transpose"], names
+  assert close(w.grad, a @ c)
+
+
 def test_tinygrad_mse_training_replays(chip):
   # An SGD step on an MSE loss: its square is a POW, and its gradient a WHERE on whether the constant exponent is 0.
   # Both run on the chip, so a TinyJit replays the step, nothing comes back to the host, and the losses are the CPU's.

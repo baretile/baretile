@@ -296,6 +296,7 @@ BINARY = {Ops.ADD: lambda a, b: a + b, Ops.SUB: lambda a, b: a - b, Ops.MUL: lam
           Ops.CMPEQ: lambda a, b: a.eq(b) if is_tensor(a) else b.eq(a), Ops.FDIV: lambda a, b: a * b.reciprocal() if is_tensor(b) else a / b,
           Ops.AND: lambda a, b: a * b, Ops.OR: lambda a, b: a.maximum(b) if is_tensor(a) else b.maximum(a)}  # AND and OR of bools only
 ELEMENTWISE = {*UNARY, *BINARY, Ops.WHERE, Ops.CAST, Ops.POW}
+VIEWS = (Ops.RESHAPE, Ops.PERMUTE)  # movement ops that keep every value, in another order
 def power(x, e):
   """x ** e as tinygrad's POW, for a number e: products for a whole e up to 4, so a negative x keeps its sign, and
   exp2(e log2 x) for a fraction, which is NaN for a negative x, as pow is. None otherwise, for the host."""
@@ -323,15 +324,18 @@ class Evaluator:
     return all(r.op is Ops.REDUCE and r.arg[0] is Ops.ADD or (r.op is Ops.PERMUTE or widens(r)) and self.summed(r)
                for r in self.users[u])
 
+  def narrowed(self, u):  # True if u's uses are casts to bf16, maybe through a reshape or permute, which keep its values
+    return all(r.op is Ops.CAST and r.dtype is dtypes.bfloat16 or r.op in VIEWS and self.narrowed(r) for r in self.users[u])
+
   def ends(self, u):
-    """The first ops after u that aren't elementwise. A kernel can compute u with the elementwise ops after it, but
-    with more than one end, more than one kernel reads u."""
+    """The first ops after u that aren't elementwise, or a reshape or permute. A kernel can compute u with the
+    elementwise ops after it, but with more than one end, more than one kernel reads u."""
     out, seen, todo = set(), set(), [u]
     while todo:
       for r in self.users[todo.pop()]:
         if r in seen: continue
         seen.add(r)
-        if r.op in ELEMENTWISE: todo.append(r)
+        if r.op in ELEMENTWISE or r.op in VIEWS: todo.append(r)
         else: out.add(r)
     return out
 
@@ -386,7 +390,8 @@ class Evaluator:
   def matmul(self, u):
     """Recognize REDUCE(ADD) u as a matmul, or return None. Its source must multiply a and b, optionally
     through a PERMUTE. Both operands must span the reduced axes. Of the remaining axes, those spanned by
-    both become batch dimensions; those spanned by a become rows, and those spanned by b become columns."""
+    both become batch dimensions; those spanned by a become rows, and those spanned by b become columns, or the
+    other way round when that's the order of u's axes."""
     bare = lambda x: bare(x.src[0]) if x.op is Ops.CAST else x  # without the widening casts that summed allows
     p = bare(u.src[0])
     order = p.arg if p.op is Ops.PERMUTE else tuple(range(len(p.shape)))
@@ -403,6 +408,12 @@ class Evaluator:
     rows, cols = [k for k in free if full(a, k) and not full(b, k)], [k for k in free if full(b, k) and not full(a, k)]
     if len(batch) + len(rows) + len(cols) != len(free) or not (rows or cols): return None
     pick = lambda v, axes: View([shape[k] for k in axes], [v.view.strides[k] for k in axes], v.view.offset)
+    # b @ a is a @ b transposed. Take it when it's in u's order and moves fewer values: a @ b's result is then moved
+    # into u's order, and an A that isn't the tensor as stored is moved too, while a B is read transposed in place
+    size = lambda axes: math.prod(shape[k] for k in axes)
+    moved = lambda v, axes: 0 if Value(v.t, pick(v, axes), v.dtype).whole() else size(axes)  # as A
+    if (batch + rows + cols != free and batch + cols + rows == free
+        and moved(b, batch + cols + summed) < size(free) + moved(a, batch + rows + summed)): a, b, rows, cols = b, a, cols, rows
     nb, nr, nk = len(batch), len(rows), len(summed)
     # rows that don't merge: the leading ones become a batch, which b repeats
     if not batch and nr > 1 and merge(pick(a, rows), [list(range(nr))]) is None: nb, nr = nr - 1, 1
@@ -411,11 +422,10 @@ class Evaluator:
     B = materialize(Value(b.t, pick(b, batch + summed + cols), b.dtype), runs(len(batch), nk, len(cols)))
     out = A.matmul(B, DTYPES[u.dtype])  # u's dtype, so bf16s cast up to fp32 give an fp32 product
     # tinygrad's bf16 matmul then casts that sum to bf16, which a bf16 matmul kernel does itself, rounding Dst's fp32
-    # sum. So where each use is that cast, make the bf16 one, cast up for u. The cast reads through it, so the ops after
-    # it join its kernel, unless more than one kernel reads it: then it's computed once, first. A matmul in more than
-    # one kernel, like a row of tiles that sums K's parts, stays fp32, since in bf16 each part would round
-    if (out.op == "matmul" and u.dtype is dtypes.float32 and A.dtype == B.dtype == "bf16"
-        and all(r.op is Ops.CAST and r.dtype is dtypes.bfloat16 for r in self.users[u])):
+    # sum. So where u's uses are that cast (narrowed), make the bf16 one, cast up for u. The cast reads through it, so
+    # the ops after it join its kernel, unless more than one kernel reads it: then it's computed once, first. A matmul
+    # in more than one kernel, like a row of tiles that sums K's parts, stays fp32, since in bf16 each part would round
+    if out.op == "matmul" and u.dtype is dtypes.float32 and A.dtype == B.dtype == "bf16" and self.narrowed(u):
       out = A.matmul(B, "bf16")
       out = (out.realize() if len(self.ends(u)) > 1 else out).float()
     made = batch + rows + cols  # the result's axes as made, permuted below into free's order for u
