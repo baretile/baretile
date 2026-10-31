@@ -189,6 +189,11 @@ python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.re
 python3 -m baretile.models.llama "$LLAMA_DIR" "$REF_DIR/Llama-3.1-8B-Instruct.refpt" 500 tt numpy
 ```
 
+On the host, the NumPy path meets the B2 gate at `tt` with no top-5 margin:
+458/500 top-1 and 490/500 top-5, against 499 and 500 in `bf16`
+([#37](https://github.com/baretile/baretile/issues/37)). Its products are exact,
+so `tt` comes to the card with no top-5 room for the chip's own rounding.
+
 For the HTTP case, start one slot, 1,024 positions, `tt` precision and bfp8 KV:
 
 ```sh
