@@ -33,6 +33,12 @@ def pytest_runtest_makereport(item, call):  # with SKIPS=fail, a test that skips
   if report.skipped and os.environ.get("SKIPS") == "fail":
     report.outcome, report.longrepr = "failed", f"it skipped, with SKIPS=fail: {report.longrepr}"
 
+def pytest_collection_modifyitems(config, items):  # with PART=i/n, every nth test from the ith, for one of n processes
+  if not (part := os.environ.get("PART")): return
+  i, n = map(int, part.split("/"))
+  config.hook.pytest_deselected(items=[t for k, t in enumerate(items) if k % n != i - 1])
+  items[:] = items[i - 1::n]
+
 @pytest.fixture
 def no_gc():  # Python collects only where the test calls gc.collect()
   collecting = gc.isenabled()
