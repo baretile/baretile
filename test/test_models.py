@@ -245,19 +245,28 @@ def test_tinygrad_jit_rebinds(chip):
 
 
 def test_tinygrad_bf16_matmul(chip, monkeypatch):
-  # tinygrad's bf16 matmul sums its bf16 products in fp32, with a cast between the product and the sum. That's still one
-  # matmul, where it would otherwise make each of the broadcast's 64 x 256 x 96 products and sum them.
+  # tinygrad's bf16 matmul sums its bf16 products in fp32, then casts the sum to bf16. That's one bf16 matmul kernel,
+  # whose Dst sums in fp32, and the bias and relu after it join it. A result that two kernels read is computed once,
+  # and a row of tiles, whose parts of K a bf16 matmul would round, stays in fp32.
   rt = adapter_on(chip).RT
   from tinygrad import Tensor, dtypes
   rng = np.random.default_rng(85)
-  a, b = (bf16(rng.standard_normal(s)) for s in ((64, 256), (256, 96)))
-  x, w = (Tensor(v, device="BARETILE").cast(dtypes.bfloat16).realize() for v in (a, b))
+  a, b, c, d, e = (bf16(rng.standard_normal(s)) for s in ((64, 256), (256, 96), (96,), (8, 1024), (1024, 96)))
+  on = lambda v: Tensor(v.astype(np.float32), device="BARETILE").cast(dtypes.bfloat16).realize()
+  x, w, bias = on(a), on(b), on(c)
   names, launch = [], rt.launch
   monkeypatch.setattr(rt, "launch", lambda kernel, args=(), units=None, name="": names.append(name) or launch(kernel, args, units, name))
-  y = (x @ w).realize()
-  assert len(names) <= 2 and any("matmul" in n for n in names), names
-  got = y.float().numpy()
-  assert np.abs(got - a @ b).max() <= 2**-7 * np.abs(a @ b).max(), np.abs(got - a @ b).max()
+  def run(*ys, want, within=2**-7):  # the kernels that compute ys together, once their values are checked
+    names.clear()
+    Tensor.realize(*ys)
+    made = list(names)
+    for y, v in zip(ys, want): assert np.abs(y.float().numpy() - v).max() <= within * np.abs(v).max()
+    return made
+  assert run(x @ w, want=[a @ b], within=2**-8) == ["matmul"]  # the fp32 sum, rounded once
+  assert run((x @ w + bias).relu(), want=[np.maximum(a @ b + c, 0)]) == ["matmul add cmplt cmpne keep drop join"]
+  y = x @ w
+  assert sorted(run(y + 1, y * 2, want=[a @ b + 1, a @ b * 2])) == ["add", "matmul", "mul"]
+  run(on(d) @ on(e), want=[d @ e], within=2**-8)  # a row of tiles, as in decoding, sums K's parts in fp32 first
 
 
 def test_tinygrad_mse_training_replays(chip):
