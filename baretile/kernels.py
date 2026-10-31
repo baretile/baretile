@@ -38,7 +38,7 @@ def grid_parts(rt, w, kt, grid, base, more=0):
           return -(-kt // -(-kt // kp)), q, acc  # make the parts as even as possible
   return False
 
-def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None):
+def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, readers=None, leading=None):
   """Compile an expression into one kernel. Return (image, work units).
 
   Expressions use nested tuples. An integer refers to an input by its index in shapes:
@@ -58,7 +58,10 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   shapes lists (batch, rows, columns) per input; dimensions of size 1 broadcast. dtype sets the input
   and computation format. out sets the final storage format, allowing a cast or an fp32 matmul result.
   grid and readers come from Runtime: grid enables multicast sharing, and readers assigns DRAM banks
-  and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep.
+  and ports to workers. reps gives each input's batch repeat count, default 1; matrix b reads b // rep. An input
+  spread over the result's leading dimensions has (rep, n) there, and matrix b reads (b // rep) % n. leading, for a
+  reduction over the batch, is (K, S): result matrix b folds K matrices S apart, from b // S * K * S + b % S on, as
+  for a leading dimension of K with S matrices to each step of it. Without it, the batch folds into one matrix.
 
   Kernel arguments:
   - a[0:2]: first work unit and unit count.
@@ -69,7 +72,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
 
   A work unit is normally one output tile. With one matmul and no reduction, it is a block of up to
   4 x 4 tiles, or a worker's block on the grid. With a reduction, it is a line of tiles along that axis:
-  a row, a column, or the same tile position across the batch.
+  a row, a column, or the same tile position across the batch, or with leading, across the matrices that fold into
+  one.
 
   bf16 arithmetic uses SrcA, SrcB and the FPU. fp32 and int32 elementwise kernels bypass the 19-bit
   Src registers: the math thread loads operands into Dst, and the SFPU computes every operation.
@@ -119,7 +123,8 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
                 shape=(batch, a[1], shapes[y][1 if bt else 2]), phases=e[3] if len(e) > 3 else 4)
     elif e[0] in COMBINE:
       x = visit(e[1])
-      op = dict(kind=e[0], x=x, shape=tuple(1 if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
+      fold = lambda s: s // leading[0] if leading else 1  # with leading, the batch folds K matrices into each
+      op = dict(kind=e[0], x=x, shape=tuple(fold(s) if ax == FOLDS[e[0]] else s for ax, s in enumerate(size(x))))
     elif e[0] == "cast" or e[0] in SFPU and e[0] not in BINARY:
       # A unary op, or the root's cast. That packs as out, after an SFPU program between floats and ints if needed.
       x = visit(e[1])
@@ -156,11 +161,11 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   n = [max([ext(op["shape"], ax) for op in ops] + [ext(size(r), ax) for op in ops for r in operands(op)])
        for ax in range(3)]
   nb, rt, w = n
-  L = n[axis]  # the length of a sweep
-  assert all(ext(size(r), axis) in (1, L) for op in ops for r in operands(op)), \
+  span, L = n[axis], leading[0] if leading else n[axis]  # how far the ops reach along the axis, and a sweep's length
+  assert all(ext(size(r), axis) in (1, span // L, span) for op in ops for r in operands(op)), \
     "all operands along the reduction axis must broadcast or have the same tile count"
   # r varies along the sweep. If not, it's one tile a line
-  swept = lambda r: r != "zero" and ext(size(r), axis) == L and not reduced(r)
+  swept = lambda r: r != "zero" and ext(size(r), axis) == span and not reduced(r)
   assert len(ops) <= MAX_OPS, f"SEM_L1 counts at most {MAX_OPS} intermediates"
   # Passes. A swept op runs in the first pass after the reductions it depends on have finished. A narrow op is ready
   # then too.
@@ -347,9 +352,14 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
     if isinstance(r, int) or swept(r): return f"{FRAMES + (r if isinstance(r, int) else inputs + r[1])} + fr * {frame}"
     return FRAMES + 2 * frame + r[1]
   arg = lambda i: 6 + 4 * i  # input i's [address, batch stride, row stride, offset] in a, after the result's
-  def which(r):  # the matrix of r that goes with matrix b of the result: b, b / rep for a repeat, or 0 for a batch of 1
+  # the matrix of r that goes with matrix b of the result: b, b / rep for a repeat, (b / rep) % n for an input spread
+  # over the result's leading dimensions, or 0 for a batch of 1
+  def which(r):
     if size(r)[0] == 1: return "0"
-    return f"b / {reps[r]}" if reps and isinstance(r, int) and reps[r] > 1 else "b"
+    if leading and not isinstance(r, int) and size(r)[0] != span: return "bo"  # one of the folded result's matrices
+    rep, n = (reps[r] if isinstance(reps[r], tuple) else (reps[r], 0)) if reps and isinstance(r, int) else (1, 0)
+    if n: return f"(b / {rep}) % {n}" if rep > 1 else f"b % {n}"
+    return f"b / {rep}" if rep > 1 else "b"
   def matrix(r, base):  # the batch term of r's tile number
     return "" if size(r)[0] == 1 else f"{which(r)} * a[{base + 1}] + "
   # The tile of r that goes with b, i_ and j. r is an input or the result, its [address, strides, offset] at a[base].
@@ -659,11 +669,16 @@ def fused_kernel(expr, shapes, dtype="bf16", out=None, grid=None, reps=None, rea
   }}"""
     index = ("b", "i_", "j")  # a tile's position: matrix, row, column. A unit fixes the two the sweep doesn't walk
     (outer, _), (inner, m) = [(index[ax], n[ax]) for ax in range(3) if ax != axis]
-    sweeps = "\n".join(f"""    for (unsigned {index[axis]} = 0, k = 0; k < {L if full else 1}; {index[axis]}++, k++) {{
+    # with leading, unit bo's line through the batch starts at its first matrix and steps over the matrices after it
+    S = leading[1] if leading else 1
+    start, step = (f"bo / {S} * {L * S} + bo % {S}", f" += {S}") if leading else ("0", "++")
+    v = index[axis]
+    sweeps = "\n".join(f"""    for (unsigned {v} = {start}, k = 0; k < {L if full else 1}; {v}{step}, k++) {{
       {tile_c(b)}
     }}""" for full, b in passes)
+    at = f"bo = unit / {n[1] * m}, {outer} = unit % {n[1] * m} / {m}" if leading else f"{outer} = unit / {m}"
     return f"""  for (unsigned u = 0; u < a[1]; u++) {{
-    unsigned unit = a[0] + u, {outer} = unit / {m}, {inner} = unit % {m};
+    unsigned unit = a[0] + u, {at}, {inner} = unit % {m};
 {sweeps}
   }}"""
   # result tiles to write to DRAM
@@ -1584,15 +1599,16 @@ def transpose_kernel(rows, cols):
 # move_kernel caches x's tiles in L1, tile t in slot t % MOVE_SLOTS. A prime spreads out power-of-two strides.
 MOVE_SLOTS = 127
 
-def move_kernel(dtype):
+def move_kernel(dtype, lead=1):
   """Move a tensor around: reshape, permute, expand, pad, slice. BRISC does it alone.
 
   args: [first unit, units, out, x's address, tile strides for batch and row, tile offset, x's rows and columns, the
   result's rows and columns, then the map: an offset and strides sb, sr and sc for batch, row and column, then the
-  bounds: lo for batch, row and column, then hi].
+  bounds: lo for batch, row and column, then hi]. With lead leading axes in place of the batch, each of them has a
+  stride and bounds where the batch has one, and the result's sizes along them, after the first, come last.
 
   Element (b, r, c) of the result is element offset + b sb + r sr + c sc of x, counted in row-major order, if it's
-  inside the bounds. Outside them it's 0.
+  inside the bounds. Outside them it's 0. With leading axes, b sb is the sum of each one's index times its stride.
 
   NoC alignment rules prevent arbitrary two-byte reads, so fetch complete input tiles into an L1 cache.
   If an output tile is an unchanged input tile within the bounds, copy it directly, bypassing the cache.
@@ -1600,7 +1616,19 @@ def move_kernel(dtype):
   values in runs along rows or columns, whichever are contiguous in x. Stop each run at a face boundary.
   When neither axis forms a run, copy individual values without dividing at each step.
   Repeat a single output column across its tile. Repeat a single row using NoC copies within L1."""
-  tb = tile_bytes(dtype)
+  tb, n = tile_bytes(dtype), lead
+  # with leading axes, matrix b's indices along them, last first, give where it starts in x and whether it's in bounds
+  axes = "" if n == 1 else f"""
+    unsigned eb = 0;
+    int inb = 1;
+    for (int k = {n - 1}, q = b; k >= 0; k--) {{
+      int d = k ? q % (int)a[{17 + 3 * n} + k] : q;
+      q = k ? q / (int)a[{17 + 3 * n} + k] : 0;
+      eb += (unsigned)d * a[12 + k], inb &= (int)a[{14 + n} + k] <= d && d < (int)a[{16 + 2 * n} + k];
+    }}"""
+  at_b, in_b = ("(unsigned)b * sb", "lo_b <= b && b < hi_b") if n == 1 else ("eb", "inb")
+  reads = ("sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18]," if n == 1 else
+           f"sr = a[{12 + n}], sc = a[{13 + n}], lo_r = a[{14 + 2 * n}], lo_c = a[{15 + 2 * n}],")
   return compile_kernel(f"""
 #define OUT {DATA:#x}
 #define CACHE {DATA + tb:#x}
@@ -1642,8 +1670,8 @@ void kmain(volatile unsigned *a) {{
   unsigned base = a[3], bstride = a[4], stride = a[5], offset = a[6], xr = a[7], xc = a[8], rows = a[9], cols = a[10];
   launch++;
   unsigned tr = (rows + 31) / 32, tc = (cols + 31) / 32;
-  int e0 = a[11], sb = a[12], sr = a[13], sc = a[14], lo_b = a[15], lo_r = a[16], lo_c = a[17], hi_b = a[18],
-      hi_r = a[19], hi_c = a[20];
+  int e0 = a[11], {reads}
+      hi_r = a[{16 + 3 * n}], hi_c = a[{17 + 3 * n}];
   // The datums go in lines along the result's rows, or down its columns. Down is for when the columns lie in x as runs
   // (along a row of x, or down a column) and the rows don't or are shorter, and always for a single column. step is
   // the step along a line, in x's elements, split into x's matrices, rows and columns so stepping needs no division.
@@ -1657,11 +1685,11 @@ void kmain(volatile unsigned *a) {{
   unsigned held_t = ~0u;
   for (unsigned u = 0; u < a[1]; u++) {{
     unsigned t = a[0] + u;
-    int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;
-    int r0 = from(i, rows, lo_r), r1 = lo_b <= b && b < hi_b ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c),
+    int b = t / (tr * tc), i = t % (tr * tc) / tc, j = t % tc;{axes}
+    int r0 = from(i, rows, lo_r), r1 = {in_b} ? to(i, rows, lo_r, hi_r) : 0, c0 = from(j, cols, lo_c),
         c1 = to(j, cols, lo_c, hi_c);
     // where the tile starts in x
-    unsigned e = (unsigned)e0 + (unsigned)b * sb + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr,
+    unsigned e = (unsigned)e0 + {at_b} + (unsigned)i * 32 * sr + (unsigned)j * 32 * sc, row = e / xc % xr,
              col = e % xc;
     unsigned src = e / xc / xr * bstride + row / 32 * stride + col / 32 + offset;
     if ((whole || turned) && r0 == 0 && r1 == 32 && c0 == 0 && c1 == 32
@@ -1683,7 +1711,7 @@ void kmain(volatile unsigned *a) {{
           k1 = down ? r1 : c1;
       for (int line = lines0; line < lines1; line++) {{
         int r = down ? k0 : line, c = down ? line : k0;
-        unsigned e_line = (unsigned)e0 + (unsigned)b * sb + (rows == 1 ? 0u : i * 32u + r) * sr
+        unsigned e_line = (unsigned)e0 + {at_b} + (rows == 1 ? 0u : i * 32u + r) * sr
                           + (cols == 1 ? 0u : j * 32u + c) * sc;
         unsigned xrow = e_line / xc, xb = xrow / xr, xi = xrow % xr, xj = e_line % xc;
         for (int k = k0; k < k1;) {{

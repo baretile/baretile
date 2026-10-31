@@ -40,8 +40,12 @@ def _kernel(key, value):
   tensor.kernels have no compiler details to display."""
   if key is None: return {}
   if isinstance(value, bytes): return dict(text=repr(key))
-  e, shapes, dtype, out, _, reps, _ = key
+  e, shapes, dtype, out, _, reps, *_ = key
   return dict(text=repr(e), dtype=dtype, out=out, units=value[1], graph=_graph(e, shapes, reps))
+
+def _rep(r):  # how an input finds its matrix for the result's matrix b: a repeat's rep, or a spread's (rep, n)
+  if isinstance(r, tuple): return f", matrix {f'(b / {r[0]})' if r[0] > 1 else 'b'} % {r[1]}"
+  return f", rep {r}" if r > 1 else ""
 
 def _graph(e, shapes, reps):
   """Return [label, detail, operands] nodes, with operands before the operations that use them. Each distinct
@@ -49,7 +53,7 @@ def _graph(e, shapes, reps):
   nodes, at = [], {}
   def visit(e, b=False):  # b: e is how a matmul reads its B
     if e in at: return at[e]
-    if isinstance(e, int): node = [f"in {e}", "x".join(map(str, shapes[e])) + (f", rep {reps[e]}" if reps[e] > 1 else ""), []]
+    if isinstance(e, int): node = [f"in {e}", "x".join(map(str, shapes[e])) + _rep(reps[e]), []]
     elif b: node = ["read B", _how(e[0]), [visit(x) for x in e[1:]]]
     elif e[0] == "matmul": node = ["matmul", f"fidelity {e[3]}" if len(e) > 3 else "", [visit(e[1]), visit(e[2], True)]]
     else: node = [e[0], "", [visit(x) for x in e[1:]]]

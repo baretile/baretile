@@ -68,6 +68,19 @@ Each promise names the test that checks it.
   expression, and `realize()`, `tolist()` or `tobytes()` compiles it into fused
   kernels. [`test_fusion`](../test/test_kernels.py),
   [`test_tensor_inputs`](../test/test_kernels.py)
+- A tensor can have up to three leading dimensions in place of the batch, so up
+  to five in all, and they fold into the batch in row-major order. Elementwise
+  ops broadcast over them as NumPy does, matmuls broadcast over them, and
+  `sum`, `max`, `mean` and `softmax` reduce over any of them. Movement and
+  slicing take every dimension. A slice takes the last dimensions when it has
+  fewer slices than the tensor has dimensions, as `x[rows, cols]` does, so a
+  slice of the first of four is `x[a:b, :, :, :]`. `gather`, `put`,
+  `repeat_interleave`, `split`, `merge`, `columns`, `topk`, `to`, `attend`,
+  `conv2d` and `max_pool2d` take three dimensions; reshape to three first.
+  [`test_leading_dimensions`](../test/test_kernels.py),
+  [`test_leading_movement`](../test/test_kernels.py),
+  [`test_leading_broadcast`](../test/test_kernels.py),
+  [`test_leading_reductions`](../test/test_kernels.py)
 - A tensor's DRAM goes back once nothing refers to it and the launches queued
   so far are done. A tensor held only by a reference cycle, as a parameter is
   after `backward()`, goes back when an allocation needs the room.
